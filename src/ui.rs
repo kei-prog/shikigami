@@ -100,17 +100,21 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                 }
             }
             input = inputs.next() => {
-                if let Some(Ok(Event::Key(key))) = input
-                    && key.kind == KeyEventKind::Press
-                {
-                    handle_key(
-                        app,
-                        key,
-                        &server,
-                        &preview_generation,
-                        &preview_sender,
-                    ).await?;
-                    needs_draw = true;
+                match input {
+                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                        handle_key(
+                            app,
+                            key,
+                            &server,
+                            &preview_generation,
+                            &preview_sender,
+                        ).await?;
+                        needs_draw = true;
+                    }
+                    Some(Ok(Event::Resize(_, _))) => {
+                        needs_draw = true;
+                    }
+                    _ => {}
                 }
             }
             preview = preview_receiver.recv() => {
