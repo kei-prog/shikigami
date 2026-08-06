@@ -27,8 +27,11 @@ wyard
 wyard automatically discovers JJ repositories under `ghq root`. Select a
 repository, move to its Workspace pane, then:
 
+- `j` / `k`: move within the focused pane
+- `h` / `l`: move between Repository and Workspace panes
+- `Enter`: move forward or open Codex CLI for the selected workspace
+- `Esc`: move back or cancel
 - `n`: create a JJ workspace
-- `Enter`: open Codex CLI in the selected workspace
 - `d`: forget a workspace; its files remain on disk
 - `r`: rescan repositories under `ghq root`
 - `?`: show all keys

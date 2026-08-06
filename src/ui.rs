@@ -100,10 +100,11 @@ fn handle_key(terminal: &mut Tui, app: &mut App, key: KeyEvent) -> Result<()> {
         Mode::Normal => match key.code {
             KeyCode::Char('q') => app.should_quit = true,
             KeyCode::Char('?') => app.mode = Mode::Help,
-            KeyCode::Tab | KeyCode::Right => app.focus = Focus::Workspaces,
-            KeyCode::Left => app.focus = Focus::Repositories,
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('h') => app.move_up(),
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('l') => app.move_down(),
+            KeyCode::Esc if app.focus == Focus::Workspaces => app.focus = Focus::Repositories,
+            KeyCode::Char('h') | KeyCode::Left => app.focus = Focus::Repositories,
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => app.focus = Focus::Workspaces,
+            KeyCode::Up | KeyCode::Char('k') => app.move_up(),
+            KeyCode::Down | KeyCode::Char('j') => app.move_down(),
             KeyCode::Char('n') => app.mode = Mode::AddWorkspace(String::new()),
             KeyCode::Char('r') => app.refresh_repositories(),
             KeyCode::Char('d') if app.focus == Focus::Workspaces => {
@@ -112,6 +113,7 @@ fn handle_key(terminal: &mut Tui, app: &mut App, key: KeyEvent) -> Result<()> {
                     Err(error) => app.message = Some(error.to_string()),
                 }
             }
+            KeyCode::Enter if app.focus == Focus::Repositories => app.focus = Focus::Workspaces,
             KeyCode::Enter if app.focus == Focus::Workspaces => launch_codex(terminal, app)?,
             _ => {}
         },
@@ -291,7 +293,7 @@ fn render_forget_confirm(frame: &mut Frame, area: Rect, app: &App, status: &str)
 
 fn render_help(frame: &mut Frame, area: Rect) {
     let popup = centered_rect(64, 16, area);
-    let help = "h / k / ↑   move up\nl / j / ↓   move down\n← / → / Tab switch pane\nn           create workspace\nd           forget workspace\nr           rescan ghq repositories\nEnter       open Codex CLI\n?           help\nq           quit\n\nPress any key to close";
+    let help = "j / k / ↑↓  move within pane\nh / l / ←→  switch pane\nEnter       select / move forward / open Codex\nEsc         move back / cancel\nn           create workspace\nd           forget workspace\nr           rescan ghq repositories\n?           help\nq           quit\n\nPress any key to close";
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(help).wrap(Wrap { trim: false }).block(
