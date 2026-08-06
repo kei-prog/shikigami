@@ -24,26 +24,26 @@ Start the TUI:
 wyard
 ```
 
-Register a repository with `a`, enter its path, and press Enter. Select the
+wyard automatically discovers JJ repositories under `ghq root`. Select a
 repository, move to its Workspace pane, then:
 
 - `n`: create a JJ workspace
 - `Enter`: open Codex CLI in the selected workspace
-- `d`: remove the selected repository registration or forget a workspace; files remain on disk
+- `d`: forget a workspace; its files remain on disk
+- `r`: rescan repositories under `ghq root`
 - `?`: show all keys
 - `q`: quit
 
-Repositories can also be managed non-interactively:
+Discovered repositories can also be listed non-interactively:
 
 ```bash
-wyard repo add /path/to/repository
 wyard repo list
-wyard repo remove repository-name
 ```
 
 New workspace directories are stored in wyard's platform data directory. JJ
 workspace state is always read from `jj workspace list`; wyard does not maintain
-a second workspace database.
+a second workspace database or repository registry. Git-only repositories are
+not shown until they are initialized for JJ.
 
 ## Scope
 

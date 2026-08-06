@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 
 use crate::{
-    config::{Config, ConfigStore, Repository},
+    ghq::{self, Repository},
     jj::{self, Workspace},
 };
 
@@ -14,16 +14,13 @@ pub enum Focus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Mode {
     Normal,
-    AddRepository(String),
     AddWorkspace(String),
     ConfirmForget(String),
-    ConfirmRemoveRepository,
     Help,
 }
 
 pub struct App {
-    pub config: Config,
-    pub store: ConfigStore,
+    pub repositories: Vec<Repository>,
     pub workspaces: Vec<Workspace>,
     pub repository_index: usize,
     pub workspace_index: usize,
@@ -34,11 +31,10 @@ pub struct App {
 }
 
 impl App {
-    pub fn load(store: ConfigStore) -> Result<Self> {
-        let config = store.load()?;
+    pub fn load() -> Result<Self> {
+        let repositories = ghq::discover_repositories()?;
         let mut app = Self {
-            config,
-            store,
+            repositories,
             workspaces: Vec::new(),
             repository_index: 0,
             workspace_index: 0,
@@ -52,7 +48,7 @@ impl App {
     }
 
     pub fn selected_repository(&self) -> Option<&Repository> {
-        self.config.repositories.get(self.repository_index)
+        self.repositories.get(self.repository_index)
     }
 
     pub fn selected_workspace(&self) -> Option<&Workspace> {
@@ -73,7 +69,7 @@ impl App {
     pub fn move_down(&mut self) {
         match self.focus {
             Focus::Repositories => {
-                if self.repository_index + 1 < self.config.repositories.len() {
+                if self.repository_index + 1 < self.repositories.len() {
                     self.repository_index += 1;
                     self.workspace_index = 0;
                     self.refresh_workspaces();
@@ -101,29 +97,12 @@ impl App {
             .min(self.workspaces.len().saturating_sub(1));
     }
 
-    pub fn add_repository(&mut self, path: &str) -> Result<()> {
-        let repository = Repository::from_path(path.into(), None)?;
-        jj::list_workspaces(&repository.path)?;
-        self.config.add_repository(repository)?;
-        self.store.save(&self.config)?;
-        self.repository_index = self.config.repositories.len().saturating_sub(1);
-        self.repository_index = self
-            .config
-            .repositories
-            .iter()
-            .position(|item| item.path == std::fs::canonicalize(path).unwrap_or_default())
-            .unwrap_or(self.repository_index);
-        self.workspace_index = 0;
-        self.refresh_workspaces();
-        Ok(())
-    }
-
     pub fn add_workspace(&mut self, name: &str) -> Result<()> {
         let repository = self
             .selected_repository()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("register a repository first"))?;
-        crate::config::validate_name(name)?;
+        ghq::validate_name(name)?;
         if self
             .workspaces
             .iter()
@@ -131,7 +110,7 @@ impl App {
         {
             bail!("workspace already exists: {name}");
         }
-        let destination = self.store.workspace_path(&repository, name)?;
+        let destination = ghq::workspace_path(&repository, name)?;
         jj::add_workspace(&repository.path, name, &destination)?;
         self.refresh_workspaces();
         self.workspace_index = self
@@ -166,18 +145,25 @@ impl App {
         jj::workspace_status(&workspace.path)
     }
 
-    pub fn remove_selected_repository(&mut self) -> Result<()> {
-        let repository = self
+    pub fn refresh_repositories(&mut self) {
+        let selected_path = self
             .selected_repository()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("no repository selected"))?;
-        self.config.remove_repository(&repository.name)?;
-        self.store.save(&self.config)?;
-        self.repository_index = self
-            .repository_index
-            .min(self.config.repositories.len().saturating_sub(1));
+            .map(|repository| repository.path.clone());
+        match ghq::discover_repositories() {
+            Ok(repositories) => {
+                self.repositories = repositories;
+                self.repository_index = selected_path
+                    .and_then(|path| {
+                        self.repositories
+                            .iter()
+                            .position(|repository| repository.path == path)
+                    })
+                    .unwrap_or(0)
+                    .min(self.repositories.len().saturating_sub(1));
+            }
+            Err(error) => self.message = Some(error.to_string()),
+        }
         self.workspace_index = 0;
         self.refresh_workspaces();
-        Ok(())
     }
 }

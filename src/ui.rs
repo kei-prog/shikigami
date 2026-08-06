@@ -76,7 +76,7 @@ fn run_loop(terminal: &mut Tui, app: &mut App) -> Result<()> {
 
 fn handle_key(terminal: &mut Tui, app: &mut App, key: KeyEvent) -> Result<()> {
     match &mut app.mode {
-        Mode::AddRepository(input) | Mode::AddWorkspace(input) => match key.code {
+        Mode::AddWorkspace(input) => match key.code {
             KeyCode::Esc => app.mode = Mode::Normal,
             KeyCode::Backspace => {
                 input.pop();
@@ -96,17 +96,6 @@ fn handle_key(terminal: &mut Tui, app: &mut App, key: KeyEvent) -> Result<()> {
             }
             _ => app.mode = Mode::Normal,
         },
-        Mode::ConfirmRemoveRepository => match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                app.mode = Mode::Normal;
-                if let Err(error) = app.remove_selected_repository() {
-                    app.message = Some(error.to_string());
-                } else {
-                    app.message = Some("repository removed from wyard; files are untouched".into());
-                }
-            }
-            _ => app.mode = Mode::Normal,
-        },
         Mode::Help => app.mode = Mode::Normal,
         Mode::Normal => match key.code {
             KeyCode::Char('q') => app.should_quit = true,
@@ -115,12 +104,8 @@ fn handle_key(terminal: &mut Tui, app: &mut App, key: KeyEvent) -> Result<()> {
             KeyCode::Left => app.focus = Focus::Repositories,
             KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('h') => app.move_up(),
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('l') => app.move_down(),
-            KeyCode::Char('a') => app.mode = Mode::AddRepository(String::new()),
             KeyCode::Char('n') => app.mode = Mode::AddWorkspace(String::new()),
-            KeyCode::Char('r') => app.refresh_workspaces(),
-            KeyCode::Char('d') if app.focus == Focus::Repositories => {
-                app.mode = Mode::ConfirmRemoveRepository
-            }
+            KeyCode::Char('r') => app.refresh_repositories(),
             KeyCode::Char('d') if app.focus == Focus::Workspaces => {
                 match app.selected_workspace_status() {
                     Ok(status) => app.mode = Mode::ConfirmForget(status),
@@ -137,7 +122,6 @@ fn handle_key(terminal: &mut Tui, app: &mut App, key: KeyEvent) -> Result<()> {
 fn submit_input(app: &mut App) {
     let mode = std::mem::replace(&mut app.mode, Mode::Normal);
     let result = match mode {
-        Mode::AddRepository(path) => app.add_repository(path.trim()),
         Mode::AddWorkspace(name) => app.add_workspace(name.trim()),
         _ => return,
     };
@@ -196,19 +180,15 @@ fn render(frame: &mut Frame, app: &App) {
     let status = app
         .message
         .as_deref()
-        .unwrap_or("? help  a add repository  n new workspace  Enter open Codex  q quit");
+        .unwrap_or("? help  n new workspace  Enter open Codex  r rescan ghq  q quit");
     frame.render_widget(
         Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
         chunks[2],
     );
 
     match &app.mode {
-        Mode::AddRepository(input) => {
-            render_input(frame, area, "Register repository", "Path", input)
-        }
         Mode::AddWorkspace(input) => render_input(frame, area, "Create workspace", "Name", input),
         Mode::ConfirmForget(status) => render_forget_confirm(frame, area, app, status),
-        Mode::ConfirmRemoveRepository => render_repository_confirm(frame, area, app),
         Mode::Help => render_help(frame, area),
         Mode::Normal => {}
     }
@@ -216,7 +196,6 @@ fn render(frame: &mut Frame, app: &App) {
 
 fn render_repositories(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
-        .config
         .repositories
         .iter()
         .map(|repo| {
@@ -242,7 +221,7 @@ fn render_repositories(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         );
     let mut state = ListState::default()
-        .with_selected((!app.config.repositories.is_empty()).then_some(app.repository_index));
+        .with_selected((!app.repositories.is_empty()).then_some(app.repository_index));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -313,30 +292,9 @@ fn render_forget_confirm(frame: &mut Frame, area: Rect, app: &App, status: &str)
     );
 }
 
-fn render_repository_confirm(frame: &mut Frame, area: Rect, app: &App) {
-    let popup = centered_rect(64, 6, area);
-    let name = app
-        .selected_repository()
-        .map(|repository| repository.name.as_str())
-        .unwrap_or("repository");
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(format!(
-            "Remove '{name}' from wyard?\nRepository files are untouched. [y/N]"
-        ))
-        .block(
-            Block::default()
-                .title(" Remove repository ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
-        ),
-        popup,
-    );
-}
-
 fn render_help(frame: &mut Frame, area: Rect) {
     let popup = centered_rect(64, 16, area);
-    let help = "h / k / ↑   move up\nl / j / ↓   move down\n← / → / Tab switch pane\na           register repository\nn           create workspace\nd           remove selected item\nr           refresh\nEnter       open Codex CLI\n?           help\nq           quit\n\nPress any key to close";
+    let help = "h / k / ↑   move up\nl / j / ↓   move down\n← / → / Tab switch pane\nn           create workspace\nd           forget workspace\nr           rescan ghq repositories\nEnter       open Codex CLI\n?           help\nq           quit\n\nPress any key to close";
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(help).wrap(Wrap { trim: false }).block(
