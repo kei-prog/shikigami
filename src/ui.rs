@@ -138,12 +138,9 @@ fn launch_codex(terminal: &mut Tui, app: &mut App) -> Result<()> {
     restore_terminal(terminal)?;
     let result = codex::run(&workspace.path);
     enable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        ClearTerminal(ClearType::All),
-        MoveTo(0, 0)
-    )?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    let area = terminal.size()?.into();
+    terminal.resize(area)?;
     app.message = Some(match result {
         Ok(()) => format!("Codex exited: {}", workspace.name),
         Err(error) => error.to_string(),
