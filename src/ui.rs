@@ -1,6 +1,9 @@
 use std::{
     io::{self, Stdout},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -25,6 +28,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -38,6 +42,11 @@ use crate::{
 };
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
+
+struct ChatPreview {
+    generation: u64,
+    result: std::result::Result<ChatState, String>,
+}
 
 pub async fn run(mut app: App) -> Result<()> {
     let server = AppServer::spawn("codex", Duration::from_secs(30)).await?;
@@ -74,6 +83,8 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
 async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> Result<()> {
     let mut inputs = EventStream::new();
     let mut server_events = server.subscribe();
+    let preview_generation = Arc::new(AtomicU64::new(0));
+    let (preview_sender, mut preview_receiver) = mpsc::unbounded_channel();
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     let mut needs_draw = true;
     while !app.should_quit {
@@ -92,26 +103,47 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                 if let Some(Ok(Event::Key(key))) = input
                     && key.kind == KeyEventKind::Press
                 {
-                    handle_key(app, key, &server).await?;
+                    handle_key(
+                        app,
+                        key,
+                        &server,
+                        &preview_generation,
+                        &preview_sender,
+                    ).await?;
+                    needs_draw = true;
+                }
+            }
+            preview = preview_receiver.recv() => {
+                if let Some(preview) = preview
+                    && preview.generation == preview_generation.load(Ordering::Relaxed)
+                {
+                    match preview.result {
+                        Ok(chat) => {
+                            let still_selected = app.selected_tree_is_thread()
+                                && app.selected_thread().is_some_and(|thread| {
+                                    thread.record.id == chat.thread_id
+                                });
+                            if still_selected {
+                                app.show_chat(chat);
+                            } else {
+                                app.chats.entry(chat.thread_id.clone()).or_insert(chat);
+                            }
+                        }
+                        Err(error) => app.message = Some(error),
+                    }
                     needs_draw = true;
                 }
             }
             event = server_events.recv() => {
-                if let Ok(event) = event
-                    && let Some(chat) = &mut app.chat
-                {
-                    if event.method == "skills/changed" {
-                        chat.skills_stale = true;
-                    } else {
-                        chat.apply(&event);
-                    }
+                if let Ok(event) = event {
+                    app.apply_chat_event(&event);
                     needs_draw = true;
                 }
             }
             request = server.next_server_request() => {
                 if let Some(request) = request {
                     if is_approval(&request) {
-                        app.pending_approval = Some(request);
+                        app.pending_approvals.push_back(request);
                         app.mode = Mode::Approval;
                         needs_draw = true;
                     } else {
@@ -124,58 +156,64 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
     Ok(())
 }
 
-async fn handle_key(app: &mut App, key: KeyEvent, server: &Arc<AppServer>) -> Result<()> {
+async fn handle_key(
+    app: &mut App,
+    key: KeyEvent,
+    server: &Arc<AppServer>,
+    preview_generation: &Arc<AtomicU64>,
+    preview_sender: &mpsc::UnboundedSender<ChatPreview>,
+) -> Result<()> {
     match app.mode {
-        Mode::Chat if app.chat.as_ref().is_some_and(|chat| chat.palette.is_some()) => {
+        Mode::Chat if app.chat().is_some_and(|chat| chat.palette.is_some()) => {
             handle_palette_key(app, key);
         }
-        Mode::Chat if app.chat.as_ref().map(|chat| chat.mode) == Some(ChatMode::Scroll) => {
+        Mode::Chat if app.chat().map(|chat| chat.mode) == Some(ChatMode::Scroll) => {
             match key.code {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     interrupt_chat(app, server).await?;
                 }
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some(chat) = &mut app.chat {
+                    if let Some(chat) = app.chat_mut() {
                         chat.scroll_half_page_up();
                     }
                 }
                 KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some(chat) = &mut app.chat {
+                    if let Some(chat) = app.chat_mut() {
                         chat.scroll_half_page_down();
                     }
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    if let Some(chat) = &mut app.chat {
+                    if let Some(chat) = app.chat_mut() {
                         chat.scroll_up(1);
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if let Some(chat) = &mut app.chat {
+                    if let Some(chat) = app.chat_mut() {
                         chat.scroll_down(1);
                     }
                 }
                 KeyCode::PageUp => {
-                    if let Some(chat) = &mut app.chat {
+                    if let Some(chat) = app.chat_mut() {
                         chat.scroll_page_up();
                     }
                 }
                 KeyCode::PageDown => {
-                    if let Some(chat) = &mut app.chat {
+                    if let Some(chat) = app.chat_mut() {
                         chat.scroll_page_down();
                     }
                 }
                 KeyCode::Home | KeyCode::Char('g') => {
-                    if let Some(chat) = &mut app.chat {
+                    if let Some(chat) = app.chat_mut() {
                         chat.scroll_to_top();
                     }
                 }
                 KeyCode::End | KeyCode::Char('G') => {
-                    if let Some(chat) = &mut app.chat {
+                    if let Some(chat) = app.chat_mut() {
                         chat.scroll_to_bottom();
                     }
                 }
                 KeyCode::Char('i') | KeyCode::Enter | KeyCode::Tab | KeyCode::Esc => {
-                    if let Some(chat) = &mut app.chat {
+                    if let Some(chat) = app.chat_mut() {
                         chat.mode = ChatMode::Input;
                     }
                 }
@@ -184,7 +222,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, server: &Arc<AppServer>) -> Re
         }
         Mode::Chat => match key.code {
             KeyCode::Tab => {
-                if let Some(chat) = &mut app.chat {
+                if let Some(chat) = app.chat_mut() {
                     chat.mode = ChatMode::Scroll;
                 }
             }
@@ -196,23 +234,18 @@ async fn handle_key(app: &mut App, key: KeyEvent, server: &Arc<AppServer>) -> Re
                 interrupt_chat(app, server).await?;
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(chat) = &mut app.chat {
+                if let Some(chat) = app.chat_mut() {
                     chat.composer.clear();
                     chat.selected_skills.clear();
                 }
             }
             KeyCode::Backspace => {
-                if let Some(chat) = &mut app.chat {
+                if let Some(chat) = app.chat_mut() {
                     chat.composer.pop();
                 }
             }
             KeyCode::Enter => submit_chat(app, server).await?,
-            KeyCode::Char('/')
-                if app
-                    .chat
-                    .as_ref()
-                    .is_some_and(|chat| chat.composer.is_empty()) =>
-            {
+            KeyCode::Char('/') if app.chat().is_some_and(|chat| chat.composer.is_empty()) => {
                 open_command_palette(app, server).await?;
             }
             KeyCode::Char(character)
@@ -220,7 +253,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, server: &Arc<AppServer>) -> Re
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                if let Some(chat) = &mut app.chat {
+                if let Some(chat) = app.chat_mut() {
                     chat.composer.push(character);
                 }
             }
@@ -362,12 +395,18 @@ async fn handle_key(app: &mut App, key: KeyEvent, server: &Arc<AppServer>) -> Re
             KeyCode::Esc if app.selected_tree_is_thread() => app.select_parent_repository(),
             KeyCode::Char('h') | KeyCode::Left => app.collapse_selected_repository(),
             KeyCode::Char('l') | KeyCode::Right => app.expand_selected_repository(),
-            KeyCode::Tab if app.chat.is_some() => {
+            KeyCode::Tab if app.chat().is_some() => {
                 app.focus = Focus::Chat;
                 app.mode = Mode::Chat;
             }
-            KeyCode::Up | KeyCode::Char('k') => app.move_up(),
-            KeyCode::Down | KeyCode::Char('j') => app.move_down(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.move_up();
+                schedule_selected_chat_preview(app, server, preview_generation, preview_sender);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.move_down();
+                schedule_selected_chat_preview(app, server, preview_generation, preview_sender);
+            }
             KeyCode::Char('a') => app.open_repository_add(),
             KeyCode::Char('A') => app.toggle_archive_view(),
             KeyCode::Char('n') => {
@@ -412,7 +451,10 @@ async fn handle_key(app: &mut App, key: KeyEvent, server: &Arc<AppServer>) -> Re
                 app.toggle_selected_repository();
             }
             KeyCode::Enter if app.selected_tree_is_thread() && !app.show_archived => {
-                open_existing_chat(app, server).await?;
+                preview_generation.fetch_add(1, Ordering::Relaxed);
+                if let Err(error) = focus_selected_chat(app, server).await {
+                    app.message = Some(format!("Could not open thread: {error}"));
+                }
             }
             _ => {}
         },
@@ -421,7 +463,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, server: &Arc<AppServer>) -> Re
 }
 
 async fn open_command_palette(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
-    let Some(chat) = &app.chat else {
+    let Some(chat) = app.chat() else {
         return Ok(());
     };
     let should_load = !chat.skills_loaded || chat.skills_stale;
@@ -430,27 +472,27 @@ async fn open_command_palette(app: &mut App, server: &Arc<AppServer>) -> Result<
     if should_load {
         match server.list_skills(&cwd, force_reload).await {
             Ok(skills) => {
-                if let Some(chat) = &mut app.chat {
+                if let Some(chat) = app.chat_mut() {
                     chat.available_skills = skills;
                     chat.skills_loaded = true;
                     chat.skills_stale = false;
                 }
             }
             Err(error) => {
-                if let Some(chat) = &mut app.chat {
+                if let Some(chat) = app.chat_mut() {
                     chat.push_notice(format!("Could not load skills: {error}"));
                 }
             }
         }
     }
-    if let Some(chat) = &mut app.chat {
+    if let Some(chat) = app.chat_mut() {
         chat.open_palette();
     }
     Ok(())
 }
 
 fn handle_palette_key(app: &mut App, key: KeyEvent) {
-    let Some(chat) = &mut app.chat else {
+    let Some(chat) = app.chat_mut() else {
         return;
     };
     match key.code {
@@ -509,7 +551,7 @@ fn handle_palette_key(app: &mut App, key: KeyEvent) {
 }
 
 fn select_palette_entry(app: &mut App) {
-    let Some(chat) = &mut app.chat else {
+    let Some(chat) = app.chat_mut() else {
         return;
     };
     let entry = chat
@@ -534,7 +576,7 @@ fn select_palette_entry(app: &mut App) {
 }
 
 async fn interrupt_chat(app: &App, server: &Arc<AppServer>) -> Result<()> {
-    if let Some(chat) = &app.chat
+    if let Some(chat) = app.chat()
         && let Some(turn_id) = &chat.active_turn_id
     {
         server.interrupt_turn(&chat.thread_id, turn_id).await?;
@@ -545,7 +587,8 @@ async fn interrupt_chat(app: &App, server: &Arc<AppServer>) -> Result<()> {
 async fn open_new_chat(app: &mut App, server: &Arc<AppServer>, workspace: Workspace) -> Result<()> {
     let thread_id = server.start_thread(&workspace.path).await?;
     app.register_app_server_thread(thread_id.clone(), workspace.path.clone())?;
-    app.chat = Some(ChatState::new(
+    app.resumed_threads.insert(thread_id.clone());
+    app.show_chat(ChatState::new(
         thread_id,
         workspace.path,
         "Untitled thread".into(),
@@ -555,24 +598,83 @@ async fn open_new_chat(app: &mut App, server: &Arc<AppServer>, workspace: Worksp
     Ok(())
 }
 
-async fn open_existing_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
+fn schedule_selected_chat_preview(
+    app: &mut App,
+    server: &Arc<AppServer>,
+    generation: &Arc<AtomicU64>,
+    sender: &mpsc::UnboundedSender<ChatPreview>,
+) {
+    let current_generation = generation.fetch_add(1, Ordering::Relaxed) + 1;
+    if !app.selected_tree_is_thread() {
+        return;
+    }
+    let Some(thread) = app.selected_thread().cloned() else {
+        return;
+    };
+    if app.show_cached_chat(&thread.record.id) {
+        return;
+    }
+    let server = Arc::clone(server);
+    let generation = Arc::clone(generation);
+    let sender = sender.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        if generation.load(Ordering::Relaxed) != current_generation {
+            return;
+        }
+        let result = match server.read_thread(&thread.record.id).await {
+            Ok(history) => {
+                let mut chat =
+                    ChatState::new(thread.record.id, thread.record.cwd, thread.record.title);
+                chat.load_history(&history);
+                Ok(chat)
+            }
+            Err(error) => Err(format!("Could not load thread: {error}")),
+        };
+        if generation.load(Ordering::Relaxed) == current_generation {
+            let _ = sender.send(ChatPreview {
+                generation: current_generation,
+                result,
+            });
+        }
+    });
+}
+
+async fn preview_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
+    if !app.selected_tree_is_thread() {
+        return Ok(());
+    }
     let Some(thread) = app.selected_thread().cloned() else {
         return Ok(());
     };
-    server
-        .resume_thread(&thread.record.id, &thread.record.cwd)
-        .await?;
+    if app.show_cached_chat(&thread.record.id) {
+        return Ok(());
+    }
     let history = server.read_thread(&thread.record.id).await?;
     let mut chat = ChatState::new(thread.record.id, thread.record.cwd, thread.record.title);
     chat.load_history(&history);
-    app.chat = Some(chat);
+    app.show_chat(chat);
+    Ok(())
+}
+
+async fn focus_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
+    preview_selected_chat(app, server).await?;
+    let Some(chat) = app.chat() else {
+        return Ok(());
+    };
+    let thread_id = chat.thread_id.clone();
+    let cwd = chat.cwd.clone();
+    if !app.resumed_threads.contains(&thread_id) {
+        server.resume_thread(&thread_id, &cwd).await?;
+        app.resumed_threads.insert(thread_id);
+    }
     app.focus = Focus::Chat;
     app.mode = Mode::Chat;
     Ok(())
 }
 
 async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
-    let Some(chat) = &app.chat else {
+    let Some(chat) = app.chat() else {
         return Ok(());
     };
     if chat.active_turn_id.is_some() || chat.composer.trim().is_empty() {
@@ -585,7 +687,7 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     let turn_id = server
         .start_turn(&thread_id, &cwd, &prompt, &skills)
         .await?;
-    if let Some(chat) = &mut app.chat {
+    if let Some(chat) = app.chat_mut() {
         chat.composer.clear();
         chat.begin_user_turn(prompt.clone(), turn_id);
     }
@@ -603,7 +705,7 @@ fn is_approval(request: &AppServerRequest) -> bool {
 }
 
 async fn resolve_approval(app: &mut App, server: &Arc<AppServer>, accept: bool) -> Result<()> {
-    let Some(request) = app.pending_approval.take() else {
+    let Some(request) = app.pending_approvals.pop_front() else {
         return Ok(());
     };
     let result = if request.method == "item/permissions/requestApproval" {
@@ -616,7 +718,9 @@ async fn resolve_approval(app: &mut App, server: &Arc<AppServer>, accept: bool) 
         json!({"decision": if accept { "accept" } else { "decline" }})
     };
     server.respond(request.id, result).await?;
-    app.mode = if app.chat.is_some() && app.focus == Focus::Chat {
+    app.mode = if !app.pending_approvals.is_empty() {
+        Mode::Approval
+    } else if app.chat().is_some() && app.focus == Focus::Chat {
         Mode::Chat
     } else {
         Mode::Normal
@@ -634,7 +738,7 @@ fn render(frame: &mut Frame, app: &mut App) {
             Constraint::Length(1),
         ])
         .split(area);
-    let chat_status = app.chat.as_ref().map(|chat| {
+    let chat_status = app.chat().map(|chat| {
         let state = if chat.active_turn_id.is_some() {
             "working"
         } else {
@@ -661,7 +765,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     render_chat_pane(frame, panes[1], app);
 
     let status = app.message.as_deref().unwrap_or(
-        "? help · j/k move · h/l collapse/expand · Enter open · n new · Tab chat · q quit",
+        "? help · j/k move/preview · h/l collapse/expand · Enter focus · n new · q quit",
     );
     frame.render_widget(
         Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
@@ -686,7 +790,8 @@ fn render(frame: &mut Frame, app: &mut App) {
 
 fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App) {
     let show_composer_cursor = app.mode == Mode::Chat && app.focus == Focus::Chat;
-    let Some(chat) = &mut app.chat else {
+    let chat_focused = app.focus == Focus::Chat;
+    let Some(chat) = app.chat_mut() else {
         frame.render_widget(
             Paragraph::new("Select a thread or press n to create one")
                 .style(Style::default().fg(Color::DarkGray))
@@ -712,9 +817,7 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App) {
     let chat_border = if chat.mode == ChatMode::Scroll {
         Color::Cyan
     } else {
-        focus_style(app.focus == Focus::Chat)
-            .fg
-            .unwrap_or(Color::DarkGray)
+        focus_style(chat_focused).fg.unwrap_or(Color::DarkGray)
     };
     let chat_block = Block::default()
         .title(" Chat ")
@@ -733,7 +836,7 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App) {
     chat.update_scroll_metrics(total_lines, visible_height);
     let scroll = u16::try_from(chat.scroll_top).unwrap_or(u16::MAX);
     frame.render_widget(paragraph.scroll((scroll, 0)), chunks[0]);
-    let message_border = if chat.mode == ChatMode::Input && app.focus == Focus::Chat {
+    let message_border = if chat.mode == ChatMode::Input && chat_focused {
         Color::Cyan
     } else {
         Color::DarkGray
@@ -975,7 +1078,12 @@ fn wrap_composer(composer: &str, max_width: usize) -> Vec<String> {
 
 fn render_approval(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(76, 12, area);
-    let request = app.pending_approval.as_ref();
+    let request = app.pending_approvals.front();
+    let thread_title = request
+        .and_then(|request| request.thread_id.as_deref())
+        .and_then(|thread_id| app.chats.get(thread_id))
+        .map(|chat| chat.title.as_str())
+        .unwrap_or("thread");
     let method = request
         .map(|value| value.method.as_str())
         .unwrap_or("approval");
@@ -985,7 +1093,7 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(format!(
-            "{method}\n\n{detail}\n\nApprove this request? [y/N]"
+            "{thread_title}\n{method}\n\n{detail}\n\nApprove this request? [y/N]"
         ))
         .wrap(Wrap { trim: false })
         .block(
@@ -999,7 +1107,7 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_navigation_tree(frame: &mut Frame, app: &App, area: Rect) {
-    let active_thread_id = app.chat.as_ref().map(|chat| chat.thread_id.as_str());
+    let visible_thread_id = app.chat().map(|chat| chat.thread_id.as_str());
     let rows = app.tree_rows();
     let items = rows.iter().map(|row| match row {
         TreeRow::Repository { repository_index } => {
@@ -1022,9 +1130,33 @@ fn render_navigation_tree(frame: &mut Frame, app: &App, area: Rect) {
         }
         TreeRow::Thread { thread_index, .. } => {
             let thread = &app.threads[*thread_index];
-            let active = active_thread_id == Some(thread.record.id.as_str());
-            let marker = if active { "●" } else { "•" };
-            let title_style = if active {
+            let visible = visible_thread_id == Some(thread.record.id.as_str());
+            let working = app
+                .chats
+                .get(&thread.record.id)
+                .is_some_and(|chat| chat.active_turn_id.is_some());
+            let awaiting_approval = app
+                .pending_approvals
+                .iter()
+                .any(|request| request.thread_id.as_deref() == Some(thread.record.id.as_str()));
+            let marker = if awaiting_approval {
+                "!"
+            } else if working {
+                "◉"
+            } else if visible {
+                "●"
+            } else {
+                "•"
+            };
+            let title_style = if awaiting_approval {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if working {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if visible {
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD)
@@ -1291,7 +1423,7 @@ fn render_archive_confirm(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_help(frame: &mut Frame, area: Rect) {
     let popup = centered_rect(64, 20, area);
-    let help = "j / k / ↑↓  move through repository tree\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand repository / open thread\nTab          focus the open chat\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / remove thread\nr            reload registered repositories\n?            help\nq            quit\n\nOnly clean worktrees created by wyard can be removed on archive.\nPress any key to close";
+    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand repository / focus chat input\nTab          focus the visible chat\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / remove thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ! approval waiting\nOnly clean wyard worktrees are removed on archive.\nPress any key to close";
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(help).wrap(Wrap { trim: false }).block(

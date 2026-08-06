@@ -30,9 +30,9 @@ checks common development directories and `ghq root` when available. Use `s`
 for an explicit home-directory scan or `b` to browse to a repository. Scan
 results are cached, while the main screen only shows repositories you register.
 
-- `j` / `k`: move through the repository tree
+- `j` / `k`: move through the repository tree and preview the selected thread
 - `h` / `l`: collapse or expand the selected repository
-- `Enter`: expand a repository or open its selected thread in the chat pane
+- `Enter`: expand a repository or focus the selected thread's chat input
 - `Tab`: focus the open chat
 - `Esc`: select the parent repository or return from chat to the tree
 - `a`: add repositories
@@ -49,6 +49,12 @@ wyard-created threads directly underneath it, and multiple repositories can be
 expanded at once. The right chat pane stays visible while navigating the tree.
 Creating a thread with `n` always uses the selected repository, including when
 the selection is one of that repository's child threads.
+
+Moving onto a thread switches the right pane automatically. Uncached history is
+loaded after a short debounce; previously viewed threads switch immediately.
+Each thread keeps an independent chat state, so multiple turns can continue in
+the background while another thread is displayed. The tree marks the visible,
+working, and approval-waiting threads separately.
 
 In the repository picker, `/` filters candidates, `Space` selects multiple
 repositories, and `Enter` registers them. Repository discovery is read-only.

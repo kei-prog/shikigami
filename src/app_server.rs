@@ -33,6 +33,8 @@ pub struct AppServerRequest {
     pub id: Value,
     pub method: String,
     pub params: Value,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,11 +115,20 @@ impl AppServer {
                     message.get("id"),
                     message.get("method").and_then(Value::as_str),
                 ) {
+                    let params = message.get("params").cloned().unwrap_or(Value::Null);
                     let _ = request_tx
                         .send(AppServerRequest {
                             id: id.clone(),
                             method: method.to_owned(),
-                            params: message.get("params").cloned().unwrap_or(Value::Null),
+                            thread_id: params
+                                .get("threadId")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            turn_id: params
+                                .get("turnId")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            params,
                         })
                         .await;
                 } else if let Some(method) = message.get("method").and_then(Value::as_str) {

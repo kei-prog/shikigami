@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     path::PathBuf,
     sync::mpsc::{Receiver, TryRecvError},
@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use directories::BaseDirs;
 
 use crate::{
-    app_server::AppServerRequest,
+    app_server::{AppServerEvent, AppServerRequest},
     chat::ChatState,
     git_workspace::{self, Workspace},
     registry::{Registry, ThreadRecord},
@@ -84,8 +84,10 @@ pub struct App {
     pub show_archived: bool,
     pub message: Option<String>,
     pub should_quit: bool,
-    pub chat: Option<ChatState>,
-    pub pending_approval: Option<AppServerRequest>,
+    pub chats: HashMap<String, ChatState>,
+    pub visible_chat_id: Option<String>,
+    pub resumed_threads: HashSet<String>,
+    pub pending_approvals: VecDeque<AppServerRequest>,
     thread_registry: Registry,
     repository_store: RepositoryStore,
     workspaces_by_repository: HashMap<PathBuf, Vec<Workspace>>,
@@ -132,8 +134,10 @@ impl App {
             show_archived: false,
             message: None,
             should_quit: false,
-            chat: None,
-            pending_approval: None,
+            chats: HashMap::new(),
+            visible_chat_id: None,
+            resumed_threads: HashSet::new(),
+            pending_approvals: VecDeque::new(),
             thread_registry: Registry::discover()?,
             repository_store,
             workspaces_by_repository: HashMap::new(),
@@ -152,6 +156,44 @@ impl App {
 
     pub fn selected_thread(&self) -> Option<&ThreadItem> {
         self.threads.get(self.thread_index)
+    }
+
+    pub fn chat(&self) -> Option<&ChatState> {
+        self.visible_chat_id
+            .as_ref()
+            .and_then(|thread_id| self.chats.get(thread_id))
+    }
+
+    pub fn chat_mut(&mut self) -> Option<&mut ChatState> {
+        let thread_id = self.visible_chat_id.clone()?;
+        self.chats.get_mut(&thread_id)
+    }
+
+    pub fn show_chat(&mut self, chat: ChatState) {
+        let thread_id = chat.thread_id.clone();
+        self.chats.insert(thread_id.clone(), chat);
+        self.visible_chat_id = Some(thread_id);
+    }
+
+    pub fn show_cached_chat(&mut self, thread_id: &str) -> bool {
+        if self.chats.contains_key(thread_id) {
+            self.visible_chat_id = Some(thread_id.to_owned());
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn apply_chat_event(&mut self, event: &AppServerEvent) {
+        apply_chat_event_to(&mut self.chats, event);
+    }
+
+    pub fn discard_chat(&mut self, thread_id: &str) {
+        self.chats.remove(thread_id);
+        self.resumed_threads.remove(thread_id);
+        if self.visible_chat_id.as_deref() == Some(thread_id) {
+            self.visible_chat_id = None;
+        }
     }
 
     pub fn tree_rows(&self) -> Vec<TreeRow> {
@@ -257,6 +299,7 @@ impl App {
             self.refresh_current();
             return Err(error);
         }
+        self.discard_chat(&record.id);
         self.refresh_current();
         Ok(())
     }
@@ -601,6 +644,15 @@ impl App {
             .map(|repository| repository.path.clone())
             .context("no repository selected")?;
         self.repository_store.unregister(&path)?;
+        let removed_thread_ids = self
+            .threads
+            .iter()
+            .filter(|thread| thread.record.repository_path == path)
+            .map(|thread| thread.record.id.clone())
+            .collect::<Vec<_>>();
+        for thread_id in removed_thread_ids {
+            self.discard_chat(&thread_id);
+        }
         self.refresh_repositories()?;
         if self.repositories.is_empty() {
             self.open_repository_add();
@@ -614,6 +666,7 @@ impl App {
             .map(|thread| thread.record.id.clone())
             .context("no thread selected")?;
         self.thread_registry.remove(&thread_id)?;
+        self.discard_chat(&thread_id);
         self.refresh_current();
         Ok(())
     }
@@ -638,6 +691,17 @@ impl App {
             && thread.record.title == "Untitled thread"
         {
             thread.record.title = prompt
+                .lines()
+                .next()
+                .unwrap_or(prompt)
+                .chars()
+                .take(80)
+                .collect();
+        }
+        if let Some(chat) = self.chats.get_mut(thread_id)
+            && chat.title == "Untitled thread"
+        {
+            chat.title = prompt
                 .lines()
                 .next()
                 .unwrap_or(prompt)
@@ -771,8 +835,22 @@ fn tree_rows_for(
     rows
 }
 
+fn apply_chat_event_to(chats: &mut HashMap<String, ChatState>, event: &AppServerEvent) {
+    if event.method == "skills/changed" {
+        for chat in chats.values_mut() {
+            chat.skills_stale = true;
+        }
+    } else if let Some(thread_id) = &event.thread_id
+        && let Some(chat) = chats.get_mut(thread_id)
+    {
+        chat.apply(event);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
     use super::*;
 
     fn thread(id: &str, repository: &str) -> ThreadItem {
@@ -859,5 +937,57 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn app_server_events_update_only_their_thread_chat() {
+        let mut chats = HashMap::from([
+            (
+                "one".into(),
+                ChatState::new("one".into(), "/one".into(), "one".into()),
+            ),
+            (
+                "two".into(),
+                ChatState::new("two".into(), "/two".into(), "two".into()),
+            ),
+        ]);
+        apply_chat_event_to(
+            &mut chats,
+            &AppServerEvent {
+                method: "item/agentMessage/delta".into(),
+                params: json!({"threadId":"two", "delta":"hello"}),
+                thread_id: Some("two".into()),
+                turn_id: Some("turn-two".into()),
+            },
+        );
+
+        assert!(chats["one"].messages.is_empty());
+        assert_eq!(chats["two"].messages.len(), 1);
+        assert_eq!(chats["two"].messages[0].content, "hello");
+    }
+
+    #[test]
+    fn skill_changes_invalidate_every_cached_chat() {
+        let mut chats = HashMap::from([
+            (
+                "one".into(),
+                ChatState::new("one".into(), "/one".into(), "one".into()),
+            ),
+            (
+                "two".into(),
+                ChatState::new("two".into(), "/two".into(), "two".into()),
+            ),
+        ]);
+        apply_chat_event_to(
+            &mut chats,
+            &AppServerEvent {
+                method: "skills/changed".into(),
+                params: Value::Null,
+                thread_id: None,
+                turn_id: None,
+            },
+        );
+
+        assert!(chats.values().all(|chat| chat.skills_stale));
     }
 }
