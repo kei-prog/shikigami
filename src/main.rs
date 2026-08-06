@@ -1,7 +1,7 @@
 mod app;
 mod codex;
 mod ghq;
-mod jj;
+mod git_workspace;
 mod ui;
 
 use anyhow::Result;
@@ -27,7 +27,7 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum RepoCommand {
-    /// List JJ repositories discovered under ghq root
+    /// List Git repositories discovered under ghq root
     List,
 }
 

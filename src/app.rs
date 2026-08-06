@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 
 use crate::{
     ghq::{self, Repository},
-    jj::{self, Workspace},
+    git_workspace::{self, Workspace},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,7 +15,7 @@ pub enum Focus {
 pub enum Mode {
     Normal,
     AddWorkspace(String),
-    ConfirmForget(String),
+    ConfirmRemove(String),
     Help,
 }
 
@@ -88,7 +88,7 @@ impl App {
         let Some(repository) = self.selected_repository().cloned() else {
             return;
         };
-        match jj::list_workspaces(&repository.path) {
+        match git_workspace::list_workspaces(&repository.path) {
             Ok(workspaces) => self.workspaces = workspaces,
             Err(error) => self.message = Some(error.to_string()),
         }
@@ -111,7 +111,7 @@ impl App {
             bail!("workspace already exists: {name}");
         }
         let destination = ghq::workspace_path(&repository, name)?;
-        jj::add_workspace(&repository.path, name, &destination)?;
+        git_workspace::add_workspace(&repository.path, name, &destination)?;
         self.refresh_workspaces();
         self.workspace_index = self
             .workspaces
@@ -121,7 +121,7 @@ impl App {
         Ok(())
     }
 
-    pub fn forget_selected_workspace(&mut self) -> Result<()> {
+    pub fn remove_selected_workspace(&mut self) -> Result<()> {
         let repository = self
             .selected_repository()
             .cloned()
@@ -130,10 +130,10 @@ impl App {
             .selected_workspace()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no workspace selected"))?;
-        if workspace.name == "default" {
-            bail!("the default workspace cannot be forgotten from wyard");
+        if workspace.is_primary {
+            bail!("the primary workspace cannot be removed from wyard");
         }
-        jj::forget_workspace(&repository.path, &workspace.name)?;
+        git_workspace::remove_workspace(&repository.path, &workspace.path)?;
         self.refresh_workspaces();
         Ok(())
     }
@@ -142,7 +142,7 @@ impl App {
         let workspace = self
             .selected_workspace()
             .ok_or_else(|| anyhow::anyhow!("no workspace selected"))?;
-        jj::workspace_status(&workspace.path)
+        git_workspace::workspace_status(&workspace.path)
     }
 
     pub fn refresh_repositories(&mut self) {

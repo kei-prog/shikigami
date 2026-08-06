@@ -53,7 +53,7 @@ fn discover_in_root(root: &Path) -> Result<Vec<Repository>> {
     for host in child_directories(root)? {
         for owner in child_directories(&host)? {
             for repository_path in child_directories(&owner)? {
-                if !repository_path.join(".jj").is_dir() {
+                if !repository_path.join(".git").exists() {
                     continue;
                 }
                 let owner_name = owner.file_name().and_then(|name| name.to_str());
@@ -104,11 +104,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discovers_only_jj_repositories() {
+    fn discovers_git_repositories() {
         let temp = tempdir().unwrap();
-        let jj_repository = temp.path().join("github.com/kei-prog/wyard");
         let git_repository = temp.path().join("github.com/kei-prog/legacy");
-        fs::create_dir_all(jj_repository.join(".jj")).unwrap();
         fs::create_dir_all(git_repository.join(".git")).unwrap();
 
         let repositories = discover_in_root(temp.path()).unwrap();
@@ -116,8 +114,8 @@ mod tests {
         assert_eq!(
             repositories,
             vec![Repository {
-                name: "kei-prog/wyard".into(),
-                path: jj_repository,
+                name: "kei-prog/legacy".into(),
+                path: git_repository,
             }]
         );
     }

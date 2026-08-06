@@ -85,13 +85,13 @@ fn handle_key(terminal: &mut Tui, app: &mut App, key: KeyEvent) -> Result<()> {
             KeyCode::Enter => submit_input(app),
             _ => {}
         },
-        Mode::ConfirmForget(_) => match key.code {
+        Mode::ConfirmRemove(_) => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 app.mode = Mode::Normal;
-                if let Err(error) = app.forget_selected_workspace() {
+                if let Err(error) = app.remove_selected_workspace() {
                     app.message = Some(error.to_string());
                 } else {
-                    app.message = Some("workspace forgotten; files remain on disk".into());
+                    app.message = Some("workspace directory removed; branch remains".into());
                 }
             }
             _ => app.mode = Mode::Normal,
@@ -109,7 +109,7 @@ fn handle_key(terminal: &mut Tui, app: &mut App, key: KeyEvent) -> Result<()> {
             KeyCode::Char('r') => app.refresh_repositories(),
             KeyCode::Char('d') if app.focus == Focus::Workspaces => {
                 match app.selected_workspace_status() {
-                    Ok(status) => app.mode = Mode::ConfirmForget(status),
+                    Ok(status) => app.mode = Mode::ConfirmRemove(status),
                     Err(error) => app.message = Some(error.to_string()),
                 }
             }
@@ -187,7 +187,7 @@ fn render(frame: &mut Frame, app: &App) {
 
     match &app.mode {
         Mode::AddWorkspace(input) => render_input(frame, area, "Create workspace", "Name", input),
-        Mode::ConfirmForget(status) => render_forget_confirm(frame, area, app, status),
+        Mode::ConfirmRemove(status) => render_remove_confirm(frame, area, app, status),
         Mode::Help => render_help(frame, area),
         Mode::Normal => {}
     }
@@ -269,7 +269,7 @@ fn render_input(frame: &mut Frame, area: Rect, title: &str, label: &str, input: 
     );
 }
 
-fn render_forget_confirm(frame: &mut Frame, area: Rect, app: &App, status: &str) {
+fn render_remove_confirm(frame: &mut Frame, area: Rect, app: &App, status: &str) {
     let popup = centered_rect(72, 10, area);
     let name = app
         .selected_workspace()
@@ -278,12 +278,12 @@ fn render_forget_confirm(frame: &mut Frame, area: Rect, app: &App, status: &str)
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(format!(
-            "Forget '{name}'?\n\n{status}\n\nFiles will remain on disk. [y/N]"
+            "Remove '{name}'?\n\n{status}\n\nThe directory will be deleted; the branch remains. [y/N]"
         ))
         .wrap(Wrap { trim: false })
         .block(
             Block::default()
-                .title(" Forget workspace ")
+                .title(" Remove workspace ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
         ),
@@ -293,7 +293,7 @@ fn render_forget_confirm(frame: &mut Frame, area: Rect, app: &App, status: &str)
 
 fn render_help(frame: &mut Frame, area: Rect) {
     let popup = centered_rect(64, 16, area);
-    let help = "j / k / ↑↓  move within pane\nh / l / ←→  switch pane\nEnter       select / move forward / open Codex\nEsc         move back / cancel\nn           create workspace\nd           forget workspace\nr           rescan ghq repositories\n?           help\nq           quit\n\nPress any key to close";
+    let help = "j / k / ↑↓  move within pane\nh / l / ←→  switch pane\nEnter       select / move forward / open Codex\nEsc         move back / cancel\nn           create workspace\nd           remove workspace\nr           rescan ghq repositories\n?           help\nq           quit\n\nPress any key to close";
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(help).wrap(Wrap { trim: false }).block(
