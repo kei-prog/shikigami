@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::git_workspace;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ThreadRecord {
     pub id: String,
@@ -16,6 +18,12 @@ pub struct ThreadRecord {
     pub title: String,
     pub created_at: u64,
     pub updated_at: u64,
+    #[serde(default)]
+    pub archived_at: Option<u64>,
+    #[serde(default)]
+    pub managed_worktree: bool,
+    #[serde(default)]
+    pub worktree_branch: Option<String>,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -26,17 +34,6 @@ struct RegistryData {
 #[derive(Debug)]
 pub struct Registry {
     path: PathBuf,
-}
-
-#[derive(Deserialize)]
-struct Notification {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(rename = "thread-id")]
-    thread_id: String,
-    cwd: PathBuf,
-    #[serde(rename = "input-messages", default)]
-    input_messages: Vec<String>,
 }
 
 impl Registry {
@@ -70,11 +67,64 @@ impl Registry {
         self.save(&threads)
     }
 
+    pub fn register_thread(
+        &self,
+        thread_id: String,
+        repository_path: &Path,
+        cwd: &Path,
+    ) -> Result<()> {
+        let now = now_seconds()?;
+        let worktree_branch = git_workspace::current_branch(cwd).ok().flatten();
+        self.upsert(ThreadRecord {
+            id: thread_id,
+            repository_path: repository_path.to_path_buf(),
+            cwd: cwd.to_path_buf(),
+            title: "Untitled thread".into(),
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            managed_worktree: git_workspace::is_managed_workspace(cwd, worktree_branch.as_deref()),
+            worktree_branch,
+        })
+    }
+
+    pub fn set_title(&self, thread_id: &str, title: &str) -> Result<()> {
+        let mut threads = self.load()?;
+        let thread = threads
+            .iter_mut()
+            .find(|thread| thread.id == thread_id)
+            .context("thread not found")?;
+        if thread.title == "Untitled thread" {
+            thread.title = title
+                .lines()
+                .next()
+                .unwrap_or(title)
+                .chars()
+                .take(80)
+                .collect();
+        }
+        thread.updated_at = now_seconds()?;
+        self.save(&threads)
+    }
+
+    pub fn set_archived(&self, thread_id: &str, archived: bool) -> Result<()> {
+        let mut threads = self.load()?;
+        let thread = threads
+            .iter_mut()
+            .find(|thread| thread.id == thread_id)
+            .context("thread not found")?;
+        thread.archived_at = archived.then(now_seconds).transpose()?;
+        self.save(&threads)
+    }
+
     fn upsert(&self, mut record: ThreadRecord) -> Result<()> {
         let mut threads = self.load()?;
         if let Some(existing) = threads.iter_mut().find(|thread| thread.id == record.id) {
             record.created_at = existing.created_at;
-            record.title.clone_from(&existing.title);
+            if existing.title != "Untitled thread" {
+                record.title.clone_from(&existing.title);
+            }
+            record.archived_at = existing.archived_at;
             *existing = record;
         } else {
             threads.push(record);
@@ -101,40 +151,11 @@ impl Registry {
     }
 }
 
-pub fn capture_notification(repository_path: &Path, payload: &str) -> Result<()> {
-    capture_into(&Registry::discover()?, repository_path, payload)
-}
-
-fn capture_into(registry: &Registry, repository_path: &Path, payload: &str) -> Result<()> {
-    let notification: Notification =
-        serde_json::from_str(payload).context("parse Codex notification")?;
-    if notification.kind != "agent-turn-complete" {
-        return Ok(());
-    }
-
-    let now = SystemTime::now()
+fn now_seconds() -> Result<u64> {
+    Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")?
-        .as_secs();
-    let title = notification
-        .input_messages
-        .iter()
-        .find_map(|message| message.lines().find(|line| !line.trim().is_empty()))
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .unwrap_or("Untitled thread")
-        .chars()
-        .take(80)
-        .collect();
-
-    registry.upsert(ThreadRecord {
-        id: notification.thread_id,
-        repository_path: repository_path.to_path_buf(),
-        cwd: notification.cwd,
-        title,
-        created_at: now,
-        updated_at: now,
-    })
+        .as_secs())
 }
 
 #[cfg(test)]
@@ -144,21 +165,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn captures_and_updates_only_completed_threads() {
+    fn registers_and_titles_a_thread() {
         let temp = tempdir().unwrap();
         let registry = Registry::at(temp.path().join("threads.json"));
         let repository = temp.path().join("repo");
-        let first = format!(
-            r#"{{"type":"agent-turn-complete","thread-id":"thread-1","cwd":"{}","input-messages":["Build the feature\nwith tests"]}}"#,
-            repository.display()
-        );
-        capture_into(&registry, &repository, &first).unwrap();
-
-        let ignored = format!(
-            r#"{{"type":"other","thread-id":"thread-2","cwd":"{}"}}"#,
-            repository.display()
-        );
-        capture_into(&registry, &repository, &ignored).unwrap();
+        fs::create_dir(&repository).unwrap();
+        registry
+            .register_thread("thread-1".into(), &repository, &repository)
+            .unwrap();
+        registry
+            .set_title("thread-1", "Build the feature\nwith tests")
+            .unwrap();
 
         let threads = registry.load().unwrap();
         assert_eq!(threads.len(), 1);
@@ -171,12 +188,43 @@ mod tests {
         let temp = tempdir().unwrap();
         let registry = Registry::at(temp.path().join("threads.json"));
         let repository = temp.path().join("repo");
-        let payload = format!(
-            r#"{{"type":"agent-turn-complete","thread-id":"thread-1","cwd":"{}","input-messages":[]}}"#,
-            repository.display()
-        );
-        capture_into(&registry, &repository, &payload).unwrap();
+        fs::create_dir(&repository).unwrap();
+        registry
+            .register_thread("thread-1".into(), &repository, &repository)
+            .unwrap();
         registry.remove("thread-1").unwrap();
         assert!(registry.load().unwrap().is_empty());
+    }
+
+    #[test]
+    fn archives_and_restores_a_thread() {
+        let temp = tempdir().unwrap();
+        let registry = Registry::at(temp.path().join("threads.json"));
+        let repository = temp.path().join("repo");
+        fs::create_dir(&repository).unwrap();
+        registry
+            .register_thread("thread-1".into(), &repository, &repository)
+            .unwrap();
+
+        registry.set_archived("thread-1", true).unwrap();
+        assert!(registry.load().unwrap()[0].archived_at.is_some());
+
+        registry.set_archived("thread-1", false).unwrap();
+        assert_eq!(registry.load().unwrap()[0].archived_at, None);
+    }
+
+    #[test]
+    fn loads_records_written_before_archive_support() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("threads.json");
+        fs::write(
+            &path,
+            r#"{"threads":[{"id":"old","repository_path":"/tmp/repo","cwd":"/tmp/repo","title":"Old","created_at":1,"updated_at":2}]}"#,
+        )
+        .unwrap();
+        let thread = Registry::at(path).load().unwrap().remove(0);
+        assert_eq!(thread.archived_at, None);
+        assert!(!thread.managed_worktree);
+        assert_eq!(thread.worktree_branch, None);
     }
 }

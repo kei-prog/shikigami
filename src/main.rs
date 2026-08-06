@@ -1,11 +1,10 @@
 mod app;
-mod codex;
+pub mod app_server;
+mod chat;
 mod git_workspace;
 mod registry;
 mod repository;
 mod ui;
-
-use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -26,11 +25,6 @@ enum Command {
         #[command(subcommand)]
         command: RepoCommand,
     },
-    #[command(hide = true)]
-    CaptureThread {
-        repository: PathBuf,
-        payload: String,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -39,15 +33,12 @@ enum RepoCommand {
     List,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        None => ui::run(App::load()?)?,
+        None => ui::run(App::load()?).await?,
         Some(Command::Repo { command }) => run_repo_command(command)?,
-        Some(Command::CaptureThread {
-            repository,
-            payload,
-        }) => registry::capture_notification(&repository, &payload)?,
     }
 
     Ok(())

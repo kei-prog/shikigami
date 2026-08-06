@@ -1,9 +1,12 @@
 use std::{
+    fs,
     path::{Path, PathBuf},
     process::{Command, Output},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
+use directories::ProjectDirs;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Workspace {
@@ -25,6 +28,157 @@ pub fn list_workspaces(repository_path: &Path) -> Result<Vec<Workspace>> {
         &String::from_utf8(output.stdout).context("git returned non-UTF-8 output")?,
         &primary_path,
     )
+}
+
+pub fn create_generated_workspace(
+    repository_path: &Path,
+    repository_name: &str,
+) -> Result<Workspace> {
+    let repository_key = repository_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let identifier = generated_identifier()?;
+    let branch = format!("wyard/{identifier}");
+    let destination = managed_worktrees_root()?
+        .join(repository_key)
+        .join(&identifier);
+    create_workspace_at(repository_path, &branch, &destination)
+}
+
+pub fn current_branch(workspace_path: &Path) -> Result<Option<String>> {
+    let output = git(workspace_path)
+        .args(["branch", "--show-current"])
+        .output()
+        .context("read worktree branch")?;
+    ensure_success("git branch --show-current", &output)?;
+    let branch = String::from_utf8(output.stdout)
+        .context("git returned non-UTF-8 output")?
+        .trim()
+        .to_owned();
+    Ok((!branch.is_empty()).then_some(branch))
+}
+
+pub fn is_managed_workspace(path: &Path, branch: Option<&str>) -> bool {
+    branch.is_some_and(|branch| branch.starts_with("wyard/"))
+        && managed_worktrees_root().is_ok_and(|root| path_is_within(path, &root))
+}
+
+pub fn workspace_is_clean(path: &Path) -> Result<bool> {
+    let output = git(path)
+        .args(["status", "--porcelain"])
+        .output()
+        .context("read worktree status")?;
+    ensure_success("git status --porcelain", &output)?;
+    Ok(output.stdout.is_empty())
+}
+
+pub fn remove_managed_workspace(
+    repository_path: &Path,
+    workspace_path: &Path,
+    branch: Option<&str>,
+) -> Result<()> {
+    if !is_managed_workspace(workspace_path, branch) {
+        bail!("refusing to remove a worktree not owned by wyard");
+    }
+    if !workspace_is_clean(workspace_path)? {
+        bail!("worktree has changes and was not removed");
+    }
+    let output = git(repository_path)
+        .args(["worktree", "remove"])
+        .arg(workspace_path)
+        .output()
+        .context("remove managed worktree")?;
+    ensure_success("git worktree remove", &output)
+}
+
+pub fn restore_managed_workspace(
+    repository_path: &Path,
+    workspace_path: &Path,
+    branch: Option<&str>,
+) -> Result<()> {
+    let branch = branch.context("archived thread has no worktree branch")?;
+    if !is_managed_workspace(workspace_path, Some(branch)) {
+        bail!("refusing to restore a worktree not owned by wyard");
+    }
+    if workspace_path.exists() {
+        return Ok(());
+    }
+    let parent = workspace_path.parent().context("worktree has no parent")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create worktree directory {}", parent.display()))?;
+    let output = git(repository_path)
+        .args(["worktree", "add"])
+        .arg(workspace_path)
+        .arg(branch)
+        .output()
+        .context("restore managed worktree")?;
+    ensure_success("git worktree add", &output)
+}
+
+fn managed_worktrees_root() -> Result<PathBuf> {
+    let dirs = ProjectDirs::from("dev", "kei-prog", "wyard")
+        .context("cannot determine wyard data directory")?;
+    Ok(dirs.data_local_dir().join("worktrees"))
+}
+
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    let Ok(root) = root.canonicalize() else {
+        return path.starts_with(root);
+    };
+    if let Ok(path) = path.canonicalize() {
+        return path.starts_with(root);
+    }
+    path.parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .is_some_and(|parent| parent.starts_with(root))
+}
+
+fn create_workspace_at(
+    repository_path: &Path,
+    branch: &str,
+    destination: &Path,
+) -> Result<Workspace> {
+    if destination.exists() {
+        bail!(
+            "worktree destination already exists: {}",
+            destination.display()
+        );
+    }
+    let parent = destination.parent().context("worktree has no parent")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create worktree directory {}", parent.display()))?;
+    let output = git(repository_path)
+        .args(["worktree", "add", "-b", branch])
+        .arg(destination)
+        .arg("HEAD")
+        .output()
+        .context("run git worktree add")?;
+    ensure_success("git worktree add", &output)?;
+    Ok(Workspace {
+        name: branch.to_owned(),
+        path: destination
+            .canonicalize()
+            .with_context(|| format!("resolve worktree {}", destination.display()))?,
+        is_primary: false,
+    })
+}
+
+fn generated_identifier() -> Result<String> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_nanos();
+    Ok(format!(
+        "{:010x}",
+        (nanos ^ u128::from(std::process::id())) & 0xffffffffff
+    ))
 }
 
 fn parse_workspaces(output: &str, primary_path: &Path) -> Result<Vec<Workspace>> {
@@ -71,6 +225,8 @@ fn ensure_success(action: &str, output: &Output) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
 
     #[test]
@@ -95,5 +251,51 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn creates_a_worktree_and_branch() {
+        let temp = tempdir().unwrap();
+        let repository = temp.path().join("repo");
+        fs::create_dir(&repository).unwrap();
+        run_git(&repository, &["init", "-b", "main"]);
+        run_git(&repository, &["config", "user.name", "wyard test"]);
+        run_git(
+            &repository,
+            &["config", "user.email", "wyard@example.invalid"],
+        );
+        fs::write(repository.join("README.md"), "test\n").unwrap();
+        run_git(&repository, &["add", "README.md"]);
+        run_git(&repository, &["commit", "-m", "Initial"]);
+
+        let destination = temp.path().join("worktree");
+        let workspace = create_workspace_at(&repository, "wyard/abc123", &destination).unwrap();
+        assert_eq!(workspace.name, "wyard/abc123");
+        assert_eq!(workspace.path, destination.canonicalize().unwrap());
+        assert!(!workspace.is_primary);
+        assert!(workspace_is_clean(&workspace.path).unwrap());
+        assert!(!is_managed_workspace(&workspace.path, Some("wyard/abc123")));
+    }
+
+    #[test]
+    fn recognizes_only_owned_paths_and_branches() {
+        let root = managed_worktrees_root().unwrap();
+        assert!(is_managed_workspace(
+            &root.join("owner-repo/abc123"),
+            Some("wyard/abc123")
+        ));
+        assert!(!is_managed_workspace(
+            &root.join("owner-repo/abc123"),
+            Some("feature")
+        ));
+        assert!(!is_managed_workspace(
+            Path::new("/tmp/abc123"),
+            Some("wyard/abc123")
+        ));
+    }
+
+    fn run_git(repository: &Path, args: &[&str]) {
+        let status = git(repository).args(args).status().unwrap();
+        assert!(status.success(), "git command failed: {args:?}");
     }
 }
