@@ -27,57 +27,6 @@ pub fn list_workspaces(repository_path: &Path) -> Result<Vec<Workspace>> {
     )
 }
 
-pub fn add_workspace(repository_path: &Path, name: &str, destination: &Path) -> Result<()> {
-    if destination.exists() {
-        bail!(
-            "workspace destination already exists: {}",
-            destination.display()
-        );
-    }
-    if let Some(parent) = destination.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create workspace parent {}", parent.display()))?;
-    }
-
-    let branch_ref = format!("refs/heads/{name}");
-    let branch_exists = git(repository_path)
-        .args(["show-ref", "--verify", "--quiet", &branch_ref])
-        .status()
-        .context("check workspace branch")?;
-    let mut command = git(repository_path);
-    command.args(["worktree", "add"]);
-    if branch_exists.success() {
-        command.arg(destination).arg(name);
-    } else if branch_exists.code() == Some(1) {
-        command.args(["-b", name]).arg(destination).arg("HEAD");
-    } else {
-        bail!("failed to check whether branch '{name}' exists");
-    }
-    let output = command.output().context("run git worktree add")?;
-    ensure_success("git worktree add", &output)
-}
-
-pub fn remove_workspace(repository_path: &Path, workspace_path: &Path) -> Result<()> {
-    let output = git(repository_path)
-        .args(["worktree", "remove"])
-        .arg(workspace_path)
-        .output()
-        .context("run git worktree remove")?;
-    ensure_success("git worktree remove", &output)
-}
-
-pub fn workspace_status(workspace_path: &Path) -> Result<String> {
-    let output = git(workspace_path)
-        .args(["status", "--short", "--branch"])
-        .output()
-        .context("run git status")?;
-    ensure_success("git status", &output)?;
-    Ok(String::from_utf8(output.stdout)
-        .context("git returned non-UTF-8 output")?
-        .trim()
-        .to_owned())
-}
-
 fn parse_workspaces(output: &str, primary_path: &Path) -> Result<Vec<Workspace>> {
     let mut workspaces = Vec::new();
     for record in output.split("\0\0").filter(|record| !record.is_empty()) {
@@ -122,8 +71,6 @@ fn ensure_success(action: &str, output: &Output) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use tempfile::tempdir;
-
     use super::*;
 
     #[test]
@@ -148,50 +95,5 @@ mod tests {
                 },
             ]
         );
-    }
-
-    #[test]
-    fn manages_real_git_worktrees() {
-        let temp = tempdir().unwrap();
-        let repository = temp.path().join("repo");
-        std::fs::create_dir(&repository).unwrap();
-        run_git(&repository, &["init", "-b", "main"]);
-        run_git(&repository, &["config", "user.name", "wyard test"]);
-        run_git(
-            &repository,
-            &["config", "user.email", "wyard@example.invalid"],
-        );
-        std::fs::write(repository.join("README.md"), "test\n").unwrap();
-        run_git(&repository, &["add", "README.md"]);
-        run_git(&repository, &["commit", "-m", "Initial"]);
-
-        let destination = temp.path().join("feature");
-        add_workspace(&repository, "feature", &destination).unwrap();
-        let canonical_destination = destination.canonicalize().unwrap();
-        assert!(
-            list_workspaces(&repository)
-                .unwrap()
-                .iter()
-                .any(|workspace| {
-                    workspace.name == "feature" && workspace.path == canonical_destination
-                })
-        );
-
-        remove_workspace(&repository, &destination).unwrap();
-        assert!(
-            !destination.exists(),
-            "git worktree remove deletes its directory"
-        );
-        assert!(
-            list_workspaces(&repository)
-                .unwrap()
-                .iter()
-                .all(|workspace| workspace.name != "feature")
-        );
-    }
-
-    fn run_git(repository: &Path, args: &[&str]) {
-        let status = git(repository).args(args).status().unwrap();
-        assert!(status.success(), "git command failed: {args:?}");
     }
 }

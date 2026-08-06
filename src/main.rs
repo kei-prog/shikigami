@@ -1,8 +1,11 @@
 mod app;
 mod codex;
-mod ghq;
 mod git_workspace;
+mod registry;
+mod repository;
 mod ui;
+
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -23,11 +26,16 @@ enum Command {
         #[command(subcommand)]
         command: RepoCommand,
     },
+    #[command(hide = true)]
+    CaptureThread {
+        repository: PathBuf,
+        payload: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum RepoCommand {
-    /// List Git repositories discovered under ghq root
+    /// List repositories registered with wyard
     List,
 }
 
@@ -36,6 +44,10 @@ fn main() -> Result<()> {
     match cli.command {
         None => ui::run(App::load()?)?,
         Some(Command::Repo { command }) => run_repo_command(command)?,
+        Some(Command::CaptureThread {
+            repository,
+            payload,
+        }) => registry::capture_notification(&repository, &payload)?,
     }
 
     Ok(())
@@ -44,7 +56,7 @@ fn main() -> Result<()> {
 fn run_repo_command(command: RepoCommand) -> Result<()> {
     match command {
         RepoCommand::List => {
-            for repository in ghq::discover_repositories()? {
+            for repository in repository::RepositoryStore::discover()?.load_registered()? {
                 println!("{}\t{}", repository.name, repository.path.display());
             }
         }

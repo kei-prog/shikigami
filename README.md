@@ -1,14 +1,17 @@
 # wyard
 
-`wyard` is a fast, lightweight TUI for managing development workspaces. It uses
-Git worktrees internally and opens the native Codex CLI in the selected workspace.
+`wyard` is a fast, lightweight TUI for switching between Codex CLI threads
+across repositories. It keeps a small list of repositories chosen by the user,
+uses the native Codex CLI, and only lists threads created through wyard.
 
 ## Requirements
 
 - Rust 1.85 or later
 - Git
-- ghq
 - Codex CLI (`codex`)
+
+ghq is optional. When available, its repositories are included in the fast
+discovery pass.
 
 ## Install
 
@@ -18,40 +21,51 @@ cargo install --path .
 
 ## Use
 
-Start the TUI:
-
 ```bash
 wyard
 ```
 
-wyard automatically discovers Git repositories under `ghq root`. Select a
-repository, move to its Workspace pane, then:
+On first launch, wyard opens the repository picker. The initial background scan
+checks common development directories and `ghq root` when available. Use `s`
+for an explicit home-directory scan or `b` to browse to a repository. Scan
+results are cached, while the main screen only shows repositories you register.
 
 - `j` / `k`: move within the focused pane
-- `h` / `l`: move between Repository and Workspace panes
-- `Enter`: move forward or open Codex CLI for the selected workspace
+- `h` / `l`: move between Repository and Thread panes
+- `Enter`: move forward or resume the selected thread
 - `Esc`: move back or cancel
-- `n`: create a workspace and branch using `git worktree add`
-- `d`: remove a clean workspace directory; its branch remains
-- `r`: rescan repositories under `ghq root`
+- `a`: add repositories
+- `n`: create a thread; choose the primary repository or an existing worktree
+- `d`: unregister a repository or remove a thread from wyard only
+- `r`: reload registered repositories and threads
 - `?`: show all keys
 - `q`: quit
 
-Discovered repositories can also be listed non-interactively:
+In the repository picker, `/` filters candidates, `Space` selects multiple
+repositories, and `Enter` registers them. Repository discovery is read-only.
+wyard does not create or remove worktrees. Existing worktrees from
+`git worktree list` are offered as locations when a new thread is created.
+
+## Thread registration
+
+wyard starts the native `codex` command with a per-process `notify` callback.
+After the first completed turn, the callback records the Codex thread ID and its
+working directory in wyard's local data directory. Selecting that thread later
+runs `codex resume <thread-id>` from the same directory.
+
+Existing Codex threads are not imported. If Codex exits before its first turn
+completes, no notification is sent and the thread is not registered. The
+per-process callback temporarily overrides any configured Codex `notify`
+callback for Codex sessions launched by wyard.
+
+Repositories can also be listed non-interactively:
 
 ```bash
 wyard repo list
 ```
 
-New workspace directories are stored in wyard's platform data directory.
-Workspace state is always read from `git worktree list`; wyard does not maintain
-a second workspace database or repository registry. Removing a workspace uses
-`git worktree remove`, which refuses to remove a dirty workspace and preserves
-its branch.
-
 ## Scope
 
-The first version intentionally does not embed a PTY or use Codex App Server.
-When a workspace is opened, wyard temporarily leaves the TUI and starts the
-native `codex` command with that workspace as its current directory. Exiting
-Codex returns to wyard.
+wyard intentionally does not embed a terminal or use Codex App Server. It leaves
+the TUI while the native Codex CLI is running and redraws itself after Codex
+exits.
