@@ -1,23 +1,30 @@
 use std::{
     collections::HashMap,
+    fs::{self, OpenOptions},
+    io::ErrorKind,
+    os::unix::net::UnixStream as StdUnixStream,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{ChildStdin, Command},
+    net::UnixStream,
+    process::Command,
     sync::{Mutex, broadcast, mpsc, oneshot},
-    time::timeout,
+    time::{sleep, timeout},
 };
+use tokio_tungstenite::{client_async, tungstenite::Message};
+
+use crate::paths;
 
 type PendingResponses = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 
@@ -73,12 +80,11 @@ struct ModelListResponse {
 }
 
 pub struct AppServer {
-    writer: Arc<Mutex<ChildStdin>>,
+    writer: mpsc::Sender<Value>,
     pending: PendingResponses,
     next_id: AtomicU64,
     events: broadcast::Sender<AppServerEvent>,
     server_requests: Mutex<mpsc::Receiver<AppServerRequest>>,
-    pid: u32,
     version: String,
     request_timeout: Duration,
 }
@@ -96,83 +102,53 @@ impl AppServer {
         let version = String::from_utf8_lossy(&version_output.stdout)
             .trim()
             .to_owned();
-        let mut child = Command::new(command)
-            .args(["app-server", "--listen", "stdio://"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("start {command} app-server"))?;
-        let pid = child.id().context("Codex app-server has no pid")?;
-        let stdin = child.stdin.take().context("open app-server stdin")?;
-        let stdout = child.stdout.take().context("open app-server stdout")?;
+        let socket_path = ensure_shared_app_server(command).await?;
+        let stream = UnixStream::connect(&socket_path)
+            .await
+            .with_context(|| format!("connect App Server socket {}", socket_path.display()))?;
+        let (socket, _) = client_async("ws://localhost/", stream)
+            .await
+            .context("upgrade App Server Unix socket")?;
+        let (mut socket_writer, mut socket_reader) = socket.split();
+        let (writer, mut writer_rx) = mpsc::channel::<Value>(128);
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (events, _) = broadcast::channel(1024);
         let (request_tx, request_rx) = mpsc::channel(128);
 
         let server = Arc::new(Self {
-            writer: Arc::new(Mutex::new(stdin)),
+            writer,
             pending: pending.clone(),
             next_id: AtomicU64::new(1),
             events: events.clone(),
             server_requests: Mutex::new(request_rx),
-            pid,
             version,
             request_timeout,
         });
 
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(message) = serde_json::from_str::<Value>(&line) else {
-                    let _ = events.send(AppServerEvent {
-                        method: "shikigami/invalidJson".into(),
-                        params: json!({"raw": line}),
-                        thread_id: None,
-                        turn_id: None,
-                    });
+            while let Some(message) = writer_rx.recv().await {
+                let Ok(encoded) = serde_json::to_string(&message) else {
                     continue;
                 };
-                if message.get("id").is_some()
-                    && (message.get("result").is_some() || message.get("error").is_some())
+                if socket_writer
+                    .send(Message::Text(encoded.into()))
+                    .await
+                    .is_err()
                 {
-                    dispatch_response(&pending, &message).await;
-                } else if let (Some(id), Some(method)) = (
-                    message.get("id"),
-                    message.get("method").and_then(Value::as_str),
-                ) {
-                    let params = message.get("params").cloned().unwrap_or(Value::Null);
-                    let _ = request_tx
-                        .send(AppServerRequest {
-                            id: id.clone(),
-                            method: method.to_owned(),
-                            thread_id: params
-                                .get("threadId")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned),
-                            turn_id: params
-                                .get("turnId")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned),
-                            params,
-                        })
-                        .await;
-                } else if let Some(method) = message.get("method").and_then(Value::as_str) {
-                    let params = message.get("params").cloned().unwrap_or(Value::Null);
-                    let _ = events.send(AppServerEvent {
-                        method: method.to_owned(),
-                        thread_id: params
-                            .get("threadId")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        turn_id: params
-                            .get("turnId")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        params,
-                    });
+                    break;
                 }
+            }
+        });
+
+        tokio::spawn(async move {
+            while let Some(Ok(frame)) = socket_reader.next().await {
+                let bytes = match frame {
+                    Message::Text(text) => text.as_bytes().to_vec(),
+                    Message::Binary(bytes) => bytes.to_vec(),
+                    Message::Close(_) => break,
+                    _ => continue,
+                };
+                dispatch_message(&pending, &events, &request_tx, &bytes).await;
             }
             let mut pending = pending.lock().await;
             for (_, sender) in pending.drain() {
@@ -184,7 +160,6 @@ impl AppServer {
                 thread_id: None,
                 turn_id: None,
             });
-            let _ = child.wait().await;
         });
 
         server.initialize().await?;
@@ -206,10 +181,6 @@ impl AppServer {
         .await
         .context("initialize Codex app-server")?;
         self.notify("initialized", json!({})).await
-    }
-
-    pub fn pid(&self) -> u32 {
-        self.pid
     }
 
     pub fn version(&self) -> &str {
@@ -345,6 +316,12 @@ impl AppServer {
         .await
     }
 
+    pub async fn unsubscribe_thread(&self, thread_id: &str) -> Result<()> {
+        self.request("thread/unsubscribe", json!({"threadId": thread_id}))
+            .await?;
+        Ok(())
+    }
+
     pub async fn delete_thread(&self, thread_id: &str) -> Result<()> {
         self.request("thread/delete", json!({"threadId": thread_id}))
             .await?;
@@ -407,15 +384,110 @@ impl AppServer {
     }
 
     async fn write(&self, message: &Value) -> Result<()> {
-        let mut encoded = serde_json::to_vec(message)?;
-        encoded.push(b'\n');
-        let mut writer = self.writer.lock().await;
-        writer
-            .write_all(&encoded)
+        self.writer
+            .send(message.clone())
             .await
-            .context("write App Server message")?;
-        writer.flush().await.context("flush App Server message")
+            .context("write App Server message")
     }
+}
+
+async fn ensure_shared_app_server(command: &str) -> Result<PathBuf> {
+    let cache_dir = paths::project_dirs()?.cache_dir().to_path_buf();
+    fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("create App Server cache directory {}", cache_dir.display()))?;
+    let socket_path = cache_dir.join("app-server.sock");
+    if socket_is_live(&socket_path) {
+        return Ok(socket_path);
+    }
+    let lock_path = cache_dir.join("app-server-start.lock");
+    let _startup_lock = acquire_startup_lock(&lock_path, &socket_path).await?;
+    if socket_is_live(&socket_path) {
+        return Ok(socket_path);
+    }
+    if socket_path.exists() {
+        fs::remove_file(&socket_path)
+            .with_context(|| format!("remove stale App Server socket {}", socket_path.display()))?;
+    }
+
+    let log_path = cache_dir.join("app-server.log");
+    let log = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)
+        .with_context(|| format!("open App Server log {}", log_path.display()))?;
+    let stderr = log
+        .try_clone()
+        .with_context(|| format!("clone App Server log {}", log_path.display()))?;
+    let listen = format!("unix://{}", socket_path.display());
+    let mut child = Command::new(command)
+        .args(["app-server", "--listen"])
+        .arg(listen)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr))
+        .kill_on_drop(false)
+        .spawn()
+        .with_context(|| format!("start shared {command} app-server"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if socket_is_live(&socket_path) {
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+            return Ok(socket_path);
+        }
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    bail!(
+        "shared {command} app-server did not start; see {}",
+        log_path.display()
+    )
+}
+
+struct StartupLock(PathBuf);
+
+impl Drop for StartupLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.0);
+    }
+}
+
+async fn acquire_startup_lock(lock_path: &Path, socket_path: &Path) -> Result<StartupLock> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match fs::create_dir(lock_path) {
+            Ok(()) => return Ok(StartupLock(lock_path.to_path_buf())),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                if socket_is_live(socket_path) {
+                    continue;
+                }
+                if Instant::now() >= deadline {
+                    fs::remove_dir(lock_path).with_context(|| {
+                        format!(
+                            "remove stale App Server startup lock {}",
+                            lock_path.display()
+                        )
+                    })?;
+                } else {
+                    sleep(Duration::from_millis(25)).await;
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("create App Server startup lock {}", lock_path.display())
+                });
+            }
+        }
+    }
+}
+
+fn socket_is_live(path: &Path) -> bool {
+    StdUnixStream::connect(path).is_ok()
 }
 
 fn decode_model_list_response(response: Value) -> Result<ModelListResponse> {
@@ -465,6 +537,62 @@ fn extract_thread_id(response: &Value, method: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .with_context(|| format!("{method} response missing thread.id"))
+}
+
+async fn dispatch_message(
+    pending: &PendingResponses,
+    events: &broadcast::Sender<AppServerEvent>,
+    request_tx: &mpsc::Sender<AppServerRequest>,
+    encoded: &[u8],
+) {
+    let Ok(message) = serde_json::from_slice::<Value>(encoded) else {
+        let _ = events.send(AppServerEvent {
+            method: "shikigami/invalidJson".into(),
+            params: json!({"raw": String::from_utf8_lossy(encoded)}),
+            thread_id: None,
+            turn_id: None,
+        });
+        return;
+    };
+    if message.get("id").is_some()
+        && (message.get("result").is_some() || message.get("error").is_some())
+    {
+        dispatch_response(pending, &message).await;
+    } else if let (Some(id), Some(method)) = (
+        message.get("id"),
+        message.get("method").and_then(Value::as_str),
+    ) {
+        let params = message.get("params").cloned().unwrap_or(Value::Null);
+        let _ = request_tx
+            .send(AppServerRequest {
+                id: id.clone(),
+                method: method.to_owned(),
+                thread_id: params
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                turn_id: params
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                params,
+            })
+            .await;
+    } else if let Some(method) = message.get("method").and_then(Value::as_str) {
+        let params = message.get("params").cloned().unwrap_or(Value::Null);
+        let _ = events.send(AppServerEvent {
+            method: method.to_owned(),
+            thread_id: params
+                .get("threadId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            turn_id: params
+                .get("turnId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            params,
+        });
+    }
 }
 
 async fn dispatch_response(pending: &PendingResponses, message: &Value) {
@@ -564,7 +692,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires an installed Codex binary"]
-    async fn installed_codex_initializes_over_stdio() {
+    async fn installed_codex_initializes_over_shared_socket() {
         let server = AppServer::spawn("codex", Duration::from_secs(10))
             .await
             .expect("initialize installed Codex App Server");
@@ -578,5 +706,19 @@ mod tests {
             .await
             .expect("list models from installed Codex App Server");
         assert!(!models.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an installed Codex binary"]
+    async fn installed_codex_accepts_multiple_shared_clients() {
+        let first = AppServer::spawn("codex", Duration::from_secs(10))
+            .await
+            .expect("initialize first client");
+        let second = AppServer::spawn("codex", Duration::from_secs(10))
+            .await
+            .expect("initialize second client");
+        assert!(!first.list_models().await.unwrap().is_empty());
+        drop(first);
+        assert!(!second.list_models().await.unwrap().is_empty());
     }
 }

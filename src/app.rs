@@ -150,6 +150,7 @@ pub struct App {
     pub thread_picker_matches: Vec<usize>,
     pub active_chat_pane: ChatPane,
     pub resumed_threads: HashSet<String>,
+    pub read_only_threads: HashSet<String>,
     pub pending_approvals: VecDeque<AppServerRequest>,
     pub attention_items: VecDeque<AttentionItem>,
     pub attention_index: usize,
@@ -241,6 +242,7 @@ impl App {
             thread_picker_matches: Vec::new(),
             active_chat_pane: ChatPane::Main,
             resumed_threads: HashSet::new(),
+            read_only_threads: HashSet::new(),
             pending_approvals: VecDeque::new(),
             attention_items: VecDeque::new(),
             attention_index: 0,
@@ -638,6 +640,8 @@ impl App {
             .is_some_and(|chat| chat.active_turn_id.is_some())
         {
             "working"
+        } else if self.read_only_threads.contains(thread_id) {
+            "read-only"
         } else if self
             .attention_items
             .iter()
@@ -736,6 +740,19 @@ impl App {
         self.threads
             .iter()
             .any(|thread| thread.record.id == thread_id)
+    }
+
+    pub fn active_chat_is_read_only(&self) -> bool {
+        self.active_chat_id()
+            .is_some_and(|thread_id| self.read_only_threads.contains(thread_id))
+    }
+
+    pub fn set_thread_read_only(&mut self, thread_id: &str, read_only: bool) {
+        if read_only {
+            self.read_only_threads.insert(thread_id.to_owned());
+        } else {
+            self.read_only_threads.remove(thread_id);
+        }
     }
 
     pub fn set_models(&mut self, models: Vec<ModelMetadata>) {
@@ -1040,6 +1057,7 @@ impl App {
             .retain(|item| item.thread_id != thread_id);
         self.persist_attention();
         self.resumed_threads.remove(thread_id);
+        self.read_only_threads.remove(thread_id);
         if self.visible_chat_id.as_deref() == Some(thread_id) {
             self.visible_chat_id = None;
         }

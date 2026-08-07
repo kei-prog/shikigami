@@ -79,11 +79,21 @@ non-primary entries returned by `git worktree list`.
 
 ## Chat runtime
 
-Shikigami starts one local `codex app-server` child and communicates over JSONL on
-stdio. New threads are registered immediately from `thread/start`; existing
-threads use `thread/resume` and `thread/read`. Messages, streamed reasoning
-summaries, plans, command output tails, tool activity, and approvals stay inside
-the Shikigami TUI instead of opening the Codex terminal UI.
+Shikigami starts one local Codex App Server on a private Unix socket when needed,
+then connects every `shi` process to that shared server. Multiple Shikigami
+terminals therefore reuse one App Server instead of competing for the same thread
+store or launching one Codex process each.
+New threads are registered immediately from `thread/start`; existing threads use
+`thread/resume` and `thread/read`. Each connection unsubscribes from its resumed
+threads on exit. Messages, streamed reasoning summaries, plans, command output
+tails, tool activity, and approvals stay inside the Shikigami TUI instead of
+opening the Codex terminal UI. App Server stderr is captured instead of being
+written over the terminal interface.
+
+If another, non-shared Codex process already owns a thread, Shikigami keeps the
+history visible using `thread/read` and marks the chat `READ ONLY`. Close the
+other Codex session and select the thread again through `/threads` to retry
+`thread/resume`; a successful retry restores normal input.
 Every thread and turn runs with `danger-full-access` and approval prompts
 disabled. The red `DANGEROUS` label in the header keeps that execution policy
 visible.

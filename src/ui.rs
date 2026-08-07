@@ -63,7 +63,8 @@ pub async fn run(mut app: App) -> Result<()> {
         Err(error) => app.message = Some(format!("Could not load models: {error}")),
     }
     let mut terminal = init_terminal()?;
-    let result = run_loop(&mut terminal, &mut app, server).await;
+    let result = run_loop(&mut terminal, &mut app, Arc::clone(&server)).await;
+    unsubscribe_all_threads(&mut app, &server).await;
     restore_terminal(&mut terminal)?;
     result
 }
@@ -352,7 +353,12 @@ async fn handle_key(
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                if let Some(chat) = app.chat_mut() {
+                if app.active_chat_is_read_only() {
+                    app.message = Some(
+                        "Read-only: this thread is open in another Codex session; use /threads to retry"
+                            .into(),
+                    );
+                } else if let Some(chat) = app.chat_mut() {
                     chat.composer.push(character);
                 }
             }
@@ -1115,10 +1121,23 @@ async fn focus_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result<(
     let cwd = chat.cwd.clone();
     let model = chat.model.clone();
     if !app.resumed_threads.contains(&thread_id) {
-        server
+        match server
             .resume_thread(&thread_id, &cwd, model.as_deref())
-            .await?;
-        app.resumed_threads.insert(thread_id);
+            .await
+        {
+            Ok(()) => {
+                app.resumed_threads.insert(thread_id.clone());
+                app.set_thread_read_only(&thread_id, false);
+            }
+            Err(error) if is_active_writer_conflict(&error) => {
+                app.set_thread_read_only(&thread_id, true);
+                app.message = Some(
+                    "Opened read-only because another Codex session owns this thread; close it and use /threads to retry"
+                        .into(),
+                );
+            }
+            Err(error) => return Err(error),
+        }
     }
     app.focus = Focus::Chat;
     app.mode = Mode::Chat;
@@ -1129,6 +1148,11 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     let Some(chat) = app.chat() else {
         return Ok(());
     };
+    if app.active_chat_is_read_only() {
+        app.message =
+            Some("Read-only: close the other Codex session, then use /threads to retry".into());
+        return Ok(());
+    }
     if chat.active_turn_id.is_some() || chat.composer.trim().is_empty() {
         return Ok(());
     }
@@ -1166,6 +1190,19 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
         app.update_thread_title(&thread_id, &prompt)?;
     }
     Ok(())
+}
+
+async fn unsubscribe_all_threads(app: &mut App, server: &Arc<AppServer>) {
+    let thread_ids = app.resumed_threads.drain().collect::<Vec<_>>();
+    let requests = thread_ids
+        .iter()
+        .map(|thread_id| server.unsubscribe_thread(thread_id));
+    let _ = tokio::time::timeout(Duration::from_secs(1), futures::future::join_all(requests)).await;
+}
+
+fn is_active_writer_conflict(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("thread-store conflict") && message.contains("active writer")
 }
 
 fn is_approval(request: &AppServerRequest) -> bool {
@@ -1213,8 +1250,11 @@ fn render(frame: &mut Frame, app: &mut App) {
             Constraint::Length(1),
         ])
         .split(area);
+    let read_only = app.active_chat_is_read_only();
     let chat_status = app.chat().map(|chat| {
-        let state = if chat.active_turn_id.is_some() {
+        let state = if read_only {
+            "read-only"
+        } else if chat.active_turn_id.is_some() {
             "working"
         } else {
             "ready"
@@ -1232,7 +1272,15 @@ fn render(frame: &mut Frame, app: &mut App) {
         " Shikigami ",
         Style::default().add_modifier(Modifier::BOLD),
     )];
-    if app.chat().is_some() {
+    if read_only {
+        header.push(Span::styled(
+            " READ ONLY ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        header.push(Span::raw(" "));
+    } else if app.chat().is_some() {
         header.push(Span::styled(
             " DANGEROUS ",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -1313,7 +1361,6 @@ fn render_chat_area(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane) {
     let pane_active = app.active_chat_pane == pane;
-    let show_composer_cursor = app.mode == Mode::Chat && app.focus == Focus::Chat && pane_active;
     let chat_focused = app.focus == Focus::Chat && pane_active;
     let has_side_chat = app.has_side_chat();
     let side_chat_position = app.current_side_chat_position();
@@ -1321,6 +1368,11 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane
         ChatPane::Main => app.visible_chat_id.clone(),
         ChatPane::Side => app.side_chat_id.clone(),
     };
+    let read_only = chat_id
+        .as_deref()
+        .is_some_and(|thread_id| app.read_only_threads.contains(thread_id));
+    let show_composer_cursor =
+        app.mode == Mode::Chat && app.focus == Focus::Chat && pane_active && !read_only;
     let message_position = chat_id
         .as_ref()
         .and_then(|thread_id| app.chats.get(thread_id))
@@ -1396,19 +1448,30 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane
         visible_editor_target(editor_targets, chat.scroll_top, visible_height);
     let scroll = u16::try_from(chat.scroll_top).unwrap_or(u16::MAX);
     frame.render_widget(paragraph.scroll((scroll, 0)), chunks[0]);
-    let message_border = if chat.mode == ChatMode::Input && chat_focused {
+    let message_border = if chat.mode == ChatMode::Input && chat_focused && !read_only {
         Color::Cyan
     } else {
         Color::DarkGray
     };
     let message_block = Block::default()
-        .title(" Message ")
+        .title(if read_only {
+            " Read only "
+        } else {
+            " Message "
+        })
         .borders(Borders::ALL)
         .padding(Padding::right(1))
         .border_style(Style::default().fg(message_border));
     let message_inner = message_block.inner(chunks[1]);
     let composer_width = message_inner.width.max(1) as usize;
-    let composer_lines = wrap_composer(&chat.composer, composer_width);
+    let composer_lines = if read_only {
+        wrap_composer(
+            "Another Codex session owns this thread. Use /threads to retry.",
+            composer_width,
+        )
+    } else {
+        wrap_composer(&chat.composer, composer_width)
+    };
     let composer_height = message_inner.height.max(1) as usize;
     let composer_scroll = composer_lines.len().saturating_sub(composer_height);
     let cursor_column = composer_lines
@@ -1445,19 +1508,23 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane
             .min(message_inner.bottom().saturating_sub(1));
         frame.set_cursor_position((x, y));
     }
-    let help = match chat.mode {
-        ChatMode::Input => {
-            if has_side_chat {
-                "INPUT · Ctrl-G pane · Ctrl-N/P side · Enter send"
-            } else {
-                "INPUT · Enter send · / palette · Ctrl-R effort · Ctrl-U clear · Tab scroll · Esc threads"
+    let help = if read_only {
+        "READ ONLY · / palette · /threads retry · Tab scroll · Esc threads"
+    } else {
+        match chat.mode {
+            ChatMode::Input => {
+                if has_side_chat {
+                    "INPUT · Ctrl-G pane · Ctrl-N/P side · Enter send"
+                } else {
+                    "INPUT · Enter send · / palette · Ctrl-R effort · Ctrl-U clear · Tab scroll · Esc threads"
+                }
             }
-        }
-        ChatMode::Scroll => {
-            if has_side_chat {
-                "SCROLL · j/k line · J/K msg · e nvim · y copy · i input"
-            } else {
-                "SCROLL · j/k line · J/K msg · e nvim · y/Y copy · u/d half · i input"
+            ChatMode::Scroll => {
+                if has_side_chat {
+                    "SCROLL · j/k line · J/K msg · e nvim · y copy · i input"
+                } else {
+                    "SCROLL · j/k line · J/K msg · e nvim · y/Y copy · u/d half · i input"
+                }
             }
         }
     };
@@ -1674,6 +1741,7 @@ fn render_thread_picker(frame: &mut Frame, area: Rect, app: &App) {
         let color = match status {
             "working" => Color::Yellow,
             "attention" => Color::Red,
+            "read-only" => Color::Yellow,
             "current" => Color::Green,
             _ => Color::Cyan,
         };
@@ -2674,6 +2742,16 @@ mod tests {
         )));
         assert!(!is_missing_thread_error(&anyhow::anyhow!(
             "permission denied"
+        )));
+    }
+
+    #[test]
+    fn active_writer_conflicts_are_detected_without_masking_other_errors() {
+        assert!(is_active_writer_conflict(&anyhow::anyhow!(
+            "thread-store conflict: thread test already has an active writer"
+        )));
+        assert!(!is_active_writer_conflict(&anyhow::anyhow!(
+            "thread not found"
         )));
     }
 
