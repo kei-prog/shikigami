@@ -1024,7 +1024,23 @@ fn is_missing_thread_error(error: &anyhow::Error) -> bool {
 }
 
 fn is_recoverable_empty_thread(title: &str, error: &anyhow::Error) -> bool {
-    title == "Untitled thread" && is_missing_thread_error(error)
+    title == "Untitled thread"
+        && (is_missing_thread_error(error) || is_unavailable_thread_read_error(error))
+}
+
+fn is_unavailable_thread_read_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    let Some(payload) = message.strip_prefix("Codex thread/read error: ") else {
+        return false;
+    };
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    payload.get("code").and_then(serde_json::Value::as_i64) == Some(-32600)
+        && payload
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| message.starts_with("thread "))
 }
 
 async fn interrupt_chat(app: &App, server: &Arc<AppServer>) -> Result<()> {
@@ -2785,6 +2801,22 @@ mod tests {
         assert!(!is_recoverable_empty_thread(
             "Untitled thread",
             &anyhow::anyhow!("permission denied")
+        ));
+        let unavailable = anyhow::anyhow!(
+            "{}",
+            r#"Codex thread/read error: {"code":-32600,"message":"thread 019fdb5c-fc45-73b2-bac8-5a8804ff74ce is unavailable"}"#
+        );
+        assert!(is_recoverable_empty_thread("Untitled thread", &unavailable));
+        assert!(!is_recoverable_empty_thread(
+            "Existing thread",
+            &unavailable
+        ));
+        assert!(!is_recoverable_empty_thread(
+            "Untitled thread",
+            &anyhow::anyhow!(
+                "{}",
+                r#"Codex thread/read error: {"code":-32600,"message":"permission denied"}"#
+            )
         ));
     }
 
