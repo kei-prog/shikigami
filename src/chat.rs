@@ -26,6 +26,7 @@ pub enum PaletteCommand {
     SideChat,
     Sides,
     SideClose,
+    Attention,
     Status,
 }
 
@@ -38,6 +39,7 @@ impl PaletteCommand {
             Self::SideChat => "/sidechat",
             Self::Sides => "/sides",
             Self::SideClose => "/sideclose",
+            Self::Attention => "/attention",
             Self::Status => "/status",
         }
     }
@@ -50,6 +52,7 @@ impl PaletteCommand {
             Self::SideChat => "Fork this thread into a side chat",
             Self::Sides => "Choose a side chat for this thread",
             Self::SideClose => "Close the current side chat",
+            Self::Attention => "Show threads that need attention",
             Self::Status => "Show the current thread and workspace",
         }
     }
@@ -100,6 +103,7 @@ impl CommandPalette {
             PaletteEntry::Command(PaletteCommand::SideChat),
             PaletteEntry::Command(PaletteCommand::Sides),
             PaletteEntry::Command(PaletteCommand::SideClose),
+            PaletteEntry::Command(PaletteCommand::Attention),
             PaletteEntry::Command(PaletteCommand::Status),
         ];
         entries.extend(skills.iter().cloned().map(PaletteEntry::Skill));
@@ -1337,6 +1341,9 @@ mod tests {
 
         palette.query = "sideclose".into();
         assert_eq!(palette.visible_entries()[0].label(), "/sideclose");
+
+        palette.query = "attention".into();
+        assert_eq!(palette.visible_entries()[0].label(), "/attention");
     }
 
     #[test]

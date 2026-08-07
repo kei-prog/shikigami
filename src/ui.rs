@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{self, Stdout},
     path::{Path, PathBuf},
     sync::{
@@ -33,7 +34,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    app::{App, ChatPane, Focus, Mode, TreeRow},
+    app::{App, AttentionKind, ChatPane, Focus, Mode, TreeRow},
     app_server::{AppServer, AppServerRequest},
     chat::{
         ChatMessage, ChatMode, ChatRole, ChatState, CommandPalette, EditorTarget, PaletteCommand,
@@ -178,7 +179,7 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
             request = server.next_server_request() => {
                 if let Some(request) = request {
                     if is_approval(&request) {
-                        app.pending_approvals.push_back(request);
+                        app.enqueue_approval(request);
                         app.mode = Mode::Approval;
                         needs_draw = true;
                     } else {
@@ -386,6 +387,14 @@ async fn handle_key(
             KeyCode::Enter => app.select_side_chat_from_picker(),
             _ => {}
         },
+        Mode::Attention => match key.code {
+            KeyCode::Esc => app.close_attention(),
+            KeyCode::Up | KeyCode::Char('k') => app.move_attention_up(),
+            KeyCode::Down | KeyCode::Char('j') => app.move_attention_down(),
+            KeyCode::Char('d') | KeyCode::Char('x') => app.dismiss_selected_attention(),
+            KeyCode::Enter => app.activate_selected_attention(),
+            _ => {}
+        },
         Mode::ConfirmQuitSideChats => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => app.should_quit = true,
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.mode = Mode::Normal,
@@ -530,6 +539,7 @@ async fn handle_key(
                 }
             }
             KeyCode::Char('?') => app.mode = Mode::Help,
+            KeyCode::Char('!') => app.open_attention(),
             KeyCode::Esc if app.selected_tree_is_thread() => app.select_parent_repository(),
             KeyCode::Char('h') | KeyCode::Left => app.collapse_selected_repository(),
             KeyCode::Char('l') | KeyCode::Right => app.expand_selected_repository(),
@@ -786,6 +796,9 @@ async fn select_palette_entry(app: &mut App, server: &Arc<AppServer>) -> Result<
         Some(PaletteEntry::Command(PaletteCommand::SideClose)) => {
             close_side_chat(app, server).await?;
         }
+        Some(PaletteEntry::Command(PaletteCommand::Attention)) => {
+            app.open_attention();
+        }
         Some(PaletteEntry::Command(PaletteCommand::Status)) => {
             if let Some(chat) = app.chat_mut() {
                 chat.push_notice(format!(
@@ -1029,6 +1042,7 @@ async fn resolve_approval(app: &mut App, server: &Arc<AppServer>, accept: bool) 
     let Some(request) = app.pending_approvals.pop_front() else {
         return Ok(());
     };
+    let thread_id = request.thread_id.clone();
     let result = if request.method == "item/permissions/requestApproval" {
         if accept {
             json!({"permissions": request.params.get("permissions").cloned().unwrap_or_else(|| json!({})), "scope":"turn"})
@@ -1039,6 +1053,7 @@ async fn resolve_approval(app: &mut App, server: &Arc<AppServer>, accept: bool) 
         json!({"decision": if accept { "accept" } else { "decline" }})
     };
     server.respond(request.id, result).await?;
+    app.approval_resolved(thread_id.as_deref());
     app.mode = if !app.pending_approvals.is_empty() {
         Mode::Approval
     } else if app.chat().is_some() && app.focus == Focus::Chat {
@@ -1085,6 +1100,15 @@ fn render(frame: &mut Frame, app: &mut App) {
         ));
         header.push(Span::raw(" "));
     }
+    if app.attention_count() > 0 {
+        header.push(Span::styled(
+            format!(" ATTENTION {} ", app.attention_count()),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        header.push(Span::raw(" "));
+    }
     header.push(Span::styled(
         chat_status.as_deref().unwrap_or("repositories / threads"),
         Style::default().fg(Color::DarkGray),
@@ -1099,9 +1123,15 @@ fn render(frame: &mut Frame, app: &mut App) {
     render_navigation_tree(frame, app, panes[0]);
     render_chat_area(frame, panes[1], app);
 
-    let status = app.message.as_deref().unwrap_or(
-        "? help · j/k move/preview · h/l collapse/expand · Enter focus · n new · q quit",
-    );
+    let default_status = if app.attention_count() > 0 {
+        format!(
+            "! attention ({}) · j/k move/preview · Enter focus · n new · q quit",
+            app.attention_count()
+        )
+    } else {
+        "? help · j/k move/preview · h/l collapse/expand · Enter focus · n new · q quit".into()
+    };
+    let status = app.message.as_deref().unwrap_or(&default_status);
     frame.render_widget(
         Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
         chunks[2],
@@ -1118,6 +1148,7 @@ fn render(frame: &mut Frame, app: &mut App) {
         Mode::ChooseModel => render_model_picker(frame, area, app),
         Mode::ChooseReasoningEffort => render_reasoning_effort_picker(frame, area, app),
         Mode::ChooseSideChat => render_side_chat_picker(frame, area, app),
+        Mode::Attention => render_attention(frame, area, app),
         Mode::ConfirmQuitSideChats => render_quit_side_chats_confirm(frame, area, app),
         Mode::Help => render_help(frame, area),
         Mode::Normal | Mode::Chat | Mode::Approval => {}
@@ -1963,18 +1994,33 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_navigation_tree(frame: &mut Frame, app: &App, area: Rect) {
     let visible_thread_id = app.main_chat().map(|chat| chat.thread_id.as_str());
+    let attention_by_thread = app
+        .attention_items
+        .iter()
+        .map(|item| (item.thread_id.as_str(), item.kind))
+        .collect::<HashMap<_, _>>();
+    let attention_by_repository = app.repository_attention_counts();
     let rows = app.tree_rows();
     let items = rows.iter().map(|row| match row {
         TreeRow::Repository { repository_index } => {
             let repository = &app.repositories[*repository_index];
+            let attention_count = attention_by_repository
+                .get(&repository.path)
+                .copied()
+                .unwrap_or(0);
             let marker = if app.repository_is_expanded(*repository_index) {
                 "▾"
             } else {
                 "▸"
             };
+            let attention = if attention_count == 0 {
+                String::new()
+            } else {
+                format!(" [{attention_count}]")
+            };
             ListItem::new(Text::from(vec![
                 Line::styled(
-                    format!("{marker} {}", repository.name),
+                    format!("{marker}{attention} {}", repository.name),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Line::styled(
@@ -1994,8 +2040,13 @@ fn render_navigation_tree(frame: &mut Frame, app: &App, area: Rect) {
                 .pending_approvals
                 .iter()
                 .any(|request| request.thread_id.as_deref() == Some(thread.record.id.as_str()));
-            let marker = if awaiting_approval {
+            let attention_kind = attention_by_thread.get(thread.record.id.as_str()).copied();
+            let marker = if awaiting_approval || attention_kind == Some(AttentionKind::Approval) {
                 "!"
+            } else if attention_kind == Some(AttentionKind::Failed) {
+                "×"
+            } else if attention_kind == Some(AttentionKind::Completed) {
+                "◆"
             } else if working {
                 "◉"
             } else if visible {
@@ -2003,21 +2054,28 @@ fn render_navigation_tree(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 "•"
             };
-            let title_style = if awaiting_approval {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else if working {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else if visible {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
+            let title_style =
+                if awaiting_approval || attention_kind == Some(AttentionKind::Approval) {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else if attention_kind == Some(AttentionKind::Failed) {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                } else if attention_kind == Some(AttentionKind::Completed) {
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD)
+                } else if working {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else if visible {
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
             let kind = if thread.is_primary {
                 "primary"
             } else {
@@ -2276,9 +2334,78 @@ fn render_archive_confirm(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
+    let height = u16::try_from(
+        app.attention_items
+            .len()
+            .saturating_mul(2)
+            .saturating_add(2),
+    )
+    .unwrap_or(u16::MAX)
+    .clamp(7, area.height.saturating_sub(4).max(7));
+    let popup = centered_rect(72, height, area);
+    let items = app.attention_items.iter().map(|item| {
+        let title = app
+            .chats
+            .get(&item.thread_id)
+            .map(|chat| chat.title.as_str())
+            .or_else(|| {
+                app.threads
+                    .iter()
+                    .find(|thread| thread.record.id == item.thread_id)
+                    .map(|thread| thread.record.title.as_str())
+            })
+            .unwrap_or("Unknown thread");
+        let location = app
+            .threads
+            .iter()
+            .find(|thread| thread.record.id == item.thread_id)
+            .map(|thread| thread.location_name.as_str())
+            .unwrap_or("side chat");
+        let (label, color) = match item.kind {
+            AttentionKind::Completed => ("completed", Color::Magenta),
+            AttentionKind::Failed => ("failed", Color::Red),
+            AttentionKind::Approval => ("approval", Color::Yellow),
+        };
+        ListItem::new(Text::from(vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("{label} "),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
+            ]),
+            Line::styled(
+                format!("{} · {}", location, item.thread_id),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]))
+    });
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(format!(" Attention · {} ", app.attention_count()))
+                .title_bottom(Line::from(
+                    " j/k select · Enter open · d dismiss · Esc close ",
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .highlight_symbol("› ")
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    let mut state = ListState::default().with_selected(
+        (!app.attention_items.is_empty()).then_some(
+            app.attention_index
+                .min(app.attention_items.len().saturating_sub(1)),
+        ),
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_stateful_widget(list, popup, &mut state);
+}
+
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(64, 25, area);
-    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand repository / focus chat input\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            open the visible diff hunk in Neovim\ny / Y        copy selected message / full chat\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            commands, skills, model, and side chat\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / remove thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ! approval waiting\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
+    let popup = centered_rect(64, 26, area);
+    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand repository / focus chat input\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            open the visible diff hunk in Neovim\ny / Y        copy selected message / full chat\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            commands, skills, model, and side chat\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / remove thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(help).wrap(Wrap { trim: false }).block(

@@ -39,6 +39,7 @@ results are cached, while the main screen only shows repositories you register.
 - `n`: create a thread in the primary repository, a new worktree, or an existing worktree
 - `x`: archive the selected thread, or restore it from the archived view
 - `A`: switch between active and archived threads
+- `!`: show threads that completed, failed, or need approval
 - `d`: unregister a repository or remove a thread from Shikigami only
 - `r`: reload registered repositories and threads
 - `?`: show all keys
@@ -56,6 +57,13 @@ loaded after a short debounce; previously viewed threads switch immediately.
 Each thread keeps an independent chat state, so multiple turns can continue in
 the background while another thread is displayed. The tree marks the visible,
 working, and approval-waiting threads separately.
+
+During a Shikigami session, a background turn that completes or fails stays in
+the attention list until its chat is viewed or the item is dismissed. The header
+and repository rows show pending counts; `!` opens the list, `j` / `k` selects an
+item, `Enter` opens it, and `d` dismisses a completed or failed item. Pending
+approvals must be accepted or declined. The list is updated directly from App
+Server events without polling.
 
 In the repository picker, `/` filters candidates, `Space` selects multiple
 repositories, and `Enter` registers them. Repository discovery is read-only.
@@ -113,7 +121,8 @@ Press `/` in an empty composer to open the command palette. Built-in Shikigami
 commands and enabled Codex skills for the current workspace appear in one
 fuzzy-searchable list, ranked by name and description matches. Selecting a
 skill inserts its `$skill-name` mention and sends the corresponding App Server
-skill input with the next message. Choose `/model` to select a model and its
+skill input with the next message. Choose `/attention` to open the attention
+list or `/model` to select a model and its
 reasoning effort from the live App Server model catalog. The current selection
 appears in the header and applies to subsequent turns in that thread. Press
 `Ctrl-r` in chat input to open the current model's reasoning-effort slider;

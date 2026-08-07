@@ -43,6 +43,7 @@ pub enum Mode {
     ChooseModel,
     ChooseReasoningEffort,
     ChooseSideChat,
+    Attention,
     ConfirmQuitSideChats,
     Approval,
     Help,
@@ -53,6 +54,29 @@ pub struct ThreadItem {
     pub record: ThreadRecord,
     pub location_name: String,
     pub is_primary: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttentionKind {
+    Completed,
+    Failed,
+    Approval,
+}
+
+impl AttentionKind {
+    fn priority(self) -> u8 {
+        match self {
+            Self::Completed => 0,
+            Self::Failed => 1,
+            Self::Approval => 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttentionItem {
+    pub thread_id: String,
+    pub kind: AttentionKind,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,6 +130,8 @@ pub struct App {
     pub active_chat_pane: ChatPane,
     pub resumed_threads: HashSet<String>,
     pub pending_approvals: VecDeque<AppServerRequest>,
+    pub attention_items: VecDeque<AttentionItem>,
+    pub attention_index: usize,
     pub models: Vec<ModelMetadata>,
     pub model_index: usize,
     pub reasoning_effort_index: usize,
@@ -189,6 +215,8 @@ impl App {
             active_chat_pane: ChatPane::Main,
             resumed_threads: HashSet::new(),
             pending_approvals: VecDeque::new(),
+            attention_items: VecDeque::new(),
+            attention_index: 0,
             models: Vec::new(),
             model_index: 0,
             reasoning_effort_index: 0,
@@ -290,6 +318,8 @@ impl App {
             return;
         };
         self.chats.remove(&thread_id);
+        self.attention_items
+            .retain(|item| item.thread_id != thread_id);
         self.resumed_threads.remove(&thread_id);
         let mut remove_parent = false;
         if let Some(side_chats) = self.side_chats_by_parent.get_mut(&parent_thread_id) {
@@ -395,6 +425,7 @@ impl App {
         self.active_chat_pane = ChatPane::Side;
         self.focus = Focus::Chat;
         self.mode = Mode::Chat;
+        self.mark_thread_seen();
     }
 
     pub fn cycle_side_chat(&mut self, forward: bool) {
@@ -422,6 +453,7 @@ impl App {
             .insert(parent_thread_id.clone(), next);
         self.side_chat_id = Some(thread_id);
         self.side_chat_parent_id = Some(parent_thread_id);
+        self.mark_thread_seen();
     }
 
     pub fn current_side_chat_position(&self) -> Option<(usize, usize)> {
@@ -624,12 +656,156 @@ impl App {
     }
 
     pub fn apply_chat_event(&mut self, event: &AppServerEvent) {
+        let thread_id = event.thread_id.clone();
+        let was_visible = thread_id
+            .as_deref()
+            .is_some_and(|thread_id| self.thread_is_visible(thread_id));
         apply_chat_event_to(&mut self.chats, event);
+        if !was_visible
+            && let (Some(thread_id), Some(kind)) = (thread_id, attention_kind_for_event(event))
+            && self.chats.contains_key(&thread_id)
+        {
+            upsert_attention(&mut self.attention_items, thread_id, kind);
+        }
+        self.clamp_attention_index();
+    }
+
+    pub fn enqueue_approval(&mut self, request: AppServerRequest) {
+        if let Some(thread_id) = request.thread_id.clone() {
+            upsert_attention(
+                &mut self.attention_items,
+                thread_id,
+                AttentionKind::Approval,
+            );
+        }
+        self.pending_approvals.push_back(request);
+        self.clamp_attention_index();
+    }
+
+    pub fn approval_resolved(&mut self, thread_id: Option<&str>) {
+        let Some(thread_id) = thread_id else {
+            return;
+        };
+        let still_pending = self
+            .pending_approvals
+            .iter()
+            .any(|request| request.thread_id.as_deref() == Some(thread_id));
+        if !still_pending {
+            self.attention_items
+                .retain(|item| item.thread_id != thread_id || item.kind != AttentionKind::Approval);
+        }
+        self.clamp_attention_index();
+    }
+
+    pub fn attention_count(&self) -> usize {
+        self.attention_items.len()
+    }
+
+    pub fn repository_attention_counts(&self) -> HashMap<PathBuf, usize> {
+        let mut repositories_by_thread = self
+            .threads
+            .iter()
+            .map(|thread| {
+                (
+                    thread.record.id.as_str(),
+                    thread.record.repository_path.clone(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for (parent_id, side_chats) in &self.side_chats_by_parent {
+            let Some(repository_path) = repositories_by_thread.get(parent_id.as_str()).cloned()
+            else {
+                continue;
+            };
+            for thread_id in side_chats {
+                repositories_by_thread.insert(thread_id, repository_path.clone());
+            }
+        }
+        let mut counts = HashMap::new();
+        for item in &self.attention_items {
+            if let Some(repository_path) = repositories_by_thread.get(item.thread_id.as_str()) {
+                *counts.entry(repository_path.clone()).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    pub fn open_attention(&mut self) {
+        if self.attention_items.is_empty() {
+            self.message = Some("Nothing needs attention".into());
+            return;
+        }
+        self.attention_index = self
+            .attention_index
+            .min(self.attention_items.len().saturating_sub(1));
+        self.mode = Mode::Attention;
+    }
+
+    pub fn close_attention(&mut self) {
+        self.mode = if self.chat().is_some() && self.focus == Focus::Chat {
+            Mode::Chat
+        } else {
+            Mode::Normal
+        };
+    }
+
+    pub fn move_attention_up(&mut self) {
+        self.attention_index = self.attention_index.saturating_sub(1);
+    }
+
+    pub fn move_attention_down(&mut self) {
+        if self.attention_index + 1 < self.attention_items.len() {
+            self.attention_index += 1;
+        }
+    }
+
+    pub fn dismiss_selected_attention(&mut self) {
+        let Some(item) = self.attention_items.get(self.attention_index) else {
+            self.close_attention();
+            return;
+        };
+        if item.kind == AttentionKind::Approval {
+            self.message = Some("Accept or decline the pending approval".into());
+            return;
+        }
+        self.attention_items.remove(self.attention_index);
+        self.clamp_attention_index();
+        if self.attention_items.is_empty() {
+            self.close_attention();
+        }
+    }
+
+    pub fn activate_selected_attention(&mut self) {
+        let Some(item) = self.attention_items.get(self.attention_index).cloned() else {
+            self.close_attention();
+            return;
+        };
+        if item.kind == AttentionKind::Approval {
+            if let Some(index) = self
+                .pending_approvals
+                .iter()
+                .position(|request| request.thread_id.as_deref() == Some(item.thread_id.as_str()))
+                && let Some(request) = self.pending_approvals.remove(index)
+            {
+                self.pending_approvals.push_front(request);
+            }
+            self.reveal_chat(&item.thread_id);
+            self.mode = Mode::Approval;
+            return;
+        }
+        self.attention_items.remove(self.attention_index);
+        self.clamp_attention_index();
+        if !self.reveal_chat(&item.thread_id) {
+            self.message = Some("The selected thread is no longer available".into());
+            self.close_attention();
+        }
     }
 
     pub fn discard_chat(&mut self, thread_id: &str) {
         self.discard_side_chats_for_parent(thread_id);
         self.chats.remove(thread_id);
+        self.attention_items
+            .retain(|item| item.thread_id != thread_id);
         self.resumed_threads.remove(thread_id);
         if self.visible_chat_id.as_deref() == Some(thread_id) {
             self.visible_chat_id = None;
@@ -650,14 +826,87 @@ impl App {
             .cloned();
         self.side_chat_parent_id = self.side_chat_id.as_ref().map(|_| thread_id);
         self.active_chat_pane = ChatPane::Main;
+        self.mark_thread_seen();
+    }
+
+    fn reveal_chat(&mut self, thread_id: &str) -> bool {
+        if let Some(thread) = self
+            .threads
+            .iter()
+            .find(|thread| thread.record.id == thread_id)
+        {
+            let selection = TreeSelection::Thread {
+                id: thread.record.id.clone(),
+                repository: thread.record.repository_path.clone(),
+            };
+            self.restore_tree_selection(selection);
+            self.sync_selection_from_tree();
+            self.show_main_chat_id(thread_id.to_owned());
+            self.focus = Focus::Chat;
+            self.mode = Mode::Chat;
+            return true;
+        }
+        let Some(parent_thread_id) = self.side_chat_parent(thread_id) else {
+            return false;
+        };
+        if !self.reveal_chat(&parent_thread_id) {
+            return false;
+        }
+        let Some(index) = self
+            .side_chats_by_parent
+            .get(&parent_thread_id)
+            .and_then(|side_chats| side_chats.iter().position(|id| id == thread_id))
+        else {
+            return false;
+        };
+        self.selected_side_chat_by_parent
+            .insert(parent_thread_id.clone(), index);
+        self.side_chat_id = Some(thread_id.to_owned());
+        self.side_chat_parent_id = Some(parent_thread_id);
+        self.active_chat_pane = ChatPane::Side;
+        self.mark_thread_seen();
+        true
+    }
+
+    fn side_chat_parent(&self, thread_id: &str) -> Option<String> {
+        self.side_chats_by_parent
+            .iter()
+            .find(|(_, side_chats)| side_chats.iter().any(|id| id == thread_id))
+            .map(|(parent_id, _)| parent_id.clone())
+    }
+
+    fn thread_is_visible(&self, thread_id: &str) -> bool {
+        self.visible_chat_id.as_deref() == Some(thread_id)
+            || self.side_chat_id.as_deref() == Some(thread_id)
+    }
+
+    fn mark_thread_seen(&mut self) {
+        let visible = [
+            self.visible_chat_id.as_deref(),
+            self.side_chat_id.as_deref(),
+        ];
+        self.attention_items.retain(|item| {
+            item.kind == AttentionKind::Approval
+                || !visible.into_iter().flatten().any(|id| id == item.thread_id)
+        });
+        self.clamp_attention_index();
+    }
+
+    fn clamp_attention_index(&mut self) {
+        self.attention_index = self
+            .attention_index
+            .min(self.attention_items.len().saturating_sub(1));
     }
 
     fn discard_side_chats_for_parent(&mut self, parent_thread_id: &str) {
         if let Some(side_chats) = self.side_chats_by_parent.remove(parent_thread_id) {
+            self.attention_items
+                .retain(|item| !side_chats.contains(&item.thread_id));
             for thread_id in side_chats {
                 self.chats.remove(&thread_id);
                 self.resumed_threads.remove(&thread_id);
             }
+            self.clamp_attention_index();
         }
         self.selected_side_chat_by_parent.remove(parent_thread_id);
         if self.side_chat_parent_id.as_deref() == Some(parent_thread_id) {
@@ -1359,6 +1608,41 @@ fn apply_chat_event_to(chats: &mut HashMap<String, ChatState>, event: &AppServer
     }
 }
 
+fn attention_kind_for_event(event: &AppServerEvent) -> Option<AttentionKind> {
+    match event.method.as_str() {
+        "error" => Some(AttentionKind::Failed),
+        "turn/completed" => {
+            let status = event
+                .params
+                .pointer("/turn/status")
+                .or_else(|| event.params.get("status"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("completed");
+            if matches!(status, "failed" | "error")
+                || event
+                    .params
+                    .pointer("/turn/error")
+                    .is_some_and(|error| !error.is_null())
+            {
+                Some(AttentionKind::Failed)
+            } else {
+                Some(AttentionKind::Completed)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn upsert_attention(items: &mut VecDeque<AttentionItem>, thread_id: String, kind: AttentionKind) {
+    if let Some(item) = items.iter_mut().find(|item| item.thread_id == thread_id) {
+        if kind.priority() > item.kind.priority() {
+            item.kind = kind;
+        }
+        return;
+    }
+    items.push_back(AttentionItem { thread_id, kind });
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
@@ -1540,5 +1824,36 @@ mod tests {
         );
 
         assert!(chats.values().all(|chat| chat.skills_stale));
+    }
+
+    #[test]
+    fn attention_queue_deduplicates_and_keeps_the_more_urgent_state() {
+        let mut items = VecDeque::new();
+        upsert_attention(&mut items, "one".into(), AttentionKind::Completed);
+        upsert_attention(&mut items, "one".into(), AttentionKind::Failed);
+        upsert_attention(&mut items, "one".into(), AttentionKind::Completed);
+
+        assert_eq!(
+            items,
+            VecDeque::from([AttentionItem {
+                thread_id: "one".into(),
+                kind: AttentionKind::Failed,
+            }])
+        );
+    }
+
+    #[test]
+    fn failed_turns_are_classified_for_attention() {
+        let event = AppServerEvent {
+            method: "turn/completed".into(),
+            params: json!({"turn":{"status":"failed","error":{"message":"boom"}}}),
+            thread_id: Some("one".into()),
+            turn_id: Some("turn-one".into()),
+        };
+
+        assert_eq!(
+            attention_kind_for_event(&event),
+            Some(AttentionKind::Failed)
+        );
     }
 }
