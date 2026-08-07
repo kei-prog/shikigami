@@ -1,8 +1,8 @@
-# wyard
+# Shikigami
 
-`wyard` is a fast, lightweight TUI for switching between Codex CLI threads
+`shi` is a fast, lightweight TUI for switching between Codex CLI threads
 across repositories. It keeps a small list of repositories chosen by the user,
-uses Codex App Server, and only lists threads created through wyard.
+uses Codex App Server, and only lists threads created through Shikigami.
 
 ## Requirements
 
@@ -22,10 +22,10 @@ cargo install --path .
 ## Use
 
 ```bash
-wyard
+shi
 ```
 
-On first launch, wyard opens the repository picker. The initial background scan
+On first launch, Shikigami opens the repository picker. The initial background scan
 checks common development directories and `ghq root` when available. Use `s`
 for an explicit home-directory scan or `b` to browse to a repository. Scan
 results are cached, while the main screen only shows repositories you register.
@@ -39,13 +39,13 @@ results are cached, while the main screen only shows repositories you register.
 - `n`: create a thread in the primary repository, a new worktree, or an existing worktree
 - `x`: archive the selected thread, or restore it from the archived view
 - `A`: switch between active and archived threads
-- `d`: unregister a repository or remove a thread from wyard only
+- `d`: unregister a repository or remove a thread from Shikigami only
 - `r`: reload registered repositories and threads
 - `?`: show all keys
 - `q`: quit
 
 The left pane is one expandable tree: each registered repository keeps its
-wyard-created threads directly underneath it, and multiple repositories can be
+Shikigami-created threads directly underneath it, and multiple repositories can be
 expanded at once. Expansion state is restored on the next launch. The right
 chat pane stays visible while navigating the tree.
 Creating a thread with `n` always uses the selected repository, including when
@@ -62,18 +62,18 @@ repositories, and `Enter` registers them. Repository discovery is read-only.
 Existing worktrees from `git worktree list` are offered as locations when a new
 thread is created.
 
-Choosing `New worktree` creates an automatically named `wyard/<id>` branch and
-worktree under wyard's local data directory, then immediately starts Codex. No
+Choosing `New worktree` creates an automatically named `shi/<id>` branch and
+worktree under Shikigami's local data directory, then immediately starts Codex. No
 branch or directory name input is required. `Existing worktree` only lists
 non-primary entries returned by `git worktree list`.
 
 ## Chat runtime
 
-wyard starts one local `codex app-server` child and communicates over JSONL on
+Shikigami starts one local `codex app-server` child and communicates over JSONL on
 stdio. New threads are registered immediately from `thread/start`; existing
 threads use `thread/resume` and `thread/read`. Messages, streamed reasoning
 summaries, plans, command output tails, tool activity, and approvals stay inside
-the wyard TUI instead of opening the Codex terminal UI.
+the Shikigami TUI instead of opening the Codex terminal UI.
 Every thread and turn runs with `danger-full-access` and approval prompts
 disabled. The red `DANGEROUS` label in the header keeps that execution policy
 visible.
@@ -83,7 +83,7 @@ activity use compact full-width gray bands separated by one line. Their heading
 is yellow while running, green when completed, and red when failed.
 File-change activity automatically includes the unified diff supplied by App
 Server. Added lines are green, removed lines are red, and hunk headers are cyan;
-wyard does not run Git or an external diff formatter for this display.
+Shikigami does not run Git or an external diff formatter for this display.
 After sending a message, an animated `Thinking…` indicator appears until the
 first response, reasoning summary, or tool activity arrives. It is display-only
 and is not added to the saved conversation history. The latest in-progress
@@ -104,12 +104,12 @@ keeps it visible. Press `y` to copy that message without its rendered wrapping
 or borders, or `Y` to copy the full current chat with role labels. Main and side
 chats keep independent selections. Clipboard commands are launched only when a
 copy is requested (`pbcopy` on macOS, with native command fallbacks elsewhere).
-When a diff hunk is visible, `e` temporarily suspends wyard and opens Neovim at
-the hunk's new-file line. Exiting Neovim restores the same wyard chat and scroll
+When a diff hunk is visible, `e` temporarily suspends Shikigami and opens Neovim at
+the hunk's new-file line. Exiting Neovim restores the same Shikigami chat and scroll
 position with a full redraw. Paths are resolved inside the thread workspace;
 deleted files and paths outside that workspace are rejected.
 
-Press `/` in an empty composer to open the command palette. Built-in wyard
+Press `/` in an empty composer to open the command palette. Built-in Shikigami
 commands and enabled Codex skills for the current workspace appear in one
 fuzzy-searchable list, ranked by name and description matches. Selecting a
 skill inserts its `$skill-name` mention and sends the corresponding App Server
@@ -121,7 +121,7 @@ appears in the header and applies to subsequent turns in that thread. Press
 New chats default to `medium` reasoning when the selected model supports it.
 
 Choose `/sidechat` to create an ephemeral fork of the current thread. Each main
-thread can keep multiple side chats for the current wyard session. The chat area
+thread can keep multiple side chats for the current Shikigami session. The chat area
 splits into main and the selected side pane, and both can stream independently.
 Press `Ctrl-g` to switch focus. While the side pane is focused, `Ctrl-n` and
 `Ctrl-p` cycle through its forks. `/sides` opens the full list; moving with
@@ -129,25 +129,29 @@ Press `Ctrl-g` to switch focus. While the side pane is focused, `Ctrl-n` and
 previous selection. Use `/sideclose` to close the selected fork without
 confirmation. Moving to another
 main thread hides its side chats; returning restores them. Side chats are not
-added to the repository tree and disappear when wyard exits. Quitting asks for
+added to the repository tree and disappear when Shikigami exits. Quitting asks for
 confirmation whenever at least one side chat remains open.
 
 Existing Codex threads are not imported.
 
 Archiving hides a thread without deleting its Codex history. If the thread uses
-a clean worktree created by wyard, wyard offers to remove that worktree while
+a clean worktree created by Shikigami, Shikigami offers to remove that worktree while
 preserving its branch. Dirty worktrees, primary repositories, and worktrees not
-created by wyard are always kept. Restoring an archived thread recreates a
-removed wyard worktree from its preserved branch.
+created by Shikigami are always kept. Restoring an archived thread recreates a
+removed Shikigami worktree from its preserved branch.
+
+Shikigami copies repository, thread, and UI state from the legacy `wyard` data
+directory on first launch. Existing `wyard/<id>` managed worktrees remain supported
+in place; newly created managed worktrees use the `shi/<id>` branch prefix.
 
 Repositories can also be listed non-interactively:
 
 ```bash
-wyard repo list
+shi repo list
 ```
 
 ## Scope
 
-wyard is a lightweight App Server client. Codex still owns agent execution,
-tools, sandboxing, conversation history, and authentication; wyard owns the TUI,
+Shikigami is a lightweight App Server client. Codex still owns agent execution,
+tools, sandboxing, conversation history, and authentication; Shikigami owns the TUI,
 repository/worktree lifecycle, and its selected thread registry.

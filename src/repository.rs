@@ -8,8 +8,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use directories::{BaseDirs, ProjectDirs};
+use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
+
+use crate::paths;
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct Repository {
@@ -46,12 +48,27 @@ pub enum ScanEvent {
 
 impl RepositoryStore {
     pub fn discover() -> Result<Self> {
-        let dirs = ProjectDirs::from("dev", "kei-prog", "wyard")
-            .context("cannot determine wyard data directory")?;
+        let dirs = paths::project_dirs()?;
+        let legacy_dirs = paths::legacy_project_dirs()?;
+        let registered_path = dirs.data_local_dir().join("repositories.json");
+        let candidates_path = dirs.cache_dir().join("repository-candidates.json");
+        let ui_state_path = dirs.data_local_dir().join("repository-ui.json");
+        paths::migrate_file(
+            &legacy_dirs.data_local_dir().join("repositories.json"),
+            &registered_path,
+        )?;
+        paths::migrate_file(
+            &legacy_dirs.cache_dir().join("repository-candidates.json"),
+            &candidates_path,
+        )?;
+        paths::migrate_file(
+            &legacy_dirs.data_local_dir().join("repository-ui.json"),
+            &ui_state_path,
+        )?;
         Ok(Self {
-            registered_path: dirs.data_local_dir().join("repositories.json"),
-            candidates_path: dirs.cache_dir().join("repository-candidates.json"),
-            ui_state_path: dirs.data_local_dir().join("repository-ui.json"),
+            registered_path,
+            candidates_path,
+            ui_state_path,
         })
     }
 

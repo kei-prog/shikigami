@@ -127,7 +127,7 @@ impl AppServer {
             while let Ok(Some(line)) = lines.next_line().await {
                 let Ok(message) = serde_json::from_str::<Value>(&line) else {
                     let _ = events.send(AppServerEvent {
-                        method: "wyard/invalidJson".into(),
+                        method: "shikigami/invalidJson".into(),
                         params: json!({"raw": line}),
                         thread_id: None,
                         turn_id: None,
@@ -179,7 +179,7 @@ impl AppServer {
                 let _ = sender.send(Err("Codex app-server exited".into()));
             }
             let _ = events.send(AppServerEvent {
-                method: "wyard/processExited".into(),
+                method: "shikigami/processExited".into(),
                 params: Value::Null,
                 thread_id: None,
                 turn_id: None,
@@ -196,8 +196,8 @@ impl AppServer {
             "initialize",
             json!({
                 "clientInfo": {
-                    "name": "wyard",
-                    "title": "wyard",
+                    "name": "shikigami",
+                    "title": "Shikigami",
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "capabilities": {"experimentalApi": true}

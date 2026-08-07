@@ -5,10 +5,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::git_workspace;
+use crate::{git_workspace, paths};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ThreadRecord {
@@ -38,11 +37,11 @@ pub struct Registry {
 
 impl Registry {
     pub fn discover() -> Result<Self> {
-        let dirs = ProjectDirs::from("dev", "kei-prog", "wyard")
-            .context("cannot determine wyard data directory")?;
-        Ok(Self {
-            path: dirs.data_local_dir().join("threads.json"),
-        })
+        let dirs = paths::project_dirs()?;
+        let legacy_dirs = paths::legacy_project_dirs()?;
+        let path = dirs.data_local_dir().join("threads.json");
+        paths::migrate_file(&legacy_dirs.data_local_dir().join("threads.json"), &path)?;
+        Ok(Self { path })
     }
 
     #[cfg(test)]
@@ -184,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn removes_a_thread_from_wyard_only() {
+    fn removes_a_thread_from_shikigami_only() {
         let temp = tempdir().unwrap();
         let registry = Registry::at(temp.path().join("threads.json"));
         let repository = temp.path().join("repo");

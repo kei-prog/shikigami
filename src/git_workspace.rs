@@ -6,7 +6,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use directories::ProjectDirs;
+
+use crate::paths;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Workspace {
@@ -45,7 +46,7 @@ pub fn create_generated_workspace(
         })
         .collect::<String>();
     let identifier = generated_identifier()?;
-    let branch = format!("wyard/{identifier}");
+    let branch = format!("shi/{identifier}");
     let destination = managed_worktrees_root()?
         .join(repository_key)
         .join(&identifier);
@@ -66,8 +67,15 @@ pub fn current_branch(workspace_path: &Path) -> Result<Option<String>> {
 }
 
 pub fn is_managed_workspace(path: &Path, branch: Option<&str>) -> bool {
-    branch.is_some_and(|branch| branch.starts_with("wyard/"))
-        && managed_worktrees_root().is_ok_and(|root| path_is_within(path, &root))
+    match branch {
+        Some(branch) if branch.starts_with("shi/") => {
+            managed_worktrees_root().is_ok_and(|root| path_is_within(path, &root))
+        }
+        Some(branch) if branch.starts_with("wyard/") => {
+            legacy_managed_worktrees_root().is_ok_and(|root| path_is_within(path, &root))
+        }
+        _ => false,
+    }
 }
 
 pub fn workspace_is_clean(path: &Path) -> Result<bool> {
@@ -85,7 +93,7 @@ pub fn remove_managed_workspace(
     branch: Option<&str>,
 ) -> Result<()> {
     if !is_managed_workspace(workspace_path, branch) {
-        bail!("refusing to remove a worktree not owned by wyard");
+        bail!("refusing to remove a worktree not owned by Shikigami");
     }
     if !workspace_is_clean(workspace_path)? {
         bail!("worktree has changes and was not removed");
@@ -105,7 +113,7 @@ pub fn restore_managed_workspace(
 ) -> Result<()> {
     let branch = branch.context("archived thread has no worktree branch")?;
     if !is_managed_workspace(workspace_path, Some(branch)) {
-        bail!("refusing to restore a worktree not owned by wyard");
+        bail!("refusing to restore a worktree not owned by Shikigami");
     }
     if workspace_path.exists() {
         return Ok(());
@@ -123,9 +131,13 @@ pub fn restore_managed_workspace(
 }
 
 fn managed_worktrees_root() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("dev", "kei-prog", "wyard")
-        .context("cannot determine wyard data directory")?;
-    Ok(dirs.data_local_dir().join("worktrees"))
+    Ok(paths::project_dirs()?.data_local_dir().join("worktrees"))
+}
+
+fn legacy_managed_worktrees_root() -> Result<PathBuf> {
+    Ok(paths::legacy_project_dirs()?
+        .data_local_dir()
+        .join("worktrees"))
 }
 
 fn path_is_within(path: &Path, root: &Path) -> bool {
@@ -259,22 +271,22 @@ mod tests {
         let repository = temp.path().join("repo");
         fs::create_dir(&repository).unwrap();
         run_git(&repository, &["init", "-b", "main"]);
-        run_git(&repository, &["config", "user.name", "wyard test"]);
+        run_git(&repository, &["config", "user.name", "Shikigami test"]);
         run_git(
             &repository,
-            &["config", "user.email", "wyard@example.invalid"],
+            &["config", "user.email", "shikigami@example.invalid"],
         );
         fs::write(repository.join("README.md"), "test\n").unwrap();
         run_git(&repository, &["add", "README.md"]);
         run_git(&repository, &["commit", "-m", "Initial"]);
 
         let destination = temp.path().join("worktree");
-        let workspace = create_workspace_at(&repository, "wyard/abc123", &destination).unwrap();
-        assert_eq!(workspace.name, "wyard/abc123");
+        let workspace = create_workspace_at(&repository, "shi/abc123", &destination).unwrap();
+        assert_eq!(workspace.name, "shi/abc123");
         assert_eq!(workspace.path, destination.canonicalize().unwrap());
         assert!(!workspace.is_primary);
         assert!(workspace_is_clean(&workspace.path).unwrap());
-        assert!(!is_managed_workspace(&workspace.path, Some("wyard/abc123")));
+        assert!(!is_managed_workspace(&workspace.path, Some("shi/abc123")));
     }
 
     #[test]
@@ -282,7 +294,7 @@ mod tests {
         let root = managed_worktrees_root().unwrap();
         assert!(is_managed_workspace(
             &root.join("owner-repo/abc123"),
-            Some("wyard/abc123")
+            Some("shi/abc123")
         ));
         assert!(!is_managed_workspace(
             &root.join("owner-repo/abc123"),
@@ -290,6 +302,15 @@ mod tests {
         ));
         assert!(!is_managed_workspace(
             Path::new("/tmp/abc123"),
+            Some("shi/abc123")
+        ));
+        let legacy_root = legacy_managed_worktrees_root().unwrap();
+        assert!(is_managed_workspace(
+            &legacy_root.join("owner-repo/abc123"),
+            Some("wyard/abc123")
+        ));
+        assert!(!is_managed_workspace(
+            &root.join("owner-repo/abc123"),
             Some("wyard/abc123")
         ));
     }

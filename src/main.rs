@@ -3,6 +3,7 @@ pub mod app_server;
 mod chat;
 mod clipboard;
 mod git_workspace;
+mod paths;
 mod registry;
 mod repository;
 mod ui;
@@ -30,7 +31,7 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum RepoCommand {
-    /// List repositories registered with wyard
+    /// List repositories registered with Shikigami
     List,
 }
 

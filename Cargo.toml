@@ -1,9 +1,13 @@
 [package]
-name = "wyard"
+name = "shikigami"
 version = "0.1.0"
 edition = "2024"
-description = "A fast, lightweight TUI for managing development workspaces"
+description = "A fast, lightweight TUI for managing Codex threads across repositories"
 license = "MIT"
+
+[[bin]]
+name = "shi"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"

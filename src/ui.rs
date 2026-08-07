@@ -486,7 +486,7 @@ async fn handle_key(
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 app.mode = Mode::Normal;
                 app.message = Some(match app.remove_selected_thread() {
-                    Ok(()) => "removed from wyard; Codex history remains".into(),
+                    Ok(()) => "removed from Shikigami; Codex history remains".into(),
                     Err(error) => error.to_string(),
                 });
             }
@@ -496,7 +496,7 @@ async fn handle_key(
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 app.mode = Mode::Normal;
                 app.message = Some(match app.archive_selected_thread(true) {
-                    Ok(()) => "archived; clean wyard worktree removed".into(),
+                    Ok(()) => "archived; clean Shikigami worktree removed".into(),
                     Err(error) => error.to_string(),
                 });
             }
@@ -514,7 +514,7 @@ async fn handle_key(
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 app.mode = Mode::Normal;
                 app.message = Some(match app.unregister_selected_repository() {
-                    Ok(()) => "repository removed from wyard".into(),
+                    Ok(()) => "repository removed from Shikigami".into(),
                     Err(error) => error.to_string(),
                 });
             }
@@ -1075,7 +1075,7 @@ fn render(frame: &mut Frame, app: &mut App) {
         )
     });
     let mut header = vec![Span::styled(
-        " wyard ",
+        " Shikigami ",
         Style::default().add_modifier(Modifier::BOLD),
     )];
     if app.chat().is_some() {
@@ -1497,7 +1497,7 @@ fn render_quit_side_chats_confirm(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(format!(
-            "{count} side chat{} will be discarded when wyard exits.\n\nQuit? [y/N]",
+            "{count} side chat{} will be discarded when Shikigami exits.\n\nQuit? [y/N]",
             if count == 1 { "" } else { "s" }
         ))
         .wrap(Wrap { trim: false })
@@ -2219,7 +2219,7 @@ fn render_remove_confirm(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(format!(
-            "Remove '{title}' from wyard?\n\nCodex history is not deleted. [y/N]"
+            "Remove '{title}' from Shikigami?\n\nCodex history is not deleted. [y/N]"
         ))
         .wrap(Wrap { trim: false })
         .block(
@@ -2241,7 +2241,7 @@ fn render_repository_remove_confirm(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(format!(
-            "Remove '{name}' from wyard?\n\nFiles and Codex threads are not deleted. [y/N]"
+            "Remove '{name}' from Shikigami?\n\nFiles and Codex threads are not deleted. [y/N]"
         ))
         .wrap(Wrap { trim: false })
         .block(
@@ -2263,7 +2263,7 @@ fn render_archive_confirm(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(format!(
-            "Archive '{title}'?\n\nThe wyard-created worktree is clean.\nRemove it now? The branch and Codex history remain. [y/N]"
+            "Archive '{title}'?\n\nThe Shikigami-created worktree is clean.\nRemove it now? The branch and Codex history remain. [y/N]"
         ))
         .wrap(Wrap { trim: false })
         .block(
