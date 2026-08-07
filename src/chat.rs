@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::VecDeque, path::PathBuf};
 
 use serde_json::Value;
 
@@ -267,6 +267,7 @@ pub struct ChatState {
     waiting_for_activity: bool,
     streaming_message: Option<usize>,
     pending_user_message: Option<String>,
+    pending_steers: VecDeque<String>,
     message_selection_scroll_pending: bool,
 }
 
@@ -299,6 +300,7 @@ impl ChatState {
             waiting_for_activity: false,
             streaming_message: None,
             pending_user_message: None,
+            pending_steers: VecDeque::new(),
             message_selection_scroll_pending: false,
         }
     }
@@ -336,6 +338,7 @@ impl ChatState {
         self.active_turn_id = None;
         self.streaming_message = None;
         self.pending_user_message = None;
+        self.pending_steers.clear();
         self.visible_editor_target = None;
         self.selected_message_index = None;
         self.message_selection_scroll_pending = false;
@@ -376,8 +379,13 @@ impl ChatState {
         }
     }
 
-    pub fn steer_submitted(&mut self) {
+    pub fn steer_submitted(&mut self, prompt: String) {
+        self.pending_steers.push_back(prompt);
         self.selected_skills.clear();
+    }
+
+    pub fn pending_steer_count(&self) -> usize {
+        self.pending_steers.len()
     }
 
     fn push_optimistic_user_message(&mut self, prompt: String) {
@@ -638,9 +646,11 @@ impl ChatState {
                 self.active_turn_id = None;
                 self.streaming_message = None;
                 self.pending_user_message = None;
+                self.pending_steers.clear();
                 self.waiting_for_activity = false;
             }
             "error" => {
+                self.pending_steers.clear();
                 self.waiting_for_activity = false;
                 let message = event
                     .params
@@ -674,6 +684,13 @@ impl ChatState {
                     if self.pending_user_message.as_deref() == Some(content.as_str()) {
                         self.pending_user_message = None;
                         return;
+                    }
+                    if let Some(index) = self
+                        .pending_steers
+                        .iter()
+                        .position(|pending| pending == &content)
+                    {
+                        self.pending_steers.remove(index);
                     }
                     self.messages.push(ChatMessage {
                         role: ChatRole::User,
@@ -1151,7 +1168,8 @@ mod tests {
             "item/completed",
             json!({"item":{"type":"agentMessage","text":"first response"}}),
         ));
-        chat.steer_submitted();
+        chat.steer_submitted("focus on tests".into());
+        assert_eq!(chat.pending_steer_count(), 1);
         chat.apply(&event(
             "item/completed",
             json!({
@@ -1168,6 +1186,23 @@ mod tests {
         assert_eq!(chat.messages[1].content, "first response");
         assert_eq!(chat.messages[2].content, "focus on tests");
         assert_eq!(chat.messages[3].content, "steered response");
+        assert_eq!(chat.pending_steer_count(), 0);
+    }
+
+    #[test]
+    fn pending_steers_clear_when_the_turn_finishes() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.begin_user_turn("question".into(), "u".into());
+        chat.steer_submitted("first".into());
+        chat.steer_submitted("second".into());
+        assert_eq!(chat.pending_steer_count(), 2);
+
+        chat.apply(&event(
+            "turn/completed",
+            json!({"turn":{"id":"u","status":"interrupted"}}),
+        ));
+
+        assert_eq!(chat.pending_steer_count(), 0);
     }
 
     #[test]

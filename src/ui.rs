@@ -1225,7 +1225,7 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
         }
         if let Some(chat) = app.chat_mut() {
             chat.composer.clear();
-            chat.steer_submitted();
+            chat.steer_submitted(prompt);
         }
         return Ok(());
     }
@@ -1581,6 +1581,7 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane
         chat.mode,
         has_side_chat,
         chat.active_turn_id.is_some(),
+        chat.pending_steer_count(),
     );
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
@@ -1591,7 +1592,13 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane
     }
 }
 
-fn chat_help(read_only: bool, mode: ChatMode, has_side_chat: bool, active_turn: bool) -> String {
+fn chat_help(
+    read_only: bool,
+    mode: ChatMode,
+    has_side_chat: bool,
+    active_turn: bool,
+    pending_steers: usize,
+) -> String {
     let controls = if read_only {
         "READ ONLY · / palette · /threads retry · Tab scroll · Esc threads".into()
     } else {
@@ -1612,10 +1619,15 @@ fn chat_help(read_only: bool, mode: ChatMode, has_side_chat: bool, active_turn: 
             }
         }
     };
-    if active_turn {
+    let help = if active_turn {
         format!("Ctrl-C stop · {controls}")
     } else {
         controls
+    };
+    match pending_steers {
+        0 => help,
+        1 => format!("Follow-up sent · waiting for Codex… · {help}"),
+        count => format!("{count} follow-ups sent · waiting for Codex… · {help}"),
     }
 }
 
@@ -2816,13 +2828,22 @@ mod tests {
 
     #[test]
     fn active_chat_help_shows_steer_and_interrupt_shortcuts() {
-        let active = chat_help(false, ChatMode::Input, false, true);
-        let idle = chat_help(false, ChatMode::Input, false, false);
+        let active = chat_help(false, ChatMode::Input, false, true, 0);
+        let idle = chat_help(false, ChatMode::Input, false, false, 0);
 
         assert!(active.starts_with("Ctrl-C stop · "));
         assert!(active.contains("Enter steer"));
         assert!(!idle.contains("Ctrl-C stop"));
         assert!(idle.contains("Enter send"));
+    }
+
+    #[test]
+    fn chat_help_shows_pending_steer_feedback() {
+        let one = chat_help(false, ChatMode::Input, false, true, 1);
+        let multiple = chat_help(false, ChatMode::Input, false, true, 2);
+
+        assert!(one.starts_with("Follow-up sent · waiting for Codex…"));
+        assert!(multiple.starts_with("2 follow-ups sent · waiting for Codex…"));
     }
 
     #[test]
