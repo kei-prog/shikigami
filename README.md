@@ -129,20 +129,21 @@ appears in the header and applies to subsequent turns in that thread. Press
 `j` / `k` changes the effort, `Enter` applies it, and `Esc` cancels.
 New chats default to `medium` reasoning when the selected model supports it.
 
-Choose `/sidechat` to create an ephemeral fork of the current thread. Each main
-thread can keep multiple side chats for the current Shikigami session. The chat area
-splits into main and the selected side pane, and both can stream independently.
+Choose `/sidechat` to create a temporary fork of the current thread. Each main
+thread can keep multiple side chats for the current Shikigami session. The chat
+area splits into main and the selected side pane, and both can stream independently.
 Press `Ctrl-g` to switch focus. While the side pane is focused, `Ctrl-n` and
 `Ctrl-p` cycle through its forks. `/sides` opens the full list; moving with
 `j` / `k` previews immediately, `Enter` confirms, and `Esc` restores the
 previous selection. Use `/sideclose` to close the selected fork without
 confirmation. Use `/sidepromote` while the side pane is focused to move that
-fork into the repository tree as a persistent thread after its current turn has
-finished, preserving its conversation, workspace, and model. Moving to another
-main thread hides its remaining side chats; returning restores them. Unpromoted
-side chats are not added to the repository tree and disappear when Shikigami
-exits. Quitting asks for confirmation whenever at least one unpromoted side chat
-remains open.
+fork into the repository tree as a persistent thread, preserving its conversation,
+workspace, model, and active turn. Moving to another main thread hides its remaining
+side chats; returning restores them. `/sideclose` and confirmed app exit delete
+unpromoted side chats from Codex. Shikigami records temporary side chats locally
+and cleans them up on the next launch after a crash. A thread created immediately
+before an unrecoverable registry-write failure is left untouched to avoid deleting
+an unrelated thread.
 
 Existing Codex threads are not imported.
 

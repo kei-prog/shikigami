@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -30,9 +31,100 @@ struct RegistryData {
     threads: Vec<ThreadRecord>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TemporarySideChatRecord {
+    pub id: String,
+    pub parent_thread_id: String,
+    pub created_at: u64,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct SideChatRegistryData {
+    side_chats: Vec<TemporarySideChatRecord>,
+}
+
 #[derive(Debug)]
 pub struct Registry {
     path: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct SideChatRegistry {
+    path: PathBuf,
+}
+
+impl SideChatRegistry {
+    pub fn discover() -> Result<Self> {
+        let dirs = paths::project_dirs()?;
+        Ok(Self {
+            path: dirs.data_local_dir().join("side-chats.json"),
+        })
+    }
+
+    #[cfg(test)]
+    fn at(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn load(&self) -> Result<Vec<TemporarySideChatRecord>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let bytes = fs::read(&self.path)
+            .with_context(|| format!("read side chat registry {}", self.path.display()))?;
+        let data: SideChatRegistryData = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse side chat registry {}", self.path.display()))?;
+        Ok(data.side_chats)
+    }
+
+    pub fn register(&self, id: String, parent_thread_id: String) -> Result<()> {
+        let mut side_chats = self.load()?;
+        if !side_chats.iter().any(|side_chat| side_chat.id == id) {
+            side_chats.push(TemporarySideChatRecord {
+                id,
+                parent_thread_id,
+                created_at: now_seconds()?,
+            });
+        }
+        self.save(&side_chats)
+    }
+
+    pub fn remove(&self, thread_id: &str) -> Result<()> {
+        let mut side_chats = self.load()?;
+        side_chats.retain(|side_chat| side_chat.id != thread_id);
+        self.save(&side_chats)
+    }
+
+    pub fn reconcile(&self, registered_thread_ids: &HashSet<String>) -> Result<Vec<String>> {
+        let mut side_chats = self.load()?;
+        let original_len = side_chats.len();
+        side_chats.retain(|side_chat| !registered_thread_ids.contains(&side_chat.id));
+        if side_chats.len() != original_len {
+            self.save(&side_chats)?;
+        }
+        Ok(side_chats
+            .into_iter()
+            .map(|side_chat| side_chat.id)
+            .collect())
+    }
+
+    fn save(&self, side_chats: &[TemporarySideChatRecord]) -> Result<()> {
+        let parent = self
+            .path
+            .parent()
+            .context("side chat registry has no parent")?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create registry directory {}", parent.display()))?;
+        let temporary = self.path.with_extension("json.tmp");
+        let data = serde_json::to_vec_pretty(&SideChatRegistryData {
+            side_chats: side_chats.to_vec(),
+        })?;
+        fs::write(&temporary, data)
+            .with_context(|| format!("write side chat registry {}", temporary.display()))?;
+        fs::rename(&temporary, &self.path)
+            .with_context(|| format!("replace side chat registry {}", self.path.display()))?;
+        Ok(())
+    }
 }
 
 impl Registry {
@@ -213,6 +305,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(registry.load().unwrap()[0].title, "Promoted side chat");
+    }
+
+    #[test]
+    fn tracks_temporary_side_chats_until_they_are_removed() {
+        let temp = tempdir().unwrap();
+        let registry = SideChatRegistry::at(temp.path().join("side-chats.json"));
+
+        registry
+            .register("side-1".into(), "parent-1".into())
+            .unwrap();
+        registry
+            .register("side-1".into(), "parent-1".into())
+            .unwrap();
+        assert_eq!(registry.load().unwrap().len(), 1);
+        assert_eq!(registry.load().unwrap()[0].parent_thread_id, "parent-1");
+
+        registry.remove("side-1").unwrap();
+        assert!(registry.load().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reconciliation_keeps_only_unpromoted_side_chats() {
+        let temp = tempdir().unwrap();
+        let registry = SideChatRegistry::at(temp.path().join("side-chats.json"));
+        registry
+            .register("promoted".into(), "parent".into())
+            .unwrap();
+        registry
+            .register("abandoned".into(), "parent".into())
+            .unwrap();
+
+        let pending = registry
+            .reconcile(&HashSet::from(["promoted".into()]))
+            .unwrap();
+
+        assert_eq!(pending, vec!["abandoned"]);
+        assert_eq!(registry.load().unwrap()[0].id, "abandoned");
     }
 
     #[test]

@@ -345,6 +345,12 @@ impl AppServer {
         .await
     }
 
+    pub async fn delete_thread(&self, thread_id: &str) -> Result<()> {
+        self.request("thread/delete", json!({"threadId": thread_id}))
+            .await?;
+        Ok(())
+    }
+
     pub async fn list_skills(&self, cwd: &Path, force_reload: bool) -> Result<Vec<SkillMetadata>> {
         let response = self
             .request(

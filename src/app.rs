@@ -12,7 +12,7 @@ use crate::{
     app_server::{AppServerEvent, AppServerRequest, ModelMetadata},
     chat::ChatState,
     git_workspace::{self, Workspace},
-    registry::{Registry, ThreadRecord},
+    registry::{Registry, SideChatRegistry, ThreadRecord},
     repository::{self, Repository, RepositoryStore, ScanEvent, ScanScope, start_scan},
 };
 
@@ -137,6 +137,7 @@ pub struct App {
     pub reasoning_effort_index: usize,
     pub reasoning_effort_returns_to_model: bool,
     thread_registry: Registry,
+    side_chat_registry: SideChatRegistry,
     repository_store: RepositoryStore,
     workspaces_by_repository: HashMap<PathBuf, Vec<Workspace>>,
     scan_receiver: Option<Receiver<ScanEvent>>,
@@ -222,6 +223,7 @@ impl App {
             reasoning_effort_index: 0,
             reasoning_effort_returns_to_model: false,
             thread_registry: Registry::discover()?,
+            side_chat_registry: SideChatRegistry::discover()?,
             repository_store,
             workspaces_by_repository: HashMap::new(),
             scan_receiver: None,
@@ -292,8 +294,10 @@ impl App {
         }
     }
 
-    pub fn show_side_chat(&mut self, parent_thread_id: String, chat: ChatState) {
+    pub fn show_side_chat(&mut self, parent_thread_id: String, chat: ChatState) -> Result<()> {
         let thread_id = chat.thread_id.clone();
+        self.side_chat_registry
+            .register(thread_id.clone(), parent_thread_id.clone())?;
         self.chats.insert(thread_id.clone(), chat);
         let side_chats = self
             .side_chats_by_parent
@@ -306,61 +310,64 @@ impl App {
         self.side_chat_id = Some(thread_id);
         self.side_chat_parent_id = Some(parent_thread_id);
         self.active_chat_pane = ChatPane::Side;
+        Ok(())
     }
 
-    pub fn close_side_chat(&mut self) {
-        let Some(parent_thread_id) = self.side_chat_parent_id.clone() else {
-            self.active_chat_pane = ChatPane::Main;
-            return;
+    pub fn complete_side_chat_deletion(&mut self, thread_id: &str) -> Result<()> {
+        self.side_chat_registry.remove(thread_id)?;
+        let Some(parent_thread_id) = self.side_chat_parent(thread_id) else {
+            return Ok(());
         };
-        let Some(thread_id) = self.side_chat_id.take() else {
-            self.active_chat_pane = ChatPane::Main;
-            return;
-        };
-        self.chats.remove(&thread_id);
+        let removed_was_visible = self.side_chat_id.as_deref() == Some(thread_id);
+        self.chats.remove(thread_id);
         self.attention_items
             .retain(|item| item.thread_id != thread_id);
-        self.resumed_threads.remove(&thread_id);
+        self.resumed_threads.remove(thread_id);
         let mut remove_parent = false;
         if let Some(side_chats) = self.side_chats_by_parent.get_mut(&parent_thread_id) {
-            side_chats.retain(|id| id != &thread_id);
+            let removed_index = side_chats.iter().position(|id| id == thread_id);
+            side_chats.retain(|id| id != thread_id);
             if side_chats.is_empty() {
                 remove_parent = true;
             } else {
-                let index = self
+                let previous_index = self
                     .selected_side_chat_by_parent
                     .get(&parent_thread_id)
                     .copied()
-                    .unwrap_or(0)
-                    .min(side_chats.len() - 1);
+                    .unwrap_or(0);
+                let index = if removed_index.is_some_and(|removed| removed < previous_index) {
+                    previous_index - 1
+                } else {
+                    previous_index.min(side_chats.len() - 1)
+                };
                 self.selected_side_chat_by_parent
                     .insert(parent_thread_id.clone(), index);
-                self.side_chat_id = side_chats.get(index).cloned();
+                if removed_was_visible {
+                    self.side_chat_id = side_chats.get(index).cloned();
+                }
             }
         }
         if remove_parent {
             self.side_chats_by_parent.remove(&parent_thread_id);
             self.selected_side_chat_by_parent.remove(&parent_thread_id);
-            self.side_chat_parent_id = None;
+            if removed_was_visible {
+                self.side_chat_id = None;
+                self.side_chat_parent_id = None;
+            }
+        } else if removed_was_visible {
+            self.side_chat_parent_id = Some(parent_thread_id);
         }
-        self.active_chat_pane = ChatPane::Main;
+        if removed_was_visible {
+            self.active_chat_pane = ChatPane::Main;
+        }
+        Ok(())
     }
 
-    pub fn promote_side_chat(
-        &mut self,
-        source_thread_id: &str,
-        mut promoted_chat: ChatState,
-    ) -> Result<String> {
+    pub fn promote_side_chat(&mut self) -> Result<(String, Option<String>)> {
         if self.active_chat_pane != ChatPane::Side {
             anyhow::bail!("focus a side chat before promoting it");
         }
-        let selected_thread_id = self.side_chat_id.clone().context("no side chat selected")?;
-        if selected_thread_id != source_thread_id {
-            anyhow::bail!("the selected side chat changed during promotion");
-        }
-        if promoted_chat.thread_id == source_thread_id {
-            anyhow::bail!("promotion requires a persistent thread fork");
-        }
+        let thread_id = self.side_chat_id.clone().context("no side chat selected")?;
         let parent_thread_id = self
             .side_chat_parent_id
             .clone()
@@ -371,9 +378,11 @@ impl App {
             .find(|thread| thread.record.id == parent_thread_id)
             .context("parent thread is not registered")?;
         let repository_path = parent.record.repository_path.clone();
-        let thread_id = promoted_chat.thread_id.clone();
-        let cwd = promoted_chat.cwd.clone();
-        let title = promoted_chat.title.clone();
+        let (cwd, title) = self
+            .chats
+            .get(&thread_id)
+            .map(|chat| (chat.cwd.clone(), chat.title.clone()))
+            .context("side chat is not loaded")?;
 
         self.thread_registry.register_thread_named(
             thread_id.clone(),
@@ -381,16 +390,17 @@ impl App {
             &cwd,
             &title,
         )?;
-        promoted_chat.mark_as_main_chat();
-        self.chats.remove(source_thread_id);
-        self.chats.insert(thread_id.clone(), promoted_chat);
-        self.attention_items
-            .retain(|item| item.thread_id != source_thread_id);
-        self.resumed_threads.remove(source_thread_id);
-        self.resumed_threads.insert(thread_id.clone());
+        let cleanup_warning = self
+            .side_chat_registry
+            .remove(&thread_id)
+            .err()
+            .map(|error| error.to_string());
+        if let Some(chat) = self.chats.get_mut(&thread_id) {
+            chat.mark_as_main_chat();
+        }
         let mut remove_parent = false;
         if let Some(side_chats) = self.side_chats_by_parent.get_mut(&parent_thread_id) {
-            side_chats.retain(|id| id != source_thread_id);
+            side_chats.retain(|id| id != &thread_id);
             if side_chats.is_empty() {
                 remove_parent = true;
             } else {
@@ -412,7 +422,35 @@ impl App {
         if !self.reveal_chat(&thread_id) {
             anyhow::bail!("promoted thread is not available");
         }
-        Ok(title)
+        Ok((title, cleanup_warning))
+    }
+
+    pub fn abandoned_side_chat_ids(&self) -> Result<Vec<String>> {
+        let registered = self
+            .thread_registry
+            .load()?
+            .into_iter()
+            .map(|thread| thread.id)
+            .collect::<HashSet<_>>();
+        self.side_chat_registry.reconcile(&registered)
+    }
+
+    pub fn forget_temporary_side_chat(&self, thread_id: &str) -> Result<()> {
+        self.side_chat_registry.remove(thread_id)
+    }
+
+    pub fn side_chat_cleanup_targets(&self) -> Vec<(String, Option<String>)> {
+        self.side_chats_by_parent
+            .values()
+            .flatten()
+            .map(|thread_id| {
+                let turn_id = self
+                    .chats
+                    .get(thread_id)
+                    .and_then(|chat| chat.active_turn_id.clone());
+                (thread_id.clone(), turn_id)
+            })
+            .collect()
     }
 
     pub fn current_side_chats(&self) -> Vec<&ChatState> {

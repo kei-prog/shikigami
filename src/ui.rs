@@ -57,6 +57,7 @@ enum UiAction {
 
 pub async fn run(mut app: App) -> Result<()> {
     let server = AppServer::spawn("codex", Duration::from_secs(30)).await?;
+    cleanup_abandoned_side_chats(&mut app, &server).await;
     match server.list_models().await {
         Ok(models) => app.set_models(models),
         Err(error) => app.message = Some(format!("Could not load models: {error}")),
@@ -396,7 +397,13 @@ async fn handle_key(
             _ => {}
         },
         Mode::ConfirmQuitSideChats => match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => app.should_quit = true,
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if cleanup_open_side_chats(app, server).await {
+                    app.should_quit = true;
+                } else {
+                    app.mode = Mode::Normal;
+                }
+            }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.mode = Mode::Normal,
             _ => {}
         },
@@ -797,7 +804,13 @@ async fn select_palette_entry(app: &mut App, server: &Arc<AppServer>) -> Result<
             close_side_chat(app, server).await?;
         }
         Some(PaletteEntry::Command(PaletteCommand::SidePromote)) => {
-            promote_side_chat(app, server).await?;
+            app.message = Some(match app.promote_side_chat() {
+                Ok((title, None)) => format!("Promoted '{title}' to a persistent thread"),
+                Ok((title, Some(warning))) => {
+                    format!("Promoted '{title}', but temporary state cleanup failed: {warning}")
+                }
+                Err(error) => format!("Could not promote side chat: {error}"),
+            });
         }
         Some(PaletteEntry::Command(PaletteCommand::Attention)) => {
             app.open_attention();
@@ -836,7 +849,7 @@ async fn open_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     let model_display_name = main_chat.model_display_name.clone();
     let reasoning_effort = main_chat.reasoning_effort.clone();
     let side_chat_number = app.current_side_chats().len() + 1;
-    let (side_thread_id, history) = match server.fork_thread(&parent_thread_id, &cwd, true).await {
+    let (side_thread_id, history) = match server.fork_thread(&parent_thread_id, &cwd, false).await {
         Ok(result) => result,
         Err(error) => {
             app.message = Some(format!("Could not fork side chat: {error}"));
@@ -853,8 +866,18 @@ async fn open_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     }
     side_chat.load_history(&history);
     side_chat.mark_as_side_chat();
-    app.resumed_threads.insert(side_thread_id);
-    app.show_side_chat(parent_thread_id, side_chat);
+    app.resumed_threads.insert(side_thread_id.clone());
+    if let Err(error) = app.show_side_chat(parent_thread_id, side_chat) {
+        let cleanup = server.delete_thread(&side_thread_id).await;
+        app.resumed_threads.remove(&side_thread_id);
+        app.message = Some(match cleanup {
+            Ok(()) => format!("Could not track side chat: {error}"),
+            Err(cleanup_error) => format!(
+                "Could not track side chat: {error}; persistent thread cleanup also failed: {cleanup_error}"
+            ),
+        });
+        return Ok(());
+    }
     app.focus = Focus::Chat;
     app.mode = Mode::Chat;
     Ok(())
@@ -870,51 +893,92 @@ async fn close_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
         && let Err(error) = server.interrupt_turn(&thread_id, &turn_id).await
     {
         app.message = Some(format!("Could not interrupt side chat: {error}"));
+        return Ok(());
     }
-    app.close_side_chat();
+    let Some(thread_id) = app.side_chat().map(|chat| chat.thread_id.clone()) else {
+        return Ok(());
+    };
+    if let Err(error) = delete_temporary_thread(server, &thread_id).await {
+        app.message = Some(format!("Could not delete side chat: {error}"));
+        return Ok(());
+    }
+    if let Err(error) = app.complete_side_chat_deletion(&thread_id) {
+        app.message = Some(format!(
+            "Side chat was deleted, but local cleanup failed: {error}"
+        ));
+    }
     Ok(())
 }
 
-async fn promote_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
-    if app.active_chat_pane != ChatPane::Side {
-        app.message = Some("Focus a side chat before promoting it".into());
-        return Ok(());
-    }
-    let Some(side_chat) = app.side_chat() else {
-        app.message = Some("No side chat is selected".into());
-        return Ok(());
-    };
-    if side_chat.active_turn_id.is_some() {
-        app.message = Some("Wait for the side chat's current turn before promoting it".into());
-        return Ok(());
-    }
-
-    let source_thread_id = side_chat.thread_id.clone();
-    let cwd = side_chat.cwd.clone();
-    let title = side_chat.title.clone();
-    let model = side_chat.model.clone();
-    let model_display_name = side_chat.model_display_name.clone();
-    let reasoning_effort = side_chat.reasoning_effort.clone();
-    let (thread_id, history) = match server.fork_thread(&source_thread_id, &cwd, false).await {
-        Ok(result) => result,
+async fn cleanup_abandoned_side_chats(app: &mut App, server: &Arc<AppServer>) {
+    let thread_ids = match app.abandoned_side_chat_ids() {
+        Ok(thread_ids) => thread_ids,
         Err(error) => {
-            app.message = Some(format!("Could not create persistent thread: {error}"));
-            return Ok(());
+            app.message = Some(format!("Could not inspect abandoned side chats: {error}"));
+            return;
         }
     };
-
-    let mut promoted_chat = ChatState::new(thread_id, cwd, title);
-    if let (Some(model), Some(display_name)) = (model, model_display_name) {
-        promoted_chat.set_model(model, display_name, reasoning_effort);
+    let mut cleaned = 0;
+    let mut failures = Vec::new();
+    for thread_id in thread_ids {
+        if let Err(error) = delete_temporary_thread(server, &thread_id).await {
+            failures.push(format!("{thread_id}: {error}"));
+            continue;
+        }
+        match app.forget_temporary_side_chat(&thread_id) {
+            Ok(()) => cleaned += 1,
+            Err(error) => failures.push(format!("{thread_id}: {error}")),
+        }
     }
-    promoted_chat.load_history(&history);
-    app.message = Some(
-        match app.promote_side_chat(&source_thread_id, promoted_chat) {
-            Ok(title) => format!("Promoted '{title}' to a persistent thread"),
-            Err(error) => format!("Could not register promoted thread: {error}"),
-        },
-    );
-    Ok(())
+    if !failures.is_empty() {
+        app.message = Some(format!(
+            "Cleaned {cleaned} abandoned side chat(s); {} cleanup(s) failed",
+            failures.len()
+        ));
+    } else if cleaned > 0 {
+        app.message = Some(format!("Cleaned {cleaned} abandoned side chat(s)"));
+    }
+}
+
+async fn cleanup_open_side_chats(app: &mut App, server: &Arc<AppServer>) -> bool {
+    let mut failures = Vec::new();
+    for (thread_id, turn_id) in app.side_chat_cleanup_targets() {
+        if let Some(turn_id) = turn_id
+            && let Err(error) = server.interrupt_turn(&thread_id, &turn_id).await
+        {
+            failures.push(format!("{thread_id}: {error}"));
+            continue;
+        }
+        if let Err(error) = delete_temporary_thread(server, &thread_id).await {
+            failures.push(format!("{thread_id}: {error}"));
+            continue;
+        }
+        if let Err(error) = app.complete_side_chat_deletion(&thread_id) {
+            failures.push(format!("{thread_id}: local cleanup failed: {error}"));
+        }
+    }
+    if failures.is_empty() {
+        true
+    } else {
+        app.message = Some(format!(
+            "Could not clean up {} side chat(s); quit cancelled",
+            failures.len()
+        ));
+        false
+    }
+}
+
+async fn delete_temporary_thread(server: &Arc<AppServer>, thread_id: &str) -> Result<()> {
+    match server.delete_thread(thread_id).await {
+        Ok(()) => Ok(()),
+        Err(error) if is_missing_thread_error(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_missing_thread_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("no rollout found for thread id") || message.contains("thread not found")
 }
 
 async fn interrupt_chat(app: &App, server: &Arc<AppServer>) -> Result<()> {
@@ -1573,7 +1637,7 @@ fn render_quit_side_chats_confirm(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(format!(
-            "{count} side chat{} will be discarded when Shikigami exits.\n\nQuit? [y/N]",
+            "{count} side chat{} will be deleted when Shikigami exits.\n\nQuit? [y/N]",
             if count == 1 { "" } else { "s" }
         ))
         .wrap(Wrap { trim: false })
@@ -2517,6 +2581,19 @@ mod tests {
         assert!(!quit_requires_side_chat_confirmation(0));
         assert!(quit_requires_side_chat_confirmation(1));
         assert!(quit_requires_side_chat_confirmation(3));
+    }
+
+    #[test]
+    fn missing_rollouts_are_already_cleaned_up() {
+        assert!(is_missing_thread_error(&anyhow::anyhow!(
+            "Codex thread/delete error: no rollout found for thread id test"
+        )));
+        assert!(is_missing_thread_error(&anyhow::anyhow!(
+            "thread not found"
+        )));
+        assert!(!is_missing_thread_error(&anyhow::anyhow!(
+            "permission denied"
+        )));
     }
 
     #[test]
