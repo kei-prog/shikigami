@@ -326,6 +326,9 @@ impl ChatState {
 
     pub fn load_history(&mut self, response: &Value) {
         self.messages.clear();
+        self.active_turn_id = None;
+        self.streaming_message = None;
+        self.pending_user_message = None;
         self.visible_editor_target = None;
         self.selected_message_index = None;
         self.message_selection_scroll_pending = false;
@@ -333,12 +336,26 @@ impl ChatState {
         let Some(turns) = response.pointer("/thread/turns").and_then(Value::as_array) else {
             return;
         };
-        for item in turns
-            .iter()
-            .filter_map(|turn| turn.get("items").and_then(Value::as_array))
-            .flatten()
-        {
-            self.push_completed_item(item);
+        for turn in turns {
+            let in_progress = turn.get("status").and_then(Value::as_str) == Some("inProgress");
+            if in_progress {
+                self.active_turn_id = turn.get("id").and_then(Value::as_str).map(str::to_owned);
+                self.waiting_for_activity = true;
+            }
+            let Some(items) = turn.get("items").and_then(Value::as_array) else {
+                continue;
+            };
+            for item in items {
+                let item_type = item.get("type").and_then(Value::as_str);
+                if in_progress && item_type != Some("userMessage") {
+                    self.waiting_for_activity = false;
+                }
+                if in_progress && item.get("status").and_then(Value::as_str) == Some("inProgress") {
+                    self.push_started_item(item);
+                } else {
+                    self.push_completed_item(item);
+                }
+            }
         }
     }
 
@@ -1039,6 +1056,36 @@ mod tests {
         assert_eq!(chat.messages.len(), 2);
         assert_eq!(chat.messages[0].role, ChatRole::User);
         assert_eq!(chat.messages[1].role, ChatRole::Assistant);
+    }
+
+    #[test]
+    fn restores_in_progress_history_and_accepts_new_streaming_events() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.load_history(&json!({"thread":{"turns":[{
+            "id":"turn-1",
+            "status":"inProgress",
+            "items":[
+                {"id":"user-1","type":"userMessage","content":[{"type":"text","text":"question"}]},
+                {"id":"edit-1","type":"fileChange","changes":[{
+                    "path":"src/main.rs",
+                    "kind":"update",
+                    "diff":"@@ -1 +1 @@\n-old\n+new"
+                }],"status":"inProgress"}
+            ]
+        }]}}));
+
+        assert_eq!(chat.active_turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(chat.messages.len(), 2);
+        assert_eq!(chat.messages[1].role, ChatRole::Diff);
+        assert!(chat.messages[1].content.starts_with("Editing: src/main.rs"));
+
+        chat.apply(&event(
+            "item/agentMessage/delta",
+            json!({"turnId":"turn-1","delta":"response"}),
+        ));
+
+        assert_eq!(chat.messages.len(), 3);
+        assert_eq!(chat.messages[2].content, "response");
     }
 
     #[test]

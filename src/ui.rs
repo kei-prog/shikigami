@@ -157,14 +157,17 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                 {
                     match preview.result {
                         Ok(chat) => {
+                            let thread_id = chat.thread_id.clone();
                             let still_selected = app.selected_tree_is_thread()
                                 && app.selected_thread().is_some_and(|thread| {
-                                    thread.record.id == chat.thread_id
+                                    thread.record.id == thread_id
                                 });
                             if still_selected {
-                                app.show_chat(chat);
+                                if !app.show_cached_chat(&thread_id) {
+                                    app.show_chat(chat);
+                                }
                             } else {
-                                app.chats.entry(chat.thread_id.clone()).or_insert(chat);
+                                app.chats.entry(thread_id).or_insert(chat);
                             }
                         }
                         Err(error) => app.message = Some(error),
