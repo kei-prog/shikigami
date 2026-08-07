@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`wyard` is a Rust 2024 TUI for managing Codex CLI threads across Git repositories. The entry point is `src/main.rs`; application state lives in `src/app.rs`, rendering in `src/ui.rs`, and App Server JSONL communication in `src/app_server.rs`. Repository discovery, thread data, Git worktrees, chat state, and clipboard support use correspondingly named modules. Tests are colocated in `#[cfg(test)] mod tests` blocks. Never commit generated `target/` contents.
+`shikigami` is a Rust 2024 TUI for managing Codex CLI threads across Git repositories. The entry point is `src/main.rs`; application state lives in `src/app.rs`, rendering in `src/ui.rs`, and App Server JSONL communication in `src/app_server.rs`. Repository discovery, thread data, Git worktrees, chat state, and clipboard support use correspondingly named modules. Tests are colocated in `#[cfg(test)] mod tests` blocks. Never commit generated `target/` contents.
 
 ## Build, Test, and Development Commands
 
@@ -13,7 +13,7 @@ Run shell commands through `rtk` in this workspace:
 - `rtk cargo test` runs the full unit-test suite.
 - `rtk cargo fmt --check` verifies standard Rust formatting.
 - `rtk cargo clippy --all-targets --all-features -- -D warnings` catches lint issues and treats warnings as failures.
-- `rtk cargo install --path .` installs the local `wyard` executable.
+- `rtk cargo install --path .` installs the local `shi` executable.
 
 Prefer lightweight implementations. Verify performance-sensitive changes with before/after measurements.
 
