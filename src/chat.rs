@@ -324,6 +324,13 @@ impl ChatState {
         self.side_chat_has_activity = false;
     }
 
+    pub fn is_unused_main_thread(&self) -> bool {
+        !self.is_side_chat
+            && self.title == "Untitled thread"
+            && self.messages.is_empty()
+            && self.active_turn_id.is_none()
+    }
+
     pub fn load_history(&mut self, response: &Value) {
         self.messages.clear();
         self.active_turn_id = None;
@@ -1086,6 +1093,21 @@ mod tests {
 
         assert_eq!(chat.messages.len(), 3);
         assert_eq!(chat.messages[2].content, "response");
+    }
+
+    #[test]
+    fn only_an_untitled_main_chat_without_messages_is_unused() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "Untitled thread".into());
+        assert!(chat.is_unused_main_thread());
+
+        chat.begin_user_turn("question".into(), "turn".into());
+        assert!(!chat.is_unused_main_thread());
+
+        let mut titled = ChatState::new("t".into(), "/tmp".into(), "Existing".into());
+        assert!(!titled.is_unused_main_thread());
+        titled.title = "Untitled thread".into();
+        titled.mark_as_side_chat();
+        assert!(!titled.is_unused_main_thread());
     }
 
     #[test]

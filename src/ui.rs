@@ -314,6 +314,9 @@ async fn handle_key(
                 }
             }
             KeyCode::Esc => {
+                if let Err(error) = cleanup_unused_main_chat(app, server).await {
+                    app.message = Some(format!("Could not remove unused thread: {error}"));
+                }
                 app.mode = Mode::Normal;
                 app.focus = Focus::Navigation;
             }
@@ -1013,6 +1016,14 @@ async fn delete_temporary_thread(server: &Arc<AppServer>, thread_id: &str) -> Re
         Err(error) if is_missing_thread_error(&error) => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+async fn cleanup_unused_main_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
+    let Some(thread_id) = app.unused_main_chat_cleanup_target()? else {
+        return Ok(());
+    };
+    delete_temporary_thread(server, &thread_id).await?;
+    app.remove_unused_main_chat(&thread_id)
 }
 
 fn is_missing_thread_error(error: &anyhow::Error) -> bool {

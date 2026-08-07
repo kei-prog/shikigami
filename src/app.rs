@@ -1683,6 +1683,56 @@ impl App {
         Ok(())
     }
 
+    pub fn unused_main_chat_cleanup_target(&self) -> Result<Option<String>> {
+        let Some(thread_id) = self.visible_chat_id.as_deref() else {
+            return Ok(None);
+        };
+        let Some(chat) = self.chats.get(thread_id) else {
+            return Ok(None);
+        };
+        let Some(thread) = self
+            .threads
+            .iter()
+            .find(|thread| thread.record.id == thread_id)
+        else {
+            return Ok(None);
+        };
+        if !chat.is_unused_main_thread() || thread.record.title != "Untitled thread" {
+            return Ok(None);
+        }
+        if thread.record.managed_worktree
+            && thread.record.cwd.is_dir()
+            && !git_workspace::workspace_is_clean(&thread.record.cwd)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(thread_id.to_owned()))
+    }
+
+    pub fn remove_unused_main_chat(&mut self, thread_id: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.unused_main_chat_cleanup_target()?.as_deref() == Some(thread_id),
+            "chat is no longer safe to remove"
+        );
+        let record = self
+            .threads
+            .iter()
+            .find(|thread| thread.record.id == thread_id)
+            .map(|thread| thread.record.clone())
+            .context("thread not found")?;
+        if record.managed_worktree && record.cwd.is_dir() {
+            git_workspace::remove_managed_workspace(
+                &record.repository_path,
+                &record.cwd,
+                record.worktree_branch.as_deref(),
+            )?;
+        }
+        self.thread_registry.remove(thread_id)?;
+        self.discard_chat(thread_id);
+        self.refresh_current();
+        Ok(())
+    }
+
     pub fn register_app_server_thread(&mut self, thread_id: String, cwd: PathBuf) -> Result<()> {
         let repository = self
             .selected_repository()

@@ -90,11 +90,12 @@ tails, tool activity, and approvals stay inside the Shikigami TUI instead of
 opening the Codex terminal UI. App Server stderr is captured instead of being
 written over the terminal interface.
 
-Codex does not persist a new thread until its first turn. Shikigami keeps an
-untitled empty thread in its own registry; if its temporary App Server thread has
-expired, opening it starts a replacement in the same worktree and updates the
-stored thread id. Empty threads therefore remain usable across restarts without
-removing their worktrees.
+Codex does not persist a new thread until its first turn. When an untitled chat
+has no messages, leaving it removes the temporary thread from Shikigami. A clean
+Shikigami-managed worktree created for that chat is removed too; a thread whose
+managed worktree has changes is kept. If an empty thread remains after an
+interrupted session and its temporary App Server thread has expired, opening it
+starts a replacement in the same worktree and updates the stored thread id.
 
 If another, non-shared Codex process already owns a thread, Shikigami keeps the
 history visible using `thread/read` and marks the chat `READ ONLY`. Close the
