@@ -43,6 +43,25 @@ struct SideChatRegistryData {
     side_chats: Vec<TemporarySideChatRecord>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PersistentAttentionKind {
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AttentionRecord {
+    pub thread_id: String,
+    pub kind: PersistentAttentionKind,
+    pub created_at: u64,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct AttentionRegistryData {
+    items: Vec<AttentionRecord>,
+}
+
 #[derive(Debug)]
 pub struct Registry {
     path: PathBuf,
@@ -51,6 +70,91 @@ pub struct Registry {
 #[derive(Debug)]
 pub struct SideChatRegistry {
     path: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct AttentionRegistry {
+    path: PathBuf,
+}
+
+impl AttentionRegistry {
+    pub fn discover() -> Result<Self> {
+        let dirs = paths::project_dirs()?;
+        Ok(Self {
+            path: dirs.data_local_dir().join("attention.json"),
+        })
+    }
+
+    #[cfg(test)]
+    fn at(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn reconcile(
+        &self,
+        registered_thread_ids: &HashSet<String>,
+    ) -> Result<Vec<AttentionRecord>> {
+        let mut items = self.load()?;
+        let original_len = items.len();
+        items.retain(|item| registered_thread_ids.contains(&item.thread_id));
+        if items.len() != original_len {
+            self.save(&items)?;
+        }
+        Ok(items)
+    }
+
+    pub fn sync(&self, desired: &[(String, PersistentAttentionKind)]) -> Result<()> {
+        if desired.is_empty() && !self.path.exists() {
+            return Ok(());
+        }
+        let existing = self
+            .load()?
+            .into_iter()
+            .map(|item| (item.thread_id.clone(), item))
+            .collect::<std::collections::HashMap<_, _>>();
+        let now = now_seconds()?;
+        let items = desired
+            .iter()
+            .map(|(thread_id, kind)| AttentionRecord {
+                thread_id: thread_id.clone(),
+                kind: *kind,
+                created_at: existing
+                    .get(thread_id)
+                    .map(|item| item.created_at)
+                    .unwrap_or(now),
+            })
+            .collect::<Vec<_>>();
+        self.save(&items)
+    }
+
+    fn load(&self) -> Result<Vec<AttentionRecord>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let bytes = fs::read(&self.path)
+            .with_context(|| format!("read attention registry {}", self.path.display()))?;
+        let data: AttentionRegistryData = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse attention registry {}", self.path.display()))?;
+        Ok(data.items)
+    }
+
+    fn save(&self, items: &[AttentionRecord]) -> Result<()> {
+        let parent = self
+            .path
+            .parent()
+            .context("attention registry has no parent")?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create registry directory {}", parent.display()))?;
+        let temporary = self.path.with_extension("json.tmp");
+        let data = serde_json::to_vec_pretty(&AttentionRegistryData {
+            items: items.to_vec(),
+        })?;
+        fs::write(&temporary, data)
+            .with_context(|| format!("write attention registry {}", temporary.display()))?;
+        fs::rename(&temporary, &self.path)
+            .with_context(|| format!("replace attention registry {}", self.path.display()))?;
+        Ok(())
+    }
 }
 
 impl SideChatRegistry {
@@ -342,6 +446,42 @@ mod tests {
 
         assert_eq!(pending, vec!["abandoned"]);
         assert_eq!(registry.load().unwrap()[0].id, "abandoned");
+    }
+
+    #[test]
+    fn attention_registry_restores_only_registered_threads() {
+        let temp = tempdir().unwrap();
+        let registry = AttentionRegistry::at(temp.path().join("attention.json"));
+        registry
+            .sync(&[
+                ("kept".into(), PersistentAttentionKind::Completed),
+                ("removed".into(), PersistentAttentionKind::Failed),
+            ])
+            .unwrap();
+
+        let restored = registry.reconcile(&HashSet::from(["kept".into()])).unwrap();
+
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].thread_id, "kept");
+        assert_eq!(restored[0].kind, PersistentAttentionKind::Completed);
+    }
+
+    #[test]
+    fn attention_sync_preserves_the_original_timestamp() {
+        let temp = tempdir().unwrap();
+        let registry = AttentionRegistry::at(temp.path().join("attention.json"));
+        registry
+            .sync(&[("thread".into(), PersistentAttentionKind::Completed)])
+            .unwrap();
+        let created_at = registry.load().unwrap()[0].created_at;
+
+        registry
+            .sync(&[("thread".into(), PersistentAttentionKind::Failed)])
+            .unwrap();
+
+        let item = registry.load().unwrap().remove(0);
+        assert_eq!(item.created_at, created_at);
+        assert_eq!(item.kind, PersistentAttentionKind::Failed);
     }
 
     #[test]

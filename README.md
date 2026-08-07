@@ -58,12 +58,14 @@ Each thread keeps an independent chat state, so multiple turns can continue in
 the background while another thread is displayed. The tree marks the visible,
 working, and approval-waiting threads separately.
 
-During a Shikigami session, a background turn that completes or fails stays in
-the attention list until its chat is viewed or the item is dismissed. The header
-and repository rows show pending counts; `!` opens the list, `j` / `k` selects an
-item, `Enter` opens it, and `d` dismisses a completed or failed item. Pending
-approvals must be accepted or declined. The list is updated directly from App
-Server events without polling.
+A background turn that completes or fails stays in the attention list until its
+chat is viewed or the item is dismissed, including across Shikigami restarts.
+Entries for threads no longer registered with Shikigami are removed on startup.
+The header and repository rows show pending counts; `!` opens the list, `j` / `k`
+selects an item, `Enter` opens it, and `d` dismisses a completed or failed item.
+Pending approvals must be accepted or declined and remain session-local because
+their App Server request cannot be answered after a restart. The list is updated
+directly from App Server events without polling.
 
 In the repository picker, `/` filters candidates, `Space` selects multiple
 repositories, and `Enter` registers them. Repository discovery is read-only.

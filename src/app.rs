@@ -12,7 +12,9 @@ use crate::{
     app_server::{AppServerEvent, AppServerRequest, ModelMetadata},
     chat::ChatState,
     git_workspace::{self, Workspace},
-    registry::{Registry, SideChatRegistry, ThreadRecord},
+    registry::{
+        AttentionRegistry, PersistentAttentionKind, Registry, SideChatRegistry, ThreadRecord,
+    },
     repository::{self, Repository, RepositoryStore, ScanEvent, ScanScope, start_scan},
 };
 
@@ -69,6 +71,21 @@ impl AttentionKind {
             Self::Completed => 0,
             Self::Failed => 1,
             Self::Approval => 2,
+        }
+    }
+
+    fn persistent(self) -> Option<PersistentAttentionKind> {
+        match self {
+            Self::Completed => Some(PersistentAttentionKind::Completed),
+            Self::Failed => Some(PersistentAttentionKind::Failed),
+            Self::Approval => None,
+        }
+    }
+
+    fn from_persistent(kind: PersistentAttentionKind) -> Self {
+        match kind {
+            PersistentAttentionKind::Completed => Self::Completed,
+            PersistentAttentionKind::Failed => Self::Failed,
         }
     }
 }
@@ -138,6 +155,7 @@ pub struct App {
     pub reasoning_effort_returns_to_model: bool,
     thread_registry: Registry,
     side_chat_registry: SideChatRegistry,
+    attention_registry: AttentionRegistry,
     repository_store: RepositoryStore,
     workspaces_by_repository: HashMap<PathBuf, Vec<Workspace>>,
     scan_receiver: Option<Receiver<ScanEvent>>,
@@ -146,6 +164,7 @@ pub struct App {
 impl App {
     pub fn load() -> Result<Self> {
         let repository_store = RepositoryStore::discover()?;
+        let thread_registry = Registry::discover()?;
         let repositories = repository_store.load_registered()?;
         let candidates = repository_store.load_candidates().unwrap_or_default();
         let browse_path = BaseDirs::new()
@@ -222,13 +241,17 @@ impl App {
             model_index: 0,
             reasoning_effort_index: 0,
             reasoning_effort_returns_to_model: false,
-            thread_registry: Registry::discover()?,
+            thread_registry,
             side_chat_registry: SideChatRegistry::discover()?,
+            attention_registry: AttentionRegistry::discover()?,
             repository_store,
             workspaces_by_repository: HashMap::new(),
             scan_receiver: None,
         };
         app.refresh_current();
+        if let Err(error) = app.restore_attention() {
+            app.message = Some(format!("Could not restore attention list: {error}"));
+        }
         if first_run {
             app.start_scan(ScanScope::Quick);
         }
@@ -768,13 +791,18 @@ impl App {
             .as_deref()
             .is_some_and(|thread_id| self.thread_is_visible(thread_id));
         apply_chat_event_to(&mut self.chats, event);
-        if !was_visible
+        let attention_changed = if !was_visible
             && let (Some(thread_id), Some(kind)) = (thread_id, attention_kind_for_event(event))
             && self.chats.contains_key(&thread_id)
         {
-            upsert_attention(&mut self.attention_items, thread_id, kind);
-        }
+            upsert_attention(&mut self.attention_items, thread_id, kind)
+        } else {
+            false
+        };
         self.clamp_attention_index();
+        if attention_changed {
+            self.persist_attention();
+        }
     }
 
     pub fn enqueue_approval(&mut self, request: AppServerRequest) {
@@ -787,6 +815,7 @@ impl App {
         }
         self.pending_approvals.push_back(request);
         self.clamp_attention_index();
+        self.persist_attention();
     }
 
     pub fn approval_resolved(&mut self, thread_id: Option<&str>) {
@@ -802,6 +831,7 @@ impl App {
                 .retain(|item| item.thread_id != thread_id || item.kind != AttentionKind::Approval);
         }
         self.clamp_attention_index();
+        self.persist_attention();
     }
 
     pub fn attention_count(&self) -> usize {
@@ -877,6 +907,7 @@ impl App {
         }
         self.attention_items.remove(self.attention_index);
         self.clamp_attention_index();
+        self.persist_attention();
         if self.attention_items.is_empty() {
             self.close_attention();
         }
@@ -902,6 +933,7 @@ impl App {
         }
         self.attention_items.remove(self.attention_index);
         self.clamp_attention_index();
+        self.persist_attention();
         if !self.reveal_chat(&item.thread_id) {
             self.message = Some("The selected thread is no longer available".into());
             self.close_attention();
@@ -913,6 +945,7 @@ impl App {
         self.chats.remove(thread_id);
         self.attention_items
             .retain(|item| item.thread_id != thread_id);
+        self.persist_attention();
         self.resumed_threads.remove(thread_id);
         if self.visible_chat_id.as_deref() == Some(thread_id) {
             self.visible_chat_id = None;
@@ -988,6 +1021,7 @@ impl App {
     }
 
     fn mark_thread_seen(&mut self) {
+        let previous_len = self.attention_items.len();
         let visible = [
             self.visible_chat_id.as_deref(),
             self.side_chat_id.as_deref(),
@@ -997,6 +1031,40 @@ impl App {
                 || !visible.into_iter().flatten().any(|id| id == item.thread_id)
         });
         self.clamp_attention_index();
+        if self.attention_items.len() != previous_len {
+            self.persist_attention();
+        }
+    }
+
+    fn restore_attention(&mut self) -> Result<()> {
+        let registered = self
+            .threads
+            .iter()
+            .map(|thread| thread.record.id.clone())
+            .collect::<HashSet<_>>();
+        self.attention_items = self
+            .attention_registry
+            .reconcile(&registered)?
+            .into_iter()
+            .map(|item| AttentionItem {
+                thread_id: item.thread_id,
+                kind: AttentionKind::from_persistent(item.kind),
+            })
+            .collect();
+        self.clamp_attention_index();
+        Ok(())
+    }
+
+    fn persist_attention(&mut self) {
+        let desired = self
+            .attention_items
+            .iter()
+            .filter(|item| self.thread_is_registered(&item.thread_id))
+            .filter_map(|item| Some((item.thread_id.clone(), item.kind.persistent()?)))
+            .collect::<Vec<_>>();
+        if let Err(error) = self.attention_registry.sync(&desired) {
+            self.message = Some(format!("Could not save attention list: {error}"));
+        }
     }
 
     fn clamp_attention_index(&mut self) {
@@ -1740,14 +1808,20 @@ fn attention_kind_for_event(event: &AppServerEvent) -> Option<AttentionKind> {
     }
 }
 
-fn upsert_attention(items: &mut VecDeque<AttentionItem>, thread_id: String, kind: AttentionKind) {
+fn upsert_attention(
+    items: &mut VecDeque<AttentionItem>,
+    thread_id: String,
+    kind: AttentionKind,
+) -> bool {
     if let Some(item) = items.iter_mut().find(|item| item.thread_id == thread_id) {
         if kind.priority() > item.kind.priority() {
             item.kind = kind;
+            return true;
         }
-        return;
+        return false;
     }
     items.push_back(AttentionItem { thread_id, kind });
+    true
 }
 
 #[cfg(test)]
