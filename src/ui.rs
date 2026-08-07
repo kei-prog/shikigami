@@ -1019,6 +1019,7 @@ fn is_missing_thread_error(error: &anyhow::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("no rollout found for thread id")
         || message.contains("thread not found")
+        || message.contains("thread not loaded:")
         || (message.contains("thread ") && message.contains(" not found"))
 }
 
@@ -2766,6 +2767,10 @@ mod tests {
         assert!(is_missing_thread_error(&anyhow::anyhow!(
             "{}",
             r#"Codex thread/read error: {"code":-32600,"message":"thread 019fdb56-fc38-79d3-81b8-85fd9af00000 not found"}"#
+        )));
+        assert!(is_missing_thread_error(&anyhow::anyhow!(
+            "{}",
+            r#"Codex thread/read error: {"code":-32600,"message":"thread not loaded: 019fdb56-fc38-79d3-81b8-85fd9af21df9"}"#
         )));
         assert!(!is_missing_thread_error(&anyhow::anyhow!(
             "permission denied"
