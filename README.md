@@ -35,6 +35,7 @@ results are cached, while the main screen only shows repositories you register.
 - `Enter`: expand a repository or focus the selected thread's chat input
 - `Tab`: focus the open chat
 - `Esc`: select the parent repository or return from chat to the tree
+- `/`: fuzzy-search active threads from the repository tree
 - `a`: add repositories
 - `n`: create a thread in the primary repository, a new worktree, or an existing worktree
 - `x`: archive the selected thread, or restore it from the archived view
@@ -121,10 +122,12 @@ Chat starts in input mode. Press `Tab` for scroll mode, then use `j` / `k` for
 one line, `u` / `d` for half a page, `PageUp` / `PageDown` for a full
 page, and `g` / `G` for the beginning or latest message. `i`, `Enter`, `Tab`, or
 `Esc` returns to input mode. In input mode, `Ctrl-u` clears the composer and
-`Esc` returns focus to the repository tree. A blinking cursor follows the
-composer input and is hidden outside input mode. New output follows the bottom
-only while the view is already at the latest message. Entering scroll mode
-always starts from the latest message at the bottom.
+`Esc` returns focus to the repository tree. Press `Ctrl-c` in either mode to
+stop the current response. While a response is streaming, type another message
+and press `Enter` to steer the active turn with the additional instruction. A
+blinking cursor follows the composer input and is hidden outside input mode. New
+output follows the bottom only while the view is already at the latest message.
+Entering scroll mode always starts from the latest message at the bottom.
 
 In scroll mode, `J` / `K` selects the next or previous raw chat message and
 keeps it visible. Press `y` to copy that message without its rendered wrapping
@@ -136,7 +139,8 @@ the hunk's new-file line. Exiting Neovim restores the same Shikigami chat and sc
 position with a full redraw. Paths are resolved inside the thread workspace;
 deleted files and paths outside that workspace are rejected.
 
-Press `/` in an empty composer to open the command palette. Built-in Shikigami
+Press `/` in the repository tree to open the thread search directly. Press `/`
+in an empty composer to open the command palette. Built-in Shikigami
 commands and enabled Codex skills for the current workspace appear in one
 fuzzy-searchable list, ranked by name and description matches. Selecting a
 skill inserts its `$skill-name` mention and sends the corresponding App Server

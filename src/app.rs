@@ -148,6 +148,7 @@ pub struct App {
     pub thread_picker_query: String,
     pub thread_picker_index: usize,
     pub thread_picker_matches: Vec<usize>,
+    pub thread_picker_original_focus: Focus,
     pub active_chat_pane: ChatPane,
     pub resumed_threads: HashSet<String>,
     pub read_only_threads: HashSet<String>,
@@ -240,6 +241,7 @@ impl App {
             thread_picker_query: String::new(),
             thread_picker_index: 0,
             thread_picker_matches: Vec::new(),
+            thread_picker_original_focus: Focus::Navigation,
             active_chat_pane: ChatPane::Main,
             resumed_threads: HashSet::new(),
             read_only_threads: HashSet::new(),
@@ -568,6 +570,7 @@ impl App {
     }
 
     pub fn open_thread_picker(&mut self) {
+        self.thread_picker_original_focus = self.focus;
         self.thread_picker_query.clear();
         self.refresh_thread_picker_matches();
         self.thread_picker_index = self
@@ -609,8 +612,8 @@ impl App {
     }
 
     pub fn cancel_thread_picker(&mut self) {
-        self.mode = Mode::Chat;
-        self.focus = Focus::Chat;
+        self.focus = self.thread_picker_original_focus;
+        self.mode = thread_picker_return_mode(self.thread_picker_original_focus);
     }
 
     pub fn activate_selected_thread_picker(&mut self) -> bool {
@@ -1955,6 +1958,13 @@ fn thread_picker_matches(
     matches.into_iter().map(|(index, _)| index).collect()
 }
 
+fn thread_picker_return_mode(focus: Focus) -> Mode {
+    match focus {
+        Focus::Navigation => Mode::Normal,
+        Focus::Chat => Mode::Chat,
+    }
+}
+
 fn preferred_reasoning_effort(model: &ModelMetadata) -> Option<&str> {
     model
         .supported_reasoning_efforts
@@ -2221,6 +2231,12 @@ mod tests {
         let threads = vec![thread("newest", "/one"), thread("older", "/one")];
 
         assert_eq!(thread_picker_matches(&threads, &[], ""), vec![0, 1]);
+    }
+
+    #[test]
+    fn thread_picker_returns_to_its_opening_pane_when_cancelled() {
+        assert_eq!(thread_picker_return_mode(Focus::Navigation), Mode::Normal);
+        assert_eq!(thread_picker_return_mode(Focus::Chat), Mode::Chat);
     }
 
     #[test]

@@ -590,6 +590,7 @@ async fn handle_key(
             }
             KeyCode::Char('?') => app.mode = Mode::Help,
             KeyCode::Char('!') => app.open_attention(),
+            KeyCode::Char('/') => app.open_thread_picker(),
             KeyCode::Esc if app.selected_tree_is_thread() => app.select_parent_repository(),
             KeyCode::Char('h') | KeyCode::Left => app.collapse_selected_repository(),
             KeyCode::Char('l') | KeyCode::Right => app.expand_selected_repository(),
@@ -1204,15 +1205,30 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
             Some("Read-only: close the other Codex session, then use /threads to retry".into());
         return Ok(());
     }
-    if chat.active_turn_id.is_some() || chat.composer.trim().is_empty() {
+    if chat.composer.trim().is_empty() {
         return Ok(());
     }
     let prompt = chat.composer.clone();
     let thread_id = chat.thread_id.clone();
+    let active_turn_id = chat.active_turn_id.clone();
     let cwd = chat.cwd.clone();
     let model = chat.model.clone();
     let effort = chat.reasoning_effort.clone();
     let skills = chat.skills_for_prompt(&prompt);
+    if let Some(turn_id) = active_turn_id {
+        if let Err(error) = server
+            .steer_turn(&thread_id, &turn_id, &prompt, &skills)
+            .await
+        {
+            app.message = Some(format!("Could not send follow-up: {error}"));
+            return Ok(());
+        }
+        if let Some(chat) = app.chat_mut() {
+            chat.composer.clear();
+            chat.steer_submitted();
+        }
+        return Ok(());
+    }
     let turn_id = server
         .start_turn(
             &thread_id,
@@ -1363,11 +1379,12 @@ fn render(frame: &mut Frame, app: &mut App) {
 
     let default_status = if app.attention_count() > 0 {
         format!(
-            "! attention ({}) · j/k move/preview · Enter focus · n new · q quit",
+            "! attention ({}) · j/k move/preview · Enter focus · / search · n new · q quit",
             app.attention_count()
         )
     } else {
-        "? help · j/k move/preview · h/l collapse/expand · Enter focus · n new · q quit".into()
+        "? help · j/k move/preview · h/l collapse/expand · Enter focus · / search · n new · q quit"
+            .into()
     };
     let status = app.message.as_deref().unwrap_or(&default_status);
     frame.render_widget(
@@ -1559,32 +1576,46 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane
             .min(message_inner.bottom().saturating_sub(1));
         frame.set_cursor_position((x, y));
     }
-    let help = if read_only {
-        "READ ONLY · / palette · /threads retry · Tab scroll · Esc threads"
-    } else {
-        match chat.mode {
-            ChatMode::Input => {
-                if has_side_chat {
-                    "INPUT · Ctrl-G pane · Ctrl-N/P side · Enter send"
-                } else {
-                    "INPUT · Enter send · / palette · Ctrl-R effort · Ctrl-U clear · Tab scroll · Esc threads"
-                }
-            }
-            ChatMode::Scroll => {
-                if has_side_chat {
-                    "SCROLL · j/k line · J/K msg · e nvim · y copy · i input"
-                } else {
-                    "SCROLL · j/k line · J/K msg · e nvim · y/Y copy · u/d half · i input"
-                }
-            }
-        }
-    };
+    let help = chat_help(
+        read_only,
+        chat.mode,
+        has_side_chat,
+        chat.active_turn_id.is_some(),
+    );
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
         chunks[2],
     );
     if pane_active && let Some(palette) = &chat.palette {
         render_command_palette(frame, area, palette);
+    }
+}
+
+fn chat_help(read_only: bool, mode: ChatMode, has_side_chat: bool, active_turn: bool) -> String {
+    let controls = if read_only {
+        "READ ONLY · / palette · /threads retry · Tab scroll · Esc threads".into()
+    } else {
+        match (mode, has_side_chat) {
+            (ChatMode::Input, true) => format!(
+                "INPUT · Ctrl-G pane · Ctrl-N/P side · Enter {}",
+                if active_turn { "steer" } else { "send" }
+            ),
+            (ChatMode::Input, false) => format!(
+                "INPUT · Enter {} · / palette · Ctrl-R effort · Ctrl-U clear · Tab scroll · Esc threads",
+                if active_turn { "steer" } else { "send" }
+            ),
+            (ChatMode::Scroll, true) => {
+                "SCROLL · j/k line · J/K msg · e nvim · y copy · i input".into()
+            }
+            (ChatMode::Scroll, false) => {
+                "SCROLL · j/k line · J/K msg · e nvim · y/Y copy · u/d half · i input".into()
+            }
+        }
+    };
+    if active_turn {
+        format!("Ctrl-C stop · {controls}")
+    } else {
+        controls
     }
 }
 
@@ -2713,8 +2744,8 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(64, 26, area);
-    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand repository / focus chat input\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            open the visible diff hunk in Neovim\ny / Y        copy selected message / full chat\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            commands, skills, model, and side chat\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / remove thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
+    let popup = centered_rect(64, 28, area);
+    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            open the visible diff hunk in Neovim\ny / Y        copy selected message / full chat\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / remove thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(help).wrap(Wrap { trim: false }).block(
@@ -2781,6 +2812,17 @@ mod tests {
         assert!(!quit_requires_side_chat_confirmation(0));
         assert!(quit_requires_side_chat_confirmation(1));
         assert!(quit_requires_side_chat_confirmation(3));
+    }
+
+    #[test]
+    fn active_chat_help_shows_steer_and_interrupt_shortcuts() {
+        let active = chat_help(false, ChatMode::Input, false, true);
+        let idle = chat_help(false, ChatMode::Input, false, false);
+
+        assert!(active.starts_with("Ctrl-C stop · "));
+        assert!(active.contains("Enter steer"));
+        assert!(!idle.contains("Ctrl-C stop"));
+        assert!(idle.contains("Enter send"));
     }
 
     #[test]

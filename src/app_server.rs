@@ -347,19 +347,13 @@ impl AppServer {
         model: Option<&str>,
         effort: Option<&str>,
     ) -> Result<String> {
-        let mut input = vec![json!({"type": "text", "text": prompt})];
-        input.extend(
-            skills
-                .iter()
-                .map(|skill| json!({"type": "skill", "name": skill.name, "path": skill.path})),
-        );
         let response = self
             .request(
                 "turn/start",
                 json!({
                     "threadId": thread_id,
                     "cwd": cwd,
-                    "input": input,
+                    "input": turn_input(prompt, skills),
                     "model": model,
                     "effort": effort,
                     "approvalPolicy": "never",
@@ -372,6 +366,33 @@ impl AppServer {
             .and_then(Value::as_str)
             .map(str::to_owned)
             .context("turn/start response missing turn.id")
+    }
+
+    pub async fn steer_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        prompt: &str,
+        skills: &[SkillMetadata],
+    ) -> Result<()> {
+        let response = self
+            .request(
+                "turn/steer",
+                json!({
+                    "threadId": thread_id,
+                    "input": turn_input(prompt, skills),
+                    "expectedTurnId": turn_id,
+                }),
+            )
+            .await?;
+        let accepted_turn_id = response
+            .get("turnId")
+            .and_then(Value::as_str)
+            .context("turn/steer response missing turnId")?;
+        if accepted_turn_id != turn_id {
+            bail!("turn/steer returned unexpected turn id {accepted_turn_id}");
+        }
+        Ok(())
     }
 
     pub async fn interrupt_turn(&self, thread_id: &str, turn_id: &str) -> Result<()> {
@@ -389,6 +410,16 @@ impl AppServer {
             .await
             .context("write App Server message")
     }
+}
+
+fn turn_input(prompt: &str, skills: &[SkillMetadata]) -> Vec<Value> {
+    let mut input = vec![json!({"type": "text", "text": prompt})];
+    input.extend(
+        skills
+            .iter()
+            .map(|skill| json!({"type": "skill", "name": skill.name, "path": skill.path})),
+    );
+    input
 }
 
 async fn ensure_shared_app_server(command: &str) -> Result<PathBuf> {
@@ -623,6 +654,24 @@ mod tests {
     }
 
     #[test]
+    fn turn_input_includes_text_and_selected_skills() {
+        let skill = SkillMetadata {
+            name: "review".into(),
+            description: "Review changes".into(),
+            path: "/tmp/review/SKILL.md".into(),
+            scope: "user".into(),
+        };
+
+        assert_eq!(
+            turn_input("$review inspect this", &[skill]),
+            vec![
+                json!({"type":"text","text":"$review inspect this"}),
+                json!({"type":"skill","name":"review","path":"/tmp/review/SKILL.md"}),
+            ]
+        );
+    }
+
+    #[test]
     fn extracts_enabled_skills_for_the_workspace() {
         let response = json!({"data":[{
             "cwd":"/tmp/project",
@@ -688,6 +737,47 @@ mod tests {
         dispatch_response(&pending, &json!({"id": 1, "result": {"value": "first"}})).await;
         assert_eq!(first_rx.await.unwrap().unwrap()["value"], "first");
         assert_eq!(second_rx.await.unwrap().unwrap()["value"], "second");
+    }
+
+    #[tokio::test]
+    async fn steer_turn_sends_the_active_turn_id_and_input() {
+        let (writer, mut messages) = mpsc::channel(1);
+        let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(1);
+        let (_request_tx, request_rx) = mpsc::channel(1);
+        let server = Arc::new(AppServer {
+            writer,
+            pending: pending.clone(),
+            next_id: AtomicU64::new(0),
+            events,
+            server_requests: Mutex::new(request_rx),
+            version: "test".into(),
+            request_timeout: Duration::from_secs(1),
+        });
+
+        let task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .steer_turn("thread-1", "turn-1", "focus on tests", &[])
+                    .await
+            }
+        });
+        let message = messages.recv().await.unwrap();
+        assert_eq!(message["method"], "turn/steer");
+        assert_eq!(message["params"]["threadId"], "thread-1");
+        assert_eq!(message["params"]["expectedTurnId"], "turn-1");
+        assert_eq!(
+            message["params"]["input"],
+            json!([{"type":"text","text":"focus on tests"}])
+        );
+        dispatch_response(
+            &pending,
+            &json!({"id":message["id"],"result":{"turnId":"turn-1"}}),
+        )
+        .await;
+
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

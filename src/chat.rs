@@ -367,6 +367,20 @@ impl ChatState {
     }
 
     pub fn begin_user_turn(&mut self, prompt: String, turn_id: String) {
+        self.push_optimistic_user_message(prompt);
+        self.active_turn_id = Some(turn_id);
+        self.streaming_message = None;
+        self.waiting_for_activity = true;
+        if self.is_side_chat {
+            self.side_chat_has_activity = true;
+        }
+    }
+
+    pub fn steer_submitted(&mut self) {
+        self.selected_skills.clear();
+    }
+
+    fn push_optimistic_user_message(&mut self, prompt: String) {
         self.scroll_to_bottom();
         self.messages.push(ChatMessage {
             role: ChatRole::User,
@@ -375,12 +389,6 @@ impl ChatState {
             diff_targets: Vec::new(),
         });
         self.pending_user_message = Some(prompt);
-        self.active_turn_id = Some(turn_id);
-        self.streaming_message = None;
-        self.waiting_for_activity = true;
-        if self.is_side_chat {
-            self.side_chat_has_activity = true;
-        }
         self.selected_skills.clear();
     }
 
@@ -1127,6 +1135,39 @@ mod tests {
         assert_eq!(chat.messages.len(), 1);
         assert_eq!(chat.messages[0].content, "question");
         assert!(chat.is_waiting_for_activity());
+    }
+
+    #[test]
+    fn steered_user_messages_follow_the_server_event_order() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.begin_user_turn("question".into(), "u".into());
+        chat.apply(&event(
+            "item/completed",
+            json!({
+                "item":{"type":"userMessage","content":[{"type":"text","text":"question"}]}
+            }),
+        ));
+        chat.apply(&event(
+            "item/completed",
+            json!({"item":{"type":"agentMessage","text":"first response"}}),
+        ));
+        chat.steer_submitted();
+        chat.apply(&event(
+            "item/completed",
+            json!({
+                "item":{"type":"userMessage","content":[{"type":"text","text":"focus on tests"}]}
+            }),
+        ));
+        chat.apply(&event(
+            "item/completed",
+            json!({"item":{"type":"agentMessage","text":"steered response"}}),
+        ));
+
+        assert_eq!(chat.messages.len(), 4);
+        assert_eq!(chat.messages[0].content, "question");
+        assert_eq!(chat.messages[1].content, "first response");
+        assert_eq!(chat.messages[2].content, "focus on tests");
+        assert_eq!(chat.messages[3].content, "steered response");
     }
 
     #[test]
