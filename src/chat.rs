@@ -21,6 +21,10 @@ pub enum ChatMode {
 pub enum PaletteCommand {
     Threads,
     Scroll,
+    Model,
+    SideChat,
+    Sides,
+    SideClose,
     Status,
 }
 
@@ -29,6 +33,10 @@ impl PaletteCommand {
         match self {
             Self::Threads => "/threads",
             Self::Scroll => "/scroll",
+            Self::Model => "/model",
+            Self::SideChat => "/sidechat",
+            Self::Sides => "/sides",
+            Self::SideClose => "/sideclose",
             Self::Status => "/status",
         }
     }
@@ -37,6 +45,10 @@ impl PaletteCommand {
         match self {
             Self::Threads => "Return to the thread list",
             Self::Scroll => "Enter chat scroll mode",
+            Self::Model => "Choose the model and reasoning effort",
+            Self::SideChat => "Fork this thread into a side chat",
+            Self::Sides => "Choose a side chat for this thread",
+            Self::SideClose => "Close the current side chat",
             Self::Status => "Show the current thread and workspace",
         }
     }
@@ -83,6 +95,10 @@ impl CommandPalette {
         let mut entries = vec![
             PaletteEntry::Command(PaletteCommand::Threads),
             PaletteEntry::Command(PaletteCommand::Scroll),
+            PaletteEntry::Command(PaletteCommand::Model),
+            PaletteEntry::Command(PaletteCommand::SideChat),
+            PaletteEntry::Command(PaletteCommand::Sides),
+            PaletteEntry::Command(PaletteCommand::SideClose),
             PaletteEntry::Command(PaletteCommand::Status),
         ];
         entries.extend(skills.iter().cloned().map(PaletteEntry::Skill));
@@ -200,10 +216,14 @@ pub struct ChatState {
     pub thread_id: String,
     pub cwd: PathBuf,
     pub title: String,
+    pub model: Option<String>,
+    pub model_display_name: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub composer: String,
     pub active_turn_id: Option<String>,
     pub mode: ChatMode,
+    pub selected_message_index: Option<usize>,
     pub scroll_top: usize,
     pub max_scroll: usize,
     pub viewport_height: usize,
@@ -213,8 +233,12 @@ pub struct ChatState {
     pub selected_skills: Vec<SkillMetadata>,
     pub skills_loaded: bool,
     pub skills_stale: bool,
+    pub is_side_chat: bool,
+    pub side_chat_has_activity: bool,
+    waiting_for_activity: bool,
     streaming_message: Option<usize>,
     pending_user_message: Option<String>,
+    message_selection_scroll_pending: bool,
 }
 
 impl ChatState {
@@ -223,10 +247,14 @@ impl ChatState {
             thread_id,
             cwd,
             title,
+            model: None,
+            model_display_name: None,
+            reasoning_effort: None,
             messages: Vec::new(),
             composer: String::new(),
             active_turn_id: None,
             mode: ChatMode::Input,
+            selected_message_index: None,
             scroll_top: 0,
             max_scroll: 0,
             viewport_height: 1,
@@ -236,13 +264,36 @@ impl ChatState {
             selected_skills: Vec::new(),
             skills_loaded: false,
             skills_stale: false,
+            is_side_chat: false,
+            side_chat_has_activity: false,
+            waiting_for_activity: false,
             streaming_message: None,
             pending_user_message: None,
+            message_selection_scroll_pending: false,
         }
+    }
+
+    pub fn set_model(
+        &mut self,
+        model: String,
+        display_name: String,
+        reasoning_effort: Option<String>,
+    ) {
+        self.model = Some(model);
+        self.model_display_name = Some(display_name);
+        self.reasoning_effort = reasoning_effort;
+    }
+
+    pub fn mark_as_side_chat(&mut self) {
+        self.is_side_chat = true;
+        self.side_chat_has_activity = false;
     }
 
     pub fn load_history(&mut self, response: &Value) {
         self.messages.clear();
+        self.selected_message_index = None;
+        self.message_selection_scroll_pending = false;
+        self.waiting_for_activity = false;
         let Some(turns) = response.pointer("/thread/turns").and_then(Value::as_array) else {
             return;
         };
@@ -264,7 +315,15 @@ impl ChatState {
         self.pending_user_message = Some(prompt);
         self.active_turn_id = Some(turn_id);
         self.streaming_message = None;
+        self.waiting_for_activity = true;
+        if self.is_side_chat {
+            self.side_chat_has_activity = true;
+        }
         self.selected_skills.clear();
+    }
+
+    pub fn is_waiting_for_activity(&self) -> bool {
+        self.active_turn_id.is_some() && self.waiting_for_activity
     }
 
     pub fn open_palette(&mut self) {
@@ -307,6 +366,85 @@ impl ChatState {
         } else {
             self.scroll_top = self.scroll_top.min(self.max_scroll);
         }
+    }
+
+    pub fn enter_scroll_mode(&mut self) {
+        self.mode = ChatMode::Scroll;
+        self.selected_message_index = self.selectable_message_indices().last();
+        self.message_selection_scroll_pending = self.selected_message_index.is_some();
+        self.scroll_to_bottom();
+    }
+
+    pub fn move_message_selection(&mut self, forward: bool) {
+        let selectable = self.selectable_message_indices().collect::<Vec<_>>();
+        if selectable.is_empty() {
+            self.selected_message_index = None;
+            return;
+        }
+        let current = self
+            .selected_message_index
+            .and_then(|selected| selectable.iter().position(|index| *index == selected))
+            .unwrap_or(selectable.len() - 1);
+        let next = if forward {
+            current.saturating_add(1).min(selectable.len() - 1)
+        } else {
+            current.saturating_sub(1)
+        };
+        self.selected_message_index = Some(selectable[next]);
+        self.message_selection_scroll_pending = true;
+    }
+
+    pub fn selected_message(&self) -> Option<&ChatMessage> {
+        self.selected_message_index
+            .and_then(|index| self.messages.get(index))
+            .filter(|message| !message.content.is_empty())
+    }
+
+    pub fn selected_message_position(&self) -> Option<(usize, usize)> {
+        let selectable = self.selectable_message_indices().collect::<Vec<_>>();
+        let selected = self.selected_message_index?;
+        selectable
+            .iter()
+            .position(|index| *index == selected)
+            .map(|position| (position + 1, selectable.len()))
+    }
+
+    pub fn conversation_text(&self) -> String {
+        self.messages
+            .iter()
+            .filter(|message| !message.content.is_empty())
+            .map(|message| {
+                let role = match message.role {
+                    ChatRole::User => "User",
+                    ChatRole::Assistant => "Assistant",
+                    ChatRole::Activity => "Activity",
+                };
+                format!("{role}:\n{}", message.content)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    pub fn take_message_selection_scroll_request(&mut self) -> bool {
+        std::mem::take(&mut self.message_selection_scroll_pending)
+    }
+
+    pub fn reveal_line_range(&mut self, start: usize, end: usize) {
+        if start < self.scroll_top {
+            self.scroll_top = start;
+        } else if end > self.scroll_top.saturating_add(self.viewport_height) {
+            self.scroll_top = end.saturating_sub(self.viewport_height);
+        }
+        self.scroll_top = self.scroll_top.min(self.max_scroll);
+        self.follow_tail = self.scroll_top == self.max_scroll;
+    }
+
+    fn selectable_message_indices(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
+        self.messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| !message.content.is_empty())
+            .map(|(index, _)| index)
     }
 
     pub fn scroll_up(&mut self, lines: usize) {
@@ -362,6 +500,9 @@ impl ChatState {
             }
             "item/started" => {
                 if let Some(item) = event.params.get("item") {
+                    if item.get("type").and_then(Value::as_str) != Some("userMessage") {
+                        self.waiting_for_activity = false;
+                    }
                     self.push_started_item(item);
                 }
             }
@@ -369,6 +510,7 @@ impl ChatState {
                 let Some(delta) = event.params.get("delta").and_then(Value::as_str) else {
                     return;
                 };
+                self.waiting_for_activity = false;
                 let index = *self.streaming_message.get_or_insert_with(|| {
                     self.messages.push(ChatMessage {
                         role: ChatRole::Assistant,
@@ -380,6 +522,7 @@ impl ChatState {
                 self.messages[index].content.push_str(delta);
             }
             "item/commandExecution/outputDelta" => {
+                self.waiting_for_activity = false;
                 if let (Some(item_id), Some(delta)) = (
                     event.params.get("itemId").and_then(Value::as_str),
                     event.params.get("delta").and_then(Value::as_str),
@@ -388,6 +531,7 @@ impl ChatState {
                 }
             }
             "item/reasoning/summaryTextDelta" => {
+                self.waiting_for_activity = false;
                 if let (Some(item_id), Some(delta)) = (
                     event.params.get("itemId").and_then(Value::as_str),
                     event.params.get("delta").and_then(Value::as_str),
@@ -395,9 +539,15 @@ impl ChatState {
                     self.append_reasoning_summary(item_id, delta);
                 }
             }
-            "turn/plan/updated" => self.update_plan(&event.params),
+            "turn/plan/updated" => {
+                self.waiting_for_activity = false;
+                self.update_plan(&event.params);
+            }
             "item/completed" => {
                 if let Some(item) = event.params.get("item") {
+                    if item.get("type").and_then(Value::as_str) != Some("userMessage") {
+                        self.waiting_for_activity = false;
+                    }
                     if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
                         if let Some(index) = self.streaming_message.take()
                             && let Some(text) = item.get("text").and_then(Value::as_str)
@@ -415,8 +565,10 @@ impl ChatState {
                 self.active_turn_id = None;
                 self.streaming_message = None;
                 self.pending_user_message = None;
+                self.waiting_for_activity = false;
             }
             "error" => {
+                self.waiting_for_activity = false;
                 let message = event
                     .params
                     .pointer("/error/message")
@@ -775,6 +927,24 @@ mod tests {
         });
         assert_eq!(chat.messages.len(), 1);
         assert_eq!(chat.messages[0].content, "question");
+        assert!(chat.is_waiting_for_activity());
+    }
+
+    #[test]
+    fn thinking_waits_for_the_first_non_user_activity() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.begin_user_turn("question".into(), "u".into());
+        assert!(chat.is_waiting_for_activity());
+
+        chat.apply(&event("turn/started", json!({"turn":{"id":"u"}})));
+        assert!(chat.is_waiting_for_activity());
+
+        chat.apply(&event(
+            "item/started",
+            json!({"item":{"id":"reason-1","type":"reasoning"}}),
+        ));
+        assert!(!chat.is_waiting_for_activity());
+        assert_eq!(chat.messages.last().unwrap().content, "Thinking…");
     }
 
     #[test]
@@ -892,6 +1062,70 @@ mod tests {
     }
 
     #[test]
+    fn scroll_mode_selects_messages_and_clamps_navigation() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.push_notice("first".into());
+        chat.messages.push(ChatMessage {
+            role: ChatRole::Assistant,
+            content: String::new(),
+            item_id: None,
+        });
+        chat.push_notice("last".into());
+
+        chat.enter_scroll_mode();
+        assert_eq!(
+            chat.selected_message()
+                .map(|message| message.content.as_str()),
+            Some("last")
+        );
+        assert_eq!(chat.selected_message_position(), Some((2, 2)));
+
+        chat.move_message_selection(false);
+        chat.move_message_selection(false);
+        assert_eq!(
+            chat.selected_message()
+                .map(|message| message.content.as_str()),
+            Some("first")
+        );
+        assert_eq!(chat.selected_message_position(), Some((1, 2)));
+
+        chat.scroll_to_top();
+        chat.mode = ChatMode::Input;
+        chat.enter_scroll_mode();
+        assert_eq!(
+            chat.selected_message()
+                .map(|message| message.content.as_str()),
+            Some("last")
+        );
+        assert_eq!(chat.scroll_top, chat.max_scroll);
+        assert!(chat.follow_tail);
+
+        chat.move_message_selection(true);
+        chat.move_message_selection(true);
+        assert_eq!(
+            chat.selected_message()
+                .map(|message| message.content.as_str()),
+            Some("last")
+        );
+    }
+
+    #[test]
+    fn conversation_copy_uses_raw_text_and_role_labels() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.begin_user_turn("long input without display wrapping".into(), "turn".into());
+        chat.messages.push(ChatMessage {
+            role: ChatRole::Assistant,
+            content: "answer\nsecond line".into(),
+            item_id: None,
+        });
+
+        assert_eq!(
+            chat.conversation_text(),
+            "User:\nlong input without display wrapping\n\nAssistant:\nanswer\nsecond line"
+        );
+    }
+
+    #[test]
     fn command_palette_filters_commands_and_skills() {
         let skills = vec![
             SkillMetadata {
@@ -927,6 +1161,30 @@ mod tests {
         assert!(fuzzy_score("review", "rev") > fuzzy_score("hunk-review", "rev"));
         assert!(fuzzy_score("gh-fix-ci", "gfc").is_some());
         assert!(fuzzy_score("oracle", "xyz").is_none());
+    }
+
+    #[test]
+    fn command_palette_exposes_side_chat_actions() {
+        let mut palette = CommandPalette::new(&[]);
+        palette.query = "sidechat".into();
+        assert_eq!(palette.visible_entries()[0].label(), "/sidechat");
+
+        palette.query = "sides".into();
+        assert_eq!(palette.visible_entries()[0].label(), "/sides");
+
+        palette.query = "sideclose".into();
+        assert_eq!(palette.visible_entries()[0].label(), "/sideclose");
+    }
+
+    #[test]
+    fn side_chat_tracks_only_new_user_activity() {
+        let mut chat = ChatState::new("side".into(), "/tmp".into(), "Sidechat 1".into());
+        chat.load_history(&json!({"thread":{"turns":[{"items":[]}]}}));
+        chat.mark_as_side_chat();
+        assert!(!chat.side_chat_has_activity);
+
+        chat.begin_user_turn("new question".into(), "turn".into());
+        assert!(chat.side_chat_has_activity);
     }
 
     #[test]

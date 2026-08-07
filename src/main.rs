@@ -1,6 +1,7 @@
 mod app;
 pub mod app_server;
 mod chat;
+mod clipboard;
 mod git_workspace;
 mod registry;
 mod repository;

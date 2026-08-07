@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -43,6 +44,32 @@ pub struct SkillMetadata {
     pub description: String,
     pub path: PathBuf,
     pub scope: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningEffortMetadata {
+    pub reasoning_effort: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelMetadata {
+    pub id: String,
+    pub model: String,
+    pub display_name: String,
+    pub description: String,
+    pub default_reasoning_effort: String,
+    pub supported_reasoning_efforts: Vec<ReasoningEffortMetadata>,
+    pub is_default: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelListResponse {
+    data: Vec<ModelMetadata>,
+    next_cursor: Option<String>,
 }
 
 pub struct AppServer {
@@ -228,14 +255,39 @@ impl AppServer {
         self.write(&json!({"id": id, "result": result})).await
     }
 
-    pub async fn start_thread(&self, cwd: &Path) -> Result<String> {
+    pub async fn list_models(&self) -> Result<Vec<ModelMetadata>> {
+        let mut models = Vec::new();
+        let mut cursor = None;
+        loop {
+            let response = self
+                .request(
+                    "model/list",
+                    json!({
+                        "cursor": cursor,
+                        "includeHidden": false,
+                        "limit": 100
+                    }),
+                )
+                .await?;
+            let page = decode_model_list_response(response)?;
+            models.extend(page.data);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(models)
+    }
+
+    pub async fn start_thread(&self, cwd: &Path, model: Option<&str>) -> Result<String> {
         let response = self
             .request(
                 "thread/start",
                 json!({
                     "cwd": cwd,
-                    "approvalPolicy": "on-request",
-                    "sandbox": "workspace-write",
+                    "model": model,
+                    "approvalPolicy": "never",
+                    "sandbox": "danger-full-access",
                     "ephemeral": false
                 }),
             )
@@ -243,14 +295,20 @@ impl AppServer {
         extract_thread_id(&response, "thread/start")
     }
 
-    pub async fn resume_thread(&self, thread_id: &str, cwd: &Path) -> Result<()> {
+    pub async fn resume_thread(
+        &self,
+        thread_id: &str,
+        cwd: &Path,
+        model: Option<&str>,
+    ) -> Result<()> {
         self.request(
             "thread/resume",
             json!({
                 "threadId": thread_id,
                 "cwd": cwd,
-                "approvalPolicy": "on-request",
-                "sandbox": "workspace-write"
+                "model": model,
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access"
             }),
         )
         .await?;
@@ -262,20 +320,21 @@ impl AppServer {
         thread_id: &str,
         cwd: &Path,
         ephemeral: bool,
-    ) -> Result<String> {
+    ) -> Result<(String, Value)> {
         let response = self
             .request(
                 "thread/fork",
                 json!({
                     "threadId": thread_id,
                     "cwd": cwd,
-                    "approvalPolicy": "on-request",
-                    "sandbox": "workspace-write",
+                    "approvalPolicy": "never",
+                    "sandbox": "danger-full-access",
                     "ephemeral": ephemeral
                 }),
             )
             .await?;
-        extract_thread_id(&response, "thread/fork")
+        let thread_id = extract_thread_id(&response, "thread/fork")?;
+        Ok((thread_id, response))
     }
 
     pub async fn read_thread(&self, thread_id: &str) -> Result<Value> {
@@ -302,6 +361,8 @@ impl AppServer {
         cwd: &Path,
         prompt: &str,
         skills: &[SkillMetadata],
+        model: Option<&str>,
+        effort: Option<&str>,
     ) -> Result<String> {
         let mut input = vec![json!({"type": "text", "text": prompt})];
         input.extend(
@@ -315,7 +376,11 @@ impl AppServer {
                 json!({
                     "threadId": thread_id,
                     "cwd": cwd,
-                    "input": input
+                    "input": input,
+                    "model": model,
+                    "effort": effort,
+                    "approvalPolicy": "never",
+                    "sandboxPolicy": {"type": "dangerFullAccess"}
                 }),
             )
             .await?;
@@ -345,6 +410,10 @@ impl AppServer {
             .context("write App Server message")?;
         writer.flush().await.context("flush App Server message")
     }
+}
+
+fn decode_model_list_response(response: Value) -> Result<ModelListResponse> {
+    serde_json::from_value(response).context("decode model/list response")
 }
 
 fn extract_skills(response: &Value, cwd: &Path) -> Result<Vec<SkillMetadata>> {
@@ -448,6 +517,32 @@ mod tests {
         assert_eq!(skills[0].description, "Review changes");
     }
 
+    #[test]
+    fn decodes_models_and_reasoning_efforts() {
+        let response = json!({
+            "data": [{
+                "id": "gpt-test",
+                "model": "gpt-test",
+                "displayName": "GPT Test",
+                "description": "Test model",
+                "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [{
+                    "reasoningEffort": "medium",
+                    "description": "Balanced"
+                }],
+                "isDefault": true
+            }],
+            "nextCursor": null
+        });
+        let page = decode_model_list_response(response).unwrap();
+        assert_eq!(page.data[0].model, "gpt-test");
+        assert_eq!(
+            page.data[0].supported_reasoning_efforts[0].reasoning_effort,
+            "medium"
+        );
+        assert!(page.data[0].is_default);
+    }
+
     #[tokio::test]
     async fn responses_are_multiplexed_by_request_id() {
         let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
@@ -472,5 +567,10 @@ mod tests {
             .list_skills(Path::new(env!("CARGO_MANIFEST_DIR")), false)
             .await
             .expect("list skills from installed Codex App Server");
+        let models = server
+            .list_models()
+            .await
+            .expect("list models from installed Codex App Server");
+        assert!(!models.is_empty());
     }
 }

@@ -22,9 +22,15 @@ struct RepositoryData {
     repositories: Vec<Repository>,
 }
 
+#[derive(Default, Deserialize, Serialize)]
+struct RepositoryUiData {
+    expanded_repositories: Vec<PathBuf>,
+}
+
 pub struct RepositoryStore {
     registered_path: PathBuf,
     candidates_path: PathBuf,
+    ui_state_path: PathBuf,
 }
 
 #[derive(Clone, Copy)]
@@ -45,6 +51,7 @@ impl RepositoryStore {
         Ok(Self {
             registered_path: dirs.data_local_dir().join("repositories.json"),
             candidates_path: dirs.cache_dir().join("repository-candidates.json"),
+            ui_state_path: dirs.data_local_dir().join("repository-ui.json"),
         })
     }
 
@@ -53,6 +60,7 @@ impl RepositoryStore {
         Self {
             registered_path: root.join("repositories.json"),
             candidates_path: root.join("candidates.json"),
+            ui_state_path: root.join("repository-ui.json"),
         }
     }
 
@@ -66,6 +74,38 @@ impl RepositoryStore {
 
     pub fn save_candidates(&self, repositories: &[Repository]) -> Result<()> {
         save(&self.candidates_path, repositories)
+    }
+
+    pub fn load_expanded_repositories(&self) -> Result<Option<HashSet<PathBuf>>> {
+        if !self.ui_state_path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&self.ui_state_path)
+            .with_context(|| format!("read {}", self.ui_state_path.display()))?;
+        let data: RepositoryUiData = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse {}", self.ui_state_path.display()))?;
+        Ok(Some(data.expanded_repositories.into_iter().collect()))
+    }
+
+    pub fn save_expanded_repositories(&self, repositories: &HashSet<PathBuf>) -> Result<()> {
+        let parent = self
+            .ui_state_path
+            .parent()
+            .context("repository UI state path has no parent")?;
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        let mut expanded_repositories = repositories.iter().cloned().collect::<Vec<_>>();
+        expanded_repositories.sort();
+        let temporary = self.ui_state_path.with_extension("json.tmp");
+        fs::write(
+            &temporary,
+            serde_json::to_vec_pretty(&RepositoryUiData {
+                expanded_repositories,
+            })?,
+        )
+        .with_context(|| format!("write {}", temporary.display()))?;
+        fs::rename(&temporary, &self.ui_state_path)
+            .with_context(|| format!("replace {}", self.ui_state_path.display()))?;
+        Ok(())
     }
 
     pub fn register(&self, repositories: &[Repository]) -> Result<()> {
@@ -288,6 +328,23 @@ mod tests {
 
         store.unregister(&repository_path).unwrap();
         assert!(store.load_registered().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stores_repository_expansion_state_including_all_collapsed() {
+        let temp = tempdir().unwrap();
+        let store = RepositoryStore::at(temp.path());
+        assert_eq!(store.load_expanded_repositories().unwrap(), None);
+
+        let expanded = HashSet::from([PathBuf::from("/one"), PathBuf::from("/two")]);
+        store.save_expanded_repositories(&expanded).unwrap();
+        assert_eq!(store.load_expanded_repositories().unwrap(), Some(expanded));
+
+        store.save_expanded_repositories(&HashSet::new()).unwrap();
+        assert_eq!(
+            store.load_expanded_repositories().unwrap(),
+            Some(HashSet::new())
+        );
     }
 
     #[test]

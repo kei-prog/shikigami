@@ -46,7 +46,8 @@ results are cached, while the main screen only shows repositories you register.
 
 The left pane is one expandable tree: each registered repository keeps its
 wyard-created threads directly underneath it, and multiple repositories can be
-expanded at once. The right chat pane stays visible while navigating the tree.
+expanded at once. Expansion state is restored on the next launch. The right
+chat pane stays visible while navigating the tree.
 Creating a thread with `n` always uses the selected repository, including when
 the selection is one of that repository's child threads.
 
@@ -73,22 +74,56 @@ stdio. New threads are registered immediately from `thread/start`; existing
 threads use `thread/resume` and `thread/read`. Messages, streamed reasoning
 summaries, plans, command output tails, tool activity, and approvals stay inside
 the wyard TUI instead of opening the Codex terminal UI.
+Every thread and turn runs with `danger-full-access` and approval prompts
+disabled. The red `DANGEROUS` label in the header keeps that execution policy
+visible.
 User messages are shown as full-width colored input bands, while Codex responses
-and activity use the normal chat background.
+use the normal chat background. Commands, reasoning, file changes, and other
+activity use compact full-width gray bands separated by one line. Their heading
+is yellow while running, green when completed, and red when failed.
+After sending a message, an animated `Thinking…` indicator appears until the
+first response, reasoning summary, or tool activity arrives. It is display-only
+and is not added to the saved conversation history. The latest in-progress
+reasoning, command, edit, or tool activity keeps animating for the full active
+turn, including periods without incoming App Server events.
 
 Chat starts in input mode. Press `Tab` for scroll mode, then use `j` / `k` for
-one line, `Ctrl-u` / `Ctrl-d` for half a page, `PageUp` / `PageDown` for a full
+one line, `u` / `d` for half a page, `PageUp` / `PageDown` for a full
 page, and `g` / `G` for the beginning or latest message. `i`, `Enter`, `Tab`, or
 `Esc` returns to input mode. In input mode, `Ctrl-u` clears the composer and
 `Esc` returns focus to the repository tree. A blinking cursor follows the
 composer input and is hidden outside input mode. New output follows the bottom
-only while the view is already at the latest message.
+only while the view is already at the latest message. Entering scroll mode
+always starts from the latest message at the bottom.
+
+In scroll mode, `J` / `K` selects the next or previous raw chat message and
+keeps it visible. Press `y` to copy that message without its rendered wrapping
+or borders, or `Y` to copy the full current chat with role labels. Main and side
+chats keep independent selections. Clipboard commands are launched only when a
+copy is requested (`pbcopy` on macOS, with native command fallbacks elsewhere).
 
 Press `/` in an empty composer to open the command palette. Built-in wyard
 commands and enabled Codex skills for the current workspace appear in one
 fuzzy-searchable list, ranked by name and description matches. Selecting a
 skill inserts its `$skill-name` mention and sends the corresponding App Server
-skill input with the next message.
+skill input with the next message. Choose `/model` to select a model and its
+reasoning effort from the live App Server model catalog. The current selection
+appears in the header and applies to subsequent turns in that thread. Press
+`Ctrl-r` in chat input to open the current model's reasoning-effort slider;
+`j` / `k` changes the effort, `Enter` applies it, and `Esc` cancels.
+New chats default to `medium` reasoning when the selected model supports it.
+
+Choose `/sidechat` to create an ephemeral fork of the current thread. Each main
+thread can keep multiple side chats for the current wyard session. The chat area
+splits into main and the selected side pane, and both can stream independently.
+Press `Ctrl-g` to switch focus. While the side pane is focused, `Ctrl-n` and
+`Ctrl-p` cycle through its forks. `/sides` opens the full list; moving with
+`j` / `k` previews immediately, `Enter` confirms, and `Esc` restores the
+previous selection. Use `/sideclose` to close the selected fork without
+confirmation. Moving to another
+main thread hides its side chats; returning restores them. Side chats are not
+added to the repository tree and disappear when wyard exits. Quitting asks for
+confirmation whenever at least one side chat remains open.
 
 Existing Codex threads are not imported.
 

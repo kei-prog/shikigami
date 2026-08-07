@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use directories::BaseDirs;
 
 use crate::{
-    app_server::{AppServerEvent, AppServerRequest},
+    app_server::{AppServerEvent, AppServerRequest, ModelMetadata},
     chat::ChatState,
     git_workspace::{self, Workspace},
     registry::{Registry, ThreadRecord},
@@ -20,6 +20,12 @@ use crate::{
 pub enum Focus {
     Navigation,
     Chat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChatPane {
+    Main,
+    Side,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,6 +40,10 @@ pub enum Mode {
     ConfirmRemoveThread,
     ConfirmArchiveCleanup,
     Chat,
+    ChooseModel,
+    ChooseReasoningEffort,
+    ChooseSideChat,
+    ConfirmQuitSideChats,
     Approval,
     Help,
 }
@@ -86,8 +96,20 @@ pub struct App {
     pub should_quit: bool,
     pub chats: HashMap<String, ChatState>,
     pub visible_chat_id: Option<String>,
+    pub side_chat_id: Option<String>,
+    pub side_chat_parent_id: Option<String>,
+    pub side_chats_by_parent: HashMap<String, Vec<String>>,
+    pub selected_side_chat_by_parent: HashMap<String, usize>,
+    pub side_chat_picker_index: usize,
+    pub side_chat_picker_original_index: usize,
+    pub side_chat_picker_original_pane: ChatPane,
+    pub active_chat_pane: ChatPane,
     pub resumed_threads: HashSet<String>,
     pub pending_approvals: VecDeque<AppServerRequest>,
+    pub models: Vec<ModelMetadata>,
+    pub model_index: usize,
+    pub reasoning_effort_index: usize,
+    pub reasoning_effort_returns_to_model: bool,
     thread_registry: Registry,
     repository_store: RepositoryStore,
     workspaces_by_repository: HashMap<PathBuf, Vec<Workspace>>,
@@ -103,10 +125,31 @@ impl App {
             .map(|dirs| dirs.home_dir().to_path_buf())
             .unwrap_or_else(|| PathBuf::from("/"));
         let first_run = repositories.is_empty();
-        let expanded_repositories = repositories
-            .first()
-            .map(|repository| HashSet::from([repository.path.clone()]))
-            .unwrap_or_default();
+        let registered_paths = repositories
+            .iter()
+            .map(|repository| repository.path.clone())
+            .collect::<HashSet<_>>();
+        let (expanded_repositories, ui_state_error) =
+            match repository_store.load_expanded_repositories() {
+                Ok(Some(mut expanded)) => {
+                    expanded.retain(|path| registered_paths.contains(path));
+                    (expanded, None)
+                }
+                Ok(None) => (
+                    repositories
+                        .first()
+                        .map(|repository| HashSet::from([repository.path.clone()]))
+                        .unwrap_or_default(),
+                    None,
+                ),
+                Err(error) => (
+                    repositories
+                        .first()
+                        .map(|repository| HashSet::from([repository.path.clone()]))
+                        .unwrap_or_default(),
+                    Some(format!("Could not load repository view state: {error}")),
+                ),
+            };
         let mut app = Self {
             repositories,
             threads: Vec::new(),
@@ -132,12 +175,24 @@ impl App {
             },
             scanning: false,
             show_archived: false,
-            message: None,
+            message: ui_state_error,
             should_quit: false,
             chats: HashMap::new(),
             visible_chat_id: None,
+            side_chat_id: None,
+            side_chat_parent_id: None,
+            side_chats_by_parent: HashMap::new(),
+            selected_side_chat_by_parent: HashMap::new(),
+            side_chat_picker_index: 0,
+            side_chat_picker_original_index: 0,
+            side_chat_picker_original_pane: ChatPane::Main,
+            active_chat_pane: ChatPane::Main,
             resumed_threads: HashSet::new(),
             pending_approvals: VecDeque::new(),
+            models: Vec::new(),
+            model_index: 0,
+            reasoning_effort_index: 0,
+            reasoning_effort_returns_to_model: false,
             thread_registry: Registry::discover()?,
             repository_store,
             workspaces_by_repository: HashMap::new(),
@@ -159,29 +214,407 @@ impl App {
     }
 
     pub fn chat(&self) -> Option<&ChatState> {
+        self.active_chat_id()
+            .and_then(|thread_id| self.chats.get(thread_id))
+    }
+
+    pub fn chat_mut(&mut self) -> Option<&mut ChatState> {
+        let thread_id = self.active_chat_id()?.to_owned();
+        self.chats.get_mut(&thread_id)
+    }
+
+    pub fn main_chat(&self) -> Option<&ChatState> {
         self.visible_chat_id
             .as_ref()
             .and_then(|thread_id| self.chats.get(thread_id))
     }
 
-    pub fn chat_mut(&mut self) -> Option<&mut ChatState> {
-        let thread_id = self.visible_chat_id.clone()?;
-        self.chats.get_mut(&thread_id)
+    pub fn side_chat(&self) -> Option<&ChatState> {
+        self.side_chat_id
+            .as_ref()
+            .and_then(|thread_id| self.chats.get(thread_id))
+    }
+
+    pub fn has_side_chat(&self) -> bool {
+        self.side_chat().is_some()
+    }
+
+    fn active_chat_id(&self) -> Option<&str> {
+        match self.active_chat_pane {
+            ChatPane::Main => self.visible_chat_id.as_deref(),
+            ChatPane::Side => self
+                .side_chat_id
+                .as_deref()
+                .or(self.visible_chat_id.as_deref()),
+        }
     }
 
     pub fn show_chat(&mut self, chat: ChatState) {
         let thread_id = chat.thread_id.clone();
         self.chats.insert(thread_id.clone(), chat);
-        self.visible_chat_id = Some(thread_id);
+        self.show_main_chat_id(thread_id);
     }
 
     pub fn show_cached_chat(&mut self, thread_id: &str) -> bool {
         if self.chats.contains_key(thread_id) {
-            self.visible_chat_id = Some(thread_id.to_owned());
+            self.show_main_chat_id(thread_id.to_owned());
             true
         } else {
             false
         }
+    }
+
+    pub fn show_side_chat(&mut self, parent_thread_id: String, chat: ChatState) {
+        let thread_id = chat.thread_id.clone();
+        self.chats.insert(thread_id.clone(), chat);
+        let side_chats = self
+            .side_chats_by_parent
+            .entry(parent_thread_id.clone())
+            .or_default();
+        side_chats.push(thread_id.clone());
+        let index = side_chats.len() - 1;
+        self.selected_side_chat_by_parent
+            .insert(parent_thread_id.clone(), index);
+        self.side_chat_id = Some(thread_id);
+        self.side_chat_parent_id = Some(parent_thread_id);
+        self.active_chat_pane = ChatPane::Side;
+    }
+
+    pub fn close_side_chat(&mut self) {
+        let Some(parent_thread_id) = self.side_chat_parent_id.clone() else {
+            self.active_chat_pane = ChatPane::Main;
+            return;
+        };
+        let Some(thread_id) = self.side_chat_id.take() else {
+            self.active_chat_pane = ChatPane::Main;
+            return;
+        };
+        self.chats.remove(&thread_id);
+        self.resumed_threads.remove(&thread_id);
+        let mut remove_parent = false;
+        if let Some(side_chats) = self.side_chats_by_parent.get_mut(&parent_thread_id) {
+            side_chats.retain(|id| id != &thread_id);
+            if side_chats.is_empty() {
+                remove_parent = true;
+            } else {
+                let index = self
+                    .selected_side_chat_by_parent
+                    .get(&parent_thread_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(side_chats.len() - 1);
+                self.selected_side_chat_by_parent
+                    .insert(parent_thread_id.clone(), index);
+                self.side_chat_id = side_chats.get(index).cloned();
+            }
+        }
+        if remove_parent {
+            self.side_chats_by_parent.remove(&parent_thread_id);
+            self.selected_side_chat_by_parent.remove(&parent_thread_id);
+            self.side_chat_parent_id = None;
+        }
+        self.active_chat_pane = ChatPane::Main;
+    }
+
+    pub fn current_side_chats(&self) -> Vec<&ChatState> {
+        let Some(parent_thread_id) = self.visible_chat_id.as_deref() else {
+            return Vec::new();
+        };
+        self.side_chats_by_parent
+            .get(parent_thread_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|thread_id| self.chats.get(thread_id))
+            .collect()
+    }
+
+    pub fn open_side_chat_picker(&mut self) {
+        let Some(parent_thread_id) = self.visible_chat_id.as_deref() else {
+            return;
+        };
+        let count = self
+            .side_chats_by_parent
+            .get(parent_thread_id)
+            .map(Vec::len)
+            .unwrap_or(0);
+        if count == 0 {
+            self.message = Some("No side chats for this thread".into());
+            return;
+        }
+        self.side_chat_picker_index = self
+            .selected_side_chat_by_parent
+            .get(parent_thread_id)
+            .copied()
+            .unwrap_or(0)
+            .min(count - 1);
+        self.side_chat_picker_original_index = self.side_chat_picker_index;
+        self.side_chat_picker_original_pane = self.active_chat_pane;
+        self.preview_side_chat_picker();
+        self.active_chat_pane = ChatPane::Side;
+        self.mode = Mode::ChooseSideChat;
+    }
+
+    pub fn move_side_chat_picker_up(&mut self) {
+        self.side_chat_picker_index = self.side_chat_picker_index.saturating_sub(1);
+        self.preview_side_chat_picker();
+    }
+
+    pub fn move_side_chat_picker_down(&mut self) {
+        let count = self.current_side_chats().len();
+        if self.side_chat_picker_index + 1 < count {
+            self.side_chat_picker_index += 1;
+            self.preview_side_chat_picker();
+        }
+    }
+
+    pub fn cancel_side_chat_picker(&mut self) {
+        self.side_chat_picker_index = self.side_chat_picker_original_index;
+        self.preview_side_chat_picker();
+        self.active_chat_pane = self.side_chat_picker_original_pane;
+        self.mode = Mode::Chat;
+    }
+
+    pub fn select_side_chat_from_picker(&mut self) {
+        let Some(parent_thread_id) = self.visible_chat_id.clone() else {
+            self.mode = Mode::Chat;
+            return;
+        };
+        let Some(thread_id) = self
+            .side_chats_by_parent
+            .get(&parent_thread_id)
+            .and_then(|side_chats| side_chats.get(self.side_chat_picker_index))
+            .cloned()
+        else {
+            self.mode = Mode::Chat;
+            return;
+        };
+        self.selected_side_chat_by_parent
+            .insert(parent_thread_id.clone(), self.side_chat_picker_index);
+        self.side_chat_id = Some(thread_id);
+        self.side_chat_parent_id = Some(parent_thread_id);
+        self.active_chat_pane = ChatPane::Side;
+        self.focus = Focus::Chat;
+        self.mode = Mode::Chat;
+    }
+
+    pub fn cycle_side_chat(&mut self, forward: bool) {
+        if self.active_chat_pane != ChatPane::Side {
+            return;
+        }
+        let Some(parent_thread_id) = self.visible_chat_id.clone() else {
+            return;
+        };
+        let Some(side_chats) = self.side_chats_by_parent.get(&parent_thread_id) else {
+            return;
+        };
+        let Some(current_thread_id) = self.side_chat_id.as_deref() else {
+            return;
+        };
+        let current = side_chats
+            .iter()
+            .position(|thread_id| thread_id == current_thread_id)
+            .unwrap_or(0);
+        let next = cycle_index(current, side_chats.len(), forward);
+        let Some(thread_id) = side_chats.get(next).cloned() else {
+            return;
+        };
+        self.selected_side_chat_by_parent
+            .insert(parent_thread_id.clone(), next);
+        self.side_chat_id = Some(thread_id);
+        self.side_chat_parent_id = Some(parent_thread_id);
+    }
+
+    pub fn current_side_chat_position(&self) -> Option<(usize, usize)> {
+        let parent_thread_id = self.visible_chat_id.as_deref()?;
+        let side_chats = self.side_chats_by_parent.get(parent_thread_id)?;
+        let current_thread_id = self.side_chat_id.as_deref()?;
+        let index = side_chats
+            .iter()
+            .position(|thread_id| thread_id == current_thread_id)?;
+        Some((index + 1, side_chats.len()))
+    }
+
+    fn preview_side_chat_picker(&mut self) {
+        let Some(parent_thread_id) = self.visible_chat_id.clone() else {
+            return;
+        };
+        let Some(thread_id) = self
+            .side_chats_by_parent
+            .get(&parent_thread_id)
+            .and_then(|side_chats| side_chats.get(self.side_chat_picker_index))
+            .cloned()
+        else {
+            return;
+        };
+        self.side_chat_id = Some(thread_id);
+        self.side_chat_parent_id = Some(parent_thread_id);
+    }
+
+    pub fn side_chat_count(&self) -> usize {
+        self.side_chats_by_parent.values().map(Vec::len).sum()
+    }
+
+    pub fn toggle_chat_pane(&mut self) {
+        if self.has_side_chat() {
+            self.active_chat_pane = match self.active_chat_pane {
+                ChatPane::Main => ChatPane::Side,
+                ChatPane::Side => ChatPane::Main,
+            };
+        }
+    }
+
+    pub fn visible_chat_has_active_turn(&self) -> bool {
+        self.main_chat()
+            .is_some_and(|chat| chat.active_turn_id.is_some())
+            || self
+                .side_chat()
+                .is_some_and(|chat| chat.active_turn_id.is_some())
+    }
+
+    pub fn thread_is_registered(&self, thread_id: &str) -> bool {
+        self.threads
+            .iter()
+            .any(|thread| thread.record.id == thread_id)
+    }
+
+    pub fn set_models(&mut self, models: Vec<ModelMetadata>) {
+        self.model_index = models
+            .iter()
+            .position(|model| model.is_default)
+            .unwrap_or(0);
+        self.models = models;
+        self.reasoning_effort_index = self
+            .selected_model()
+            .and_then(|model| {
+                let default = preferred_reasoning_effort(model)?;
+                model
+                    .supported_reasoning_efforts
+                    .iter()
+                    .position(|effort| effort.reasoning_effort == default)
+            })
+            .unwrap_or(0);
+    }
+
+    pub fn default_model_settings(&self) -> Option<(String, String, Option<String>)> {
+        let model = self
+            .models
+            .iter()
+            .find(|model| model.is_default)
+            .or_else(|| self.models.first())?;
+        Some((
+            model.model.clone(),
+            model.display_name.clone(),
+            preferred_reasoning_effort(model).map(str::to_owned),
+        ))
+    }
+
+    pub fn open_model_picker(&mut self) {
+        let current_model = self.chat().and_then(|chat| chat.model.clone());
+        self.model_index = current_model
+            .as_deref()
+            .and_then(|current| self.models.iter().position(|model| model.model == current))
+            .or_else(|| self.models.iter().position(|model| model.is_default))
+            .unwrap_or(0);
+        self.sync_reasoning_effort_index();
+        self.mode = Mode::ChooseModel;
+    }
+
+    pub fn open_current_reasoning_effort_picker(&mut self) {
+        let current_model = self.chat().and_then(|chat| chat.model.clone());
+        self.model_index = current_model
+            .as_deref()
+            .and_then(|current| self.models.iter().position(|model| model.model == current))
+            .or_else(|| self.models.iter().position(|model| model.is_default))
+            .unwrap_or(0);
+        self.sync_reasoning_effort_index();
+        self.reasoning_effort_returns_to_model = false;
+        self.mode = Mode::ChooseReasoningEffort;
+    }
+
+    pub fn open_selected_reasoning_effort_picker(&mut self) {
+        self.sync_reasoning_effort_index();
+        self.reasoning_effort_returns_to_model = true;
+        self.mode = Mode::ChooseReasoningEffort;
+    }
+
+    pub fn cancel_reasoning_effort_picker(&mut self) {
+        self.mode = if self.reasoning_effort_returns_to_model {
+            Mode::ChooseModel
+        } else {
+            Mode::Chat
+        };
+        self.reasoning_effort_returns_to_model = false;
+    }
+
+    pub fn selected_model(&self) -> Option<&ModelMetadata> {
+        self.models.get(self.model_index)
+    }
+
+    pub fn move_model_up(&mut self) {
+        self.model_index = self.model_index.saturating_sub(1);
+        self.sync_reasoning_effort_index();
+    }
+
+    pub fn move_model_down(&mut self) {
+        if self.model_index + 1 < self.models.len() {
+            self.model_index += 1;
+            self.sync_reasoning_effort_index();
+        }
+    }
+
+    pub fn move_reasoning_effort_up(&mut self) {
+        self.reasoning_effort_index = self.reasoning_effort_index.saturating_sub(1);
+    }
+
+    pub fn move_reasoning_effort_down(&mut self) {
+        let count = self
+            .selected_model()
+            .map(|model| model.supported_reasoning_efforts.len())
+            .unwrap_or(0);
+        if self.reasoning_effort_index + 1 < count {
+            self.reasoning_effort_index += 1;
+        }
+    }
+
+    pub fn apply_selected_model(&mut self) {
+        let Some(model) = self.selected_model().cloned() else {
+            self.mode = Mode::Chat;
+            return;
+        };
+        let effort = model
+            .supported_reasoning_efforts
+            .get(self.reasoning_effort_index)
+            .map(|effort| effort.reasoning_effort.clone())
+            .or_else(|| preferred_reasoning_effort(&model).map(str::to_owned));
+        if let Some(chat) = self.chat_mut() {
+            chat.set_model(model.model, model.display_name, effort);
+        }
+        self.reasoning_effort_returns_to_model = false;
+        self.mode = Mode::Chat;
+    }
+
+    fn sync_reasoning_effort_index(&mut self) {
+        let current_effort = self.chat().and_then(|chat| chat.reasoning_effort.clone());
+        self.reasoning_effort_index = self
+            .selected_model()
+            .and_then(|model| {
+                current_effort
+                    .as_deref()
+                    .and_then(|current| {
+                        model
+                            .supported_reasoning_efforts
+                            .iter()
+                            .position(|effort| effort.reasoning_effort == current)
+                    })
+                    .or_else(|| {
+                        let default = preferred_reasoning_effort(model)?;
+                        model
+                            .supported_reasoning_efforts
+                            .iter()
+                            .position(|effort| effort.reasoning_effort == default)
+                    })
+            })
+            .unwrap_or(0);
     }
 
     pub fn apply_chat_event(&mut self, event: &AppServerEvent) {
@@ -189,10 +622,42 @@ impl App {
     }
 
     pub fn discard_chat(&mut self, thread_id: &str) {
+        self.discard_side_chats_for_parent(thread_id);
         self.chats.remove(thread_id);
         self.resumed_threads.remove(thread_id);
         if self.visible_chat_id.as_deref() == Some(thread_id) {
             self.visible_chat_id = None;
+        }
+    }
+
+    fn show_main_chat_id(&mut self, thread_id: String) {
+        self.visible_chat_id = Some(thread_id.clone());
+        let selected = self
+            .selected_side_chat_by_parent
+            .get(&thread_id)
+            .copied()
+            .unwrap_or(0);
+        self.side_chat_id = self
+            .side_chats_by_parent
+            .get(&thread_id)
+            .and_then(|side_chats| side_chats.get(selected))
+            .cloned();
+        self.side_chat_parent_id = self.side_chat_id.as_ref().map(|_| thread_id);
+        self.active_chat_pane = ChatPane::Main;
+    }
+
+    fn discard_side_chats_for_parent(&mut self, parent_thread_id: &str) {
+        if let Some(side_chats) = self.side_chats_by_parent.remove(parent_thread_id) {
+            for thread_id in side_chats {
+                self.chats.remove(&thread_id);
+                self.resumed_threads.remove(&thread_id);
+            }
+        }
+        self.selected_side_chat_by_parent.remove(parent_thread_id);
+        if self.side_chat_parent_id.as_deref() == Some(parent_thread_id) {
+            self.side_chat_id = None;
+            self.side_chat_parent_id = None;
+            self.active_chat_pane = ChatPane::Main;
         }
     }
 
@@ -227,6 +692,7 @@ impl App {
             return;
         };
         self.expanded_repositories.insert(repository.path);
+        self.persist_expanded_repositories();
     }
 
     pub fn collapse_selected_repository(&mut self) {
@@ -235,6 +701,7 @@ impl App {
         };
         self.expanded_repositories.remove(&repository.path);
         self.select_repository_row(self.repository_index);
+        self.persist_expanded_repositories();
     }
 
     pub fn toggle_selected_repository(&mut self) {
@@ -609,6 +1076,7 @@ impl App {
     }
 
     pub fn refresh_repositories(&mut self) -> Result<()> {
+        let had_repositories = !self.repositories.is_empty();
         let selected_path = self
             .selected_repository()
             .map(|repository| repository.path.clone());
@@ -627,11 +1095,14 @@ impl App {
                 .iter()
                 .any(|repository| repository.path == *path)
         });
-        if self.expanded_repositories.is_empty()
+        if !had_repositories
+            && self.expanded_repositories.is_empty()
             && let Some(repository) = self.repositories.get(self.repository_index)
         {
             self.expanded_repositories.insert(repository.path.clone());
         }
+        self.repository_store
+            .save_expanded_repositories(&self.expanded_repositories)?;
         self.select_repository_row(self.repository_index);
         self.location_index = 0;
         self.refresh_current();
@@ -715,6 +1186,15 @@ impl App {
     fn start_scan(&mut self, scope: ScanScope) {
         self.scan_receiver = Some(start_scan(scope));
         self.scanning = true;
+    }
+
+    fn persist_expanded_repositories(&mut self) {
+        if let Err(error) = self
+            .repository_store
+            .save_expanded_repositories(&self.expanded_repositories)
+        {
+            self.message = Some(format!("Could not save repository view state: {error}"));
+        }
     }
 
     fn refresh_browser(&mut self) {
@@ -811,6 +1291,32 @@ impl App {
     }
 }
 
+fn preferred_reasoning_effort(model: &ModelMetadata) -> Option<&str> {
+    model
+        .supported_reasoning_efforts
+        .iter()
+        .find(|effort| effort.reasoning_effort == "medium")
+        .or_else(|| {
+            model
+                .supported_reasoning_efforts
+                .iter()
+                .find(|effort| effort.reasoning_effort == model.default_reasoning_effort)
+        })
+        .or_else(|| model.supported_reasoning_efforts.first())
+        .map(|effort| effort.reasoning_effort.as_str())
+}
+
+fn cycle_index(current: usize, count: usize, forward: bool) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    if forward {
+        (current + 1) % count
+    } else {
+        current.checked_sub(1).unwrap_or(count - 1)
+    }
+}
+
 fn tree_rows_for(
     repositories: &[Repository],
     threads: &[ThreadItem],
@@ -869,6 +1375,45 @@ mod tests {
             location_name: "primary".into(),
             is_primary: true,
         }
+    }
+
+    fn model(default: &str, efforts: &[&str]) -> ModelMetadata {
+        ModelMetadata {
+            id: "test".into(),
+            model: "test".into(),
+            display_name: "Test".into(),
+            description: String::new(),
+            default_reasoning_effort: default.into(),
+            supported_reasoning_efforts: efforts
+                .iter()
+                .map(|effort| crate::app_server::ReasoningEffortMetadata {
+                    reasoning_effort: (*effort).into(),
+                    description: String::new(),
+                })
+                .collect(),
+            is_default: true,
+        }
+    }
+
+    #[test]
+    fn medium_is_the_preferred_reasoning_effort() {
+        let model = model("low", &["low", "medium", "high"]);
+        assert_eq!(preferred_reasoning_effort(&model), Some("medium"));
+    }
+
+    #[test]
+    fn model_default_is_used_when_medium_is_unavailable() {
+        let model = model("low", &["low", "high"]);
+        assert_eq!(preferred_reasoning_effort(&model), Some("low"));
+    }
+
+    #[test]
+    fn side_chat_cycle_wraps_in_both_directions() {
+        assert_eq!(cycle_index(0, 3, true), 1);
+        assert_eq!(cycle_index(2, 3, true), 0);
+        assert_eq!(cycle_index(2, 3, false), 1);
+        assert_eq!(cycle_index(0, 3, false), 2);
+        assert_eq!(cycle_index(0, 0, true), 0);
     }
 
     #[test]

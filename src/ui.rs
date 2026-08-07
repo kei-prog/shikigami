@@ -4,7 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
@@ -18,7 +18,6 @@ use crossterm::{
     },
 };
 use futures::StreamExt;
-use ratatui::prelude::Stylize;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -33,11 +32,12 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    app::{App, Focus, Mode, TreeRow},
+    app::{App, ChatPane, Focus, Mode, TreeRow},
     app_server::{AppServer, AppServerRequest},
     chat::{
         ChatMessage, ChatMode, ChatRole, ChatState, CommandPalette, PaletteCommand, PaletteEntry,
     },
+    clipboard,
     git_workspace::Workspace,
 };
 
@@ -50,6 +50,10 @@ struct ChatPreview {
 
 pub async fn run(mut app: App) -> Result<()> {
     let server = AppServer::spawn("codex", Duration::from_secs(30)).await?;
+    match server.list_models().await {
+        Ok(models) => app.set_models(models),
+        Err(error) => app.message = Some(format!("Could not load models: {error}")),
+    }
     let mut terminal = init_terminal()?;
     let result = run_loop(&mut terminal, &mut app, server).await;
     restore_terminal(&mut terminal)?;
@@ -96,6 +100,9 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
             _ = ticker.tick() => {
                 if app.scanning {
                     app.poll_scan();
+                    needs_draw = true;
+                }
+                if app.visible_chat_has_active_turn() {
                     needs_draw = true;
                 }
             }
@@ -169,12 +176,21 @@ async fn handle_key(
 ) -> Result<()> {
     match app.mode {
         Mode::Chat if app.chat().is_some_and(|chat| chat.palette.is_some()) => {
-            handle_palette_key(app, key);
+            handle_palette_key(app, key, server).await?;
         }
         Mode::Chat if app.chat().map(|chat| chat.mode) == Some(ChatMode::Scroll) => {
             match key.code {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     interrupt_chat(app, server).await?;
+                }
+                KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.toggle_chat_pane();
+                }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.cycle_side_chat(true);
+                }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.cycle_side_chat(false);
                 }
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if let Some(chat) = app.chat_mut() {
@@ -186,6 +202,28 @@ async fn handle_key(
                         chat.scroll_half_page_down();
                     }
                 }
+                KeyCode::Char('u') => {
+                    if let Some(chat) = app.chat_mut() {
+                        chat.scroll_half_page_up();
+                    }
+                }
+                KeyCode::Char('d') => {
+                    if let Some(chat) = app.chat_mut() {
+                        chat.scroll_half_page_down();
+                    }
+                }
+                KeyCode::Char('K') => {
+                    if let Some(chat) = app.chat_mut() {
+                        chat.move_message_selection(false);
+                    }
+                }
+                KeyCode::Char('J') => {
+                    if let Some(chat) = app.chat_mut() {
+                        chat.move_message_selection(true);
+                    }
+                }
+                KeyCode::Char('y') => copy_selected_message(app),
+                KeyCode::Char('Y') => copy_conversation(app),
                 KeyCode::Up | KeyCode::Char('k') => {
                     if let Some(chat) = app.chat_mut() {
                         chat.scroll_up(1);
@@ -227,7 +265,7 @@ async fn handle_key(
         Mode::Chat => match key.code {
             KeyCode::Tab => {
                 if let Some(chat) = app.chat_mut() {
-                    chat.mode = ChatMode::Scroll;
+                    chat.enter_scroll_mode();
                 }
             }
             KeyCode::Esc => {
@@ -237,10 +275,26 @@ async fn handle_key(
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 interrupt_chat(app, server).await?;
             }
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.toggle_chat_pane();
+            }
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.cycle_side_chat(true);
+            }
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.cycle_side_chat(false);
+            }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(chat) = app.chat_mut() {
                     chat.composer.clear();
                     chat.selected_skills.clear();
+                }
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if app.models.is_empty() {
+                    app.message = Some("No models are available from Codex".into());
+                } else {
+                    app.open_current_reasoning_effort_picker();
                 }
             }
             KeyCode::Backspace => {
@@ -261,6 +315,41 @@ async fn handle_key(
                     chat.composer.push(character);
                 }
             }
+            _ => {}
+        },
+        Mode::ChooseModel => match key.code {
+            KeyCode::Esc => app.mode = Mode::Chat,
+            KeyCode::Up | KeyCode::Char('k') => app.move_model_up(),
+            KeyCode::Down | KeyCode::Char('j') => app.move_model_down(),
+            KeyCode::Enter => {
+                if app
+                    .selected_model()
+                    .is_some_and(|model| model.supported_reasoning_efforts.is_empty())
+                {
+                    app.apply_selected_model();
+                } else if app.selected_model().is_some() {
+                    app.open_selected_reasoning_effort_picker();
+                }
+            }
+            _ => {}
+        },
+        Mode::ChooseReasoningEffort => match key.code {
+            KeyCode::Esc => app.cancel_reasoning_effort_picker(),
+            KeyCode::Up | KeyCode::Char('k') => app.move_reasoning_effort_up(),
+            KeyCode::Down | KeyCode::Char('j') => app.move_reasoning_effort_down(),
+            KeyCode::Enter => app.apply_selected_model(),
+            _ => {}
+        },
+        Mode::ChooseSideChat => match key.code {
+            KeyCode::Esc => app.cancel_side_chat_picker(),
+            KeyCode::Up | KeyCode::Char('k') => app.move_side_chat_picker_up(),
+            KeyCode::Down | KeyCode::Char('j') => app.move_side_chat_picker_down(),
+            KeyCode::Enter => app.select_side_chat_from_picker(),
+            _ => {}
+        },
+        Mode::ConfirmQuitSideChats => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => app.should_quit = true,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.mode = Mode::Normal,
             _ => {}
         },
         Mode::Approval => match key.code {
@@ -394,7 +483,13 @@ async fn handle_key(
         },
         Mode::Help => app.mode = Mode::Normal,
         Mode::Normal => match key.code {
-            KeyCode::Char('q') => app.should_quit = true,
+            KeyCode::Char('q') => {
+                if !quit_requires_side_chat_confirmation(app.side_chat_count()) {
+                    app.should_quit = true;
+                } else {
+                    app.mode = Mode::ConfirmQuitSideChats;
+                }
+            }
             KeyCode::Char('?') => app.mode = Mode::Help,
             KeyCode::Esc if app.selected_tree_is_thread() => app.select_parent_repository(),
             KeyCode::Char('h') | KeyCode::Left => app.collapse_selected_repository(),
@@ -495,9 +590,34 @@ async fn open_command_palette(app: &mut App, server: &Arc<AppServer>) -> Result<
     Ok(())
 }
 
-fn handle_palette_key(app: &mut App, key: KeyEvent) {
+fn copy_selected_message(app: &mut App) {
+    let content = app
+        .chat()
+        .and_then(ChatState::selected_message)
+        .map(|message| message.content.clone());
+    app.message = Some(match content {
+        Some(content) => match clipboard::copy(&content) {
+            Ok(()) => "Copied selected message".into(),
+            Err(error) => format!("Could not copy message: {error}"),
+        },
+        None => "No message selected".into(),
+    });
+}
+
+fn copy_conversation(app: &mut App) {
+    let content = app.chat().map(ChatState::conversation_text);
+    app.message = Some(match content {
+        Some(content) if !content.is_empty() => match clipboard::copy(&content) {
+            Ok(()) => "Copied full chat".into(),
+            Err(error) => format!("Could not copy chat: {error}"),
+        },
+        _ => "Chat is empty".into(),
+    });
+}
+
+async fn handle_palette_key(app: &mut App, key: KeyEvent, server: &Arc<AppServer>) -> Result<()> {
     let Some(chat) = app.chat_mut() else {
-        return;
+        return Ok(());
     };
     match key.code {
         KeyCode::Esc => chat.palette = None,
@@ -540,7 +660,7 @@ fn handle_palette_key(app: &mut App, key: KeyEvent) {
                 }
             }
         }
-        KeyCode::Enter => select_palette_entry(app),
+        KeyCode::Enter => select_palette_entry(app, server).await?,
         KeyCode::Char(character)
             if !key
                 .modifiers
@@ -552,31 +672,120 @@ fn handle_palette_key(app: &mut App, key: KeyEvent) {
         }
         _ => {}
     }
+    Ok(())
 }
 
-fn select_palette_entry(app: &mut App) {
-    let Some(chat) = app.chat_mut() else {
-        return;
-    };
-    let entry = chat
-        .palette
-        .as_ref()
-        .and_then(CommandPalette::selected_entry);
-    chat.palette = None;
+async fn select_palette_entry(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
+    let entry = app.chat_mut().and_then(|chat| {
+        let entry = chat
+            .palette
+            .as_ref()
+            .and_then(CommandPalette::selected_entry);
+        chat.palette = None;
+        entry
+    });
     match entry {
-        Some(PaletteEntry::Skill(skill)) => chat.select_skill(skill),
+        Some(PaletteEntry::Skill(skill)) => {
+            if let Some(chat) = app.chat_mut() {
+                chat.select_skill(skill);
+            }
+        }
         Some(PaletteEntry::Command(PaletteCommand::Threads)) => {
             app.mode = Mode::Normal;
             app.focus = Focus::Navigation;
         }
-        Some(PaletteEntry::Command(PaletteCommand::Scroll)) => chat.mode = ChatMode::Scroll,
-        Some(PaletteEntry::Command(PaletteCommand::Status)) => chat.push_notice(format!(
-            "Thread: {}\nWorkspace: {}",
-            chat.thread_id,
-            chat.cwd.display()
-        )),
+        Some(PaletteEntry::Command(PaletteCommand::Scroll)) => {
+            if let Some(chat) = app.chat_mut() {
+                chat.enter_scroll_mode();
+            }
+        }
+        Some(PaletteEntry::Command(PaletteCommand::Model)) => {
+            if app.models.is_empty() {
+                app.message = Some("No models are available from Codex".into());
+            } else {
+                app.open_model_picker();
+            }
+        }
+        Some(PaletteEntry::Command(PaletteCommand::SideChat)) => {
+            open_side_chat(app, server).await?;
+        }
+        Some(PaletteEntry::Command(PaletteCommand::Sides)) => {
+            app.open_side_chat_picker();
+        }
+        Some(PaletteEntry::Command(PaletteCommand::SideClose)) => {
+            close_side_chat(app, server).await?;
+        }
+        Some(PaletteEntry::Command(PaletteCommand::Status)) => {
+            if let Some(chat) = app.chat_mut() {
+                chat.push_notice(format!(
+                    "Thread: {}\nWorkspace: {}\nModel: {} ({})\nSandbox: danger-full-access",
+                    chat.thread_id,
+                    chat.cwd.display(),
+                    chat.model.as_deref().unwrap_or("Codex default"),
+                    chat.reasoning_effort.as_deref().unwrap_or("default")
+                ));
+            }
+        }
         None => {}
     }
+    Ok(())
+}
+
+async fn open_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
+    let Some(main_chat) = app.main_chat() else {
+        return Ok(());
+    };
+    if main_chat.active_turn_id.is_some() {
+        app.message = Some("Wait for the current turn before forking a side chat".into());
+        return Ok(());
+    }
+    if main_chat.messages.is_empty() {
+        app.message = Some("Send a message before forking a side chat".into());
+        return Ok(());
+    }
+    let parent_thread_id = main_chat.thread_id.clone();
+    let cwd = main_chat.cwd.clone();
+    let model = main_chat.model.clone();
+    let model_display_name = main_chat.model_display_name.clone();
+    let reasoning_effort = main_chat.reasoning_effort.clone();
+    let side_chat_number = app.current_side_chats().len() + 1;
+    let (side_thread_id, history) = match server.fork_thread(&parent_thread_id, &cwd, true).await {
+        Ok(result) => result,
+        Err(error) => {
+            app.message = Some(format!("Could not fork side chat: {error}"));
+            return Ok(());
+        }
+    };
+    let mut side_chat = ChatState::new(
+        side_thread_id.clone(),
+        cwd,
+        format!("Sidechat {side_chat_number}"),
+    );
+    if let (Some(model), Some(display_name)) = (model, model_display_name) {
+        side_chat.set_model(model, display_name, reasoning_effort);
+    }
+    side_chat.load_history(&history);
+    side_chat.mark_as_side_chat();
+    app.resumed_threads.insert(side_thread_id);
+    app.show_side_chat(parent_thread_id, side_chat);
+    app.focus = Focus::Chat;
+    app.mode = Mode::Chat;
+    Ok(())
+}
+
+async fn close_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
+    let active_turn = app.side_chat().and_then(|chat| {
+        chat.active_turn_id
+            .as_ref()
+            .map(|turn_id| (chat.thread_id.clone(), turn_id.clone()))
+    });
+    if let Some((thread_id, turn_id)) = active_turn
+        && let Err(error) = server.interrupt_turn(&thread_id, &turn_id).await
+    {
+        app.message = Some(format!("Could not interrupt side chat: {error}"));
+    }
+    app.close_side_chat();
+    Ok(())
 }
 
 async fn interrupt_chat(app: &App, server: &Arc<AppServer>) -> Result<()> {
@@ -589,14 +798,20 @@ async fn interrupt_chat(app: &App, server: &Arc<AppServer>) -> Result<()> {
 }
 
 async fn open_new_chat(app: &mut App, server: &Arc<AppServer>, workspace: Workspace) -> Result<()> {
-    let thread_id = server.start_thread(&workspace.path).await?;
+    let model_settings = app.default_model_settings();
+    let thread_id = server
+        .start_thread(
+            &workspace.path,
+            model_settings.as_ref().map(|(model, _, _)| model.as_str()),
+        )
+        .await?;
     app.register_app_server_thread(thread_id.clone(), workspace.path.clone())?;
     app.resumed_threads.insert(thread_id.clone());
-    app.show_chat(ChatState::new(
-        thread_id,
-        workspace.path,
-        "Untitled thread".into(),
-    ));
+    let mut chat = ChatState::new(thread_id, workspace.path, "Untitled thread".into());
+    if let Some((model, display_name, effort)) = model_settings {
+        chat.set_model(model, display_name, effort);
+    }
+    app.show_chat(chat);
     app.focus = Focus::Chat;
     app.mode = Mode::Chat;
     Ok(())
@@ -619,6 +834,7 @@ fn schedule_selected_chat_preview(
         return;
     }
     let server = Arc::clone(server);
+    let model_settings = app.default_model_settings();
     let generation = Arc::clone(generation);
     let sender = sender.clone();
     tokio::spawn(async move {
@@ -630,6 +846,9 @@ fn schedule_selected_chat_preview(
             Ok(history) => {
                 let mut chat =
                     ChatState::new(thread.record.id, thread.record.cwd, thread.record.title);
+                if let Some((model, display_name, effort)) = model_settings {
+                    chat.set_model(model, display_name, effort);
+                }
                 chat.load_history(&history);
                 Ok(chat)
             }
@@ -656,6 +875,9 @@ async fn preview_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result
     }
     let history = server.read_thread(&thread.record.id).await?;
     let mut chat = ChatState::new(thread.record.id, thread.record.cwd, thread.record.title);
+    if let Some((model, display_name, effort)) = app.default_model_settings() {
+        chat.set_model(model, display_name, effort);
+    }
     chat.load_history(&history);
     app.show_chat(chat);
     Ok(())
@@ -668,8 +890,11 @@ async fn focus_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result<(
     };
     let thread_id = chat.thread_id.clone();
     let cwd = chat.cwd.clone();
+    let model = chat.model.clone();
     if !app.resumed_threads.contains(&thread_id) {
-        server.resume_thread(&thread_id, &cwd).await?;
+        server
+            .resume_thread(&thread_id, &cwd, model.as_deref())
+            .await?;
         app.resumed_threads.insert(thread_id);
     }
     app.focus = Focus::Chat;
@@ -687,15 +912,36 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     let prompt = chat.composer.clone();
     let thread_id = chat.thread_id.clone();
     let cwd = chat.cwd.clone();
+    let model = chat.model.clone();
+    let effort = chat.reasoning_effort.clone();
     let skills = chat.skills_for_prompt(&prompt);
     let turn_id = server
-        .start_turn(&thread_id, &cwd, &prompt, &skills)
+        .start_turn(
+            &thread_id,
+            &cwd,
+            &prompt,
+            &skills,
+            model.as_deref(),
+            effort.as_deref(),
+        )
         .await?;
     if let Some(chat) = app.chat_mut() {
+        let first_side_message = chat.is_side_chat && !chat.side_chat_has_activity;
         chat.composer.clear();
         chat.begin_user_turn(prompt.clone(), turn_id);
+        if first_side_message {
+            chat.title = prompt
+                .lines()
+                .next()
+                .unwrap_or(&prompt)
+                .chars()
+                .take(40)
+                .collect();
+        }
     }
-    app.update_thread_title(&thread_id, &prompt)?;
+    if app.thread_is_registered(&thread_id) {
+        app.update_thread_title(&thread_id, &prompt)?;
+    }
     Ok(())
 }
 
@@ -748,25 +994,39 @@ fn render(frame: &mut Frame, app: &mut App) {
         } else {
             "ready"
         };
-        format!("{} · {state}", chat.title)
-    });
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            " wyard ".bold(),
-            chat_status
+        format!(
+            "{} · {state} · {} · {}",
+            chat.title,
+            chat.model_display_name
                 .as_deref()
-                .unwrap_or("repositories / threads")
-                .dark_gray(),
-        ])),
-        chunks[0],
-    );
+                .unwrap_or("Codex default"),
+            chat.reasoning_effort.as_deref().unwrap_or("default")
+        )
+    });
+    let mut header = vec![Span::styled(
+        " wyard ",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    if app.chat().is_some() {
+        header.push(Span::styled(
+            " DANGEROUS ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+        header.push(Span::raw(" "));
+    }
+    header.push(Span::styled(
+        chat_status.as_deref().unwrap_or("repositories / threads"),
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(header)), chunks[0]);
 
+    let navigation_width = navigation_width(chunks[1].width);
     let panes = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
+        .constraints([Constraint::Length(navigation_width), Constraint::Min(20)])
         .split(chunks[1]);
     render_navigation_tree(frame, app, panes[0]);
-    render_chat_pane(frame, panes[1], app);
+    render_chat_area(frame, panes[1], app);
 
     let status = app.message.as_deref().unwrap_or(
         "? help · j/k move/preview · h/l collapse/expand · Enter focus · n new · q quit",
@@ -784,6 +1044,10 @@ fn render(frame: &mut Frame, app: &mut App) {
         Mode::ConfirmRemoveRepository => render_repository_remove_confirm(frame, area, app),
         Mode::ConfirmRemoveThread => render_remove_confirm(frame, area, app),
         Mode::ConfirmArchiveCleanup => render_archive_confirm(frame, area, app),
+        Mode::ChooseModel => render_model_picker(frame, area, app),
+        Mode::ChooseReasoningEffort => render_reasoning_effort_picker(frame, area, app),
+        Mode::ChooseSideChat => render_side_chat_picker(frame, area, app),
+        Mode::ConfirmQuitSideChats => render_quit_side_chats_confirm(frame, area, app),
         Mode::Help => render_help(frame, area),
         Mode::Normal | Mode::Chat | Mode::Approval => {}
     }
@@ -792,21 +1056,64 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App) {
-    let show_composer_cursor = app.mode == Mode::Chat && app.focus == Focus::Chat;
-    let chat_focused = app.focus == Focus::Chat;
-    let Some(chat) = app.chat_mut() else {
+fn render_chat_area(frame: &mut Frame, area: Rect, app: &mut App) {
+    if app.has_side_chat() {
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area);
+        render_chat_pane(frame, panes[0], app, ChatPane::Main);
+        render_chat_pane(frame, panes[1], app, ChatPane::Side);
+    } else {
+        render_chat_pane(frame, area, app, ChatPane::Main);
+    }
+}
+
+fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane) {
+    let pane_active = app.active_chat_pane == pane;
+    let show_composer_cursor = app.mode == Mode::Chat && app.focus == Focus::Chat && pane_active;
+    let chat_focused = app.focus == Focus::Chat && pane_active;
+    let has_side_chat = app.has_side_chat();
+    let side_chat_position = app.current_side_chat_position();
+    let chat_id = match pane {
+        ChatPane::Main => app.visible_chat_id.clone(),
+        ChatPane::Side => app.side_chat_id.clone(),
+    };
+    let message_position = chat_id
+        .as_ref()
+        .and_then(|thread_id| app.chats.get(thread_id))
+        .filter(|chat| chat.mode == ChatMode::Scroll)
+        .and_then(ChatState::selected_message_position)
+        .map(|(index, count)| format!(" · {index}/{count}"))
+        .unwrap_or_default();
+    let title = match pane {
+        ChatPane::Main => format!(" Chat{message_position} "),
+        ChatPane::Side => chat_id
+            .as_ref()
+            .and_then(|thread_id| app.chats.get(thread_id))
+            .map(|chat| {
+                let position = side_chat_position
+                    .map(|(index, count)| format!(" {index}/{count}"))
+                    .unwrap_or_default();
+                format!(" Sidechat{position} · {}{message_position} ", chat.title)
+            })
+            .unwrap_or_else(|| " Sidechat ".into()),
+    };
+    let Some(chat_id) = chat_id else {
         frame.render_widget(
             Paragraph::new("Select a thread or press n to create one")
                 .style(Style::default().fg(Color::DarkGray))
                 .block(
                     Block::default()
-                        .title(" Chat ")
+                        .title(title.as_str())
                         .borders(Borders::ALL)
                         .border_style(focus_style(false)),
                 ),
             area,
         );
+        return;
+    };
+    let Some(chat) = app.chats.get_mut(&chat_id) else {
         return;
     };
     let chunks = Layout::default()
@@ -818,26 +1125,30 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App) {
         ])
         .split(area);
     let visible_height = chunks[0].height.saturating_sub(2).max(1) as usize;
-    let chat_border = if chat.mode == ChatMode::Scroll {
+    let chat_border = if pane_active && chat.mode == ChatMode::Scroll {
         Color::Cyan
     } else {
         focus_style(chat_focused).fg.unwrap_or(Color::DarkGray)
     };
     let chat_block = Block::default()
-        .title(" Chat ")
+        .title(title.as_str())
         .borders(Borders::ALL)
         .padding(Padding::right(1))
         .border_style(Style::default().fg(chat_border));
     let text_width = chat_block.inner(chunks[0]).width.max(1);
-    let lines = chat
-        .messages
-        .iter()
-        .flat_map(|message| chat_message_lines(message, text_width as usize))
-        .collect::<Vec<_>>();
+    let RenderedChat {
+        lines,
+        selected_range,
+    } = rendered_chat(chat, text_width as usize);
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     let total_lines = paragraph.line_count(text_width);
     let paragraph = paragraph.block(chat_block);
     chat.update_scroll_metrics(total_lines, visible_height);
+    if chat.take_message_selection_scroll_request()
+        && let Some((start, end)) = selected_range
+    {
+        chat.reveal_line_range(start, end);
+    }
     let scroll = u16::try_from(chat.scroll_top).unwrap_or(u16::MAX);
     frame.render_widget(paragraph.scroll((scroll, 0)), chunks[0]);
     let message_border = if chat.mode == ChatMode::Input && chat_focused {
@@ -891,19 +1202,36 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App) {
     }
     let help = match chat.mode {
         ChatMode::Input => {
-            "INPUT · Enter send · / palette · Ctrl-U clear · Tab scroll · Esc threads"
+            if has_side_chat {
+                "INPUT · Ctrl-G pane · Ctrl-N/P side · Enter send"
+            } else {
+                "INPUT · Enter send · / palette · Ctrl-R effort · Ctrl-U clear · Tab scroll · Esc threads"
+            }
         }
         ChatMode::Scroll => {
-            "SCROLL · j/k line · Ctrl-U/D half · PgUp/PgDn page · g/G ends · i/Tab/Esc input"
+            if has_side_chat {
+                "SCROLL · j/k line · J/K msg · y copy · i input"
+            } else {
+                "SCROLL · j/k line · J/K message · y copy · Y all · u/d half · i input"
+            }
         }
     };
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
         chunks[2],
     );
-    if let Some(palette) = &chat.palette {
+    if pane_active && let Some(palette) = &chat.palette {
         render_command_palette(frame, area, palette);
     }
+}
+
+fn thinking_frame() -> &'static str {
+    const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let frame = (elapsed.as_millis() / 100) as usize % FRAMES.len();
+    FRAMES[frame]
 }
 
 fn render_command_palette(frame: &mut Frame, area: Rect, palette: &CommandPalette) {
@@ -952,13 +1280,175 @@ fn render_command_palette(frame: &mut Frame, area: Rect, palette: &CommandPalett
     frame.render_stateful_widget(list, popup, &mut state);
 }
 
-fn chat_message_lines(message: &ChatMessage, available_width: usize) -> Vec<Line<'static>> {
+fn render_model_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let height = u16::try_from(app.models.len().saturating_mul(2).saturating_add(2))
+        .unwrap_or(u16::MAX)
+        .clamp(7, area.height.saturating_sub(4).max(7));
+    let popup = centered_rect(72, height, area);
+    let items = app.models.iter().map(|model| {
+        let default = if model.is_default { " · default" } else { "" };
+        ListItem::new(Text::from(vec![
+            Line::styled(
+                format!("{}{}", model.display_name, default),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(&model.description, Style::default().fg(Color::DarkGray)),
+        ]))
+    });
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(" Model ")
+                .title_bottom(Line::from(" j/k select · Enter effort · Esc close "))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_symbol("› ")
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    let mut state = ListState::default().with_selected(
+        (!app.models.is_empty()).then_some(app.model_index.min(app.models.len() - 1)),
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_stateful_widget(list, popup, &mut state);
+}
+
+fn render_reasoning_effort_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(model) = app.selected_model() else {
+        return;
+    };
+    let efforts = &model.supported_reasoning_efforts;
+    let selected = app
+        .reasoning_effort_index
+        .min(efforts.len().saturating_sub(1));
+    let mut slider = Vec::new();
+    for (index, effort) in efforts.iter().enumerate() {
+        if index > 0 {
+            slider.push(Span::styled(" ─ ", Style::default().fg(Color::DarkGray)));
+        }
+        let active = index == selected;
+        slider.push(Span::styled(
+            format!(
+                "{} {}",
+                if active { "●" } else { "○" },
+                effort.reasoning_effort
+            ),
+            if active {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ));
+    }
+    let description = efforts
+        .get(selected)
+        .map(|effort| effort.description.as_str())
+        .unwrap_or("No reasoning effort options are available");
+    let popup = centered_rect(78, 9, area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::from(""),
+            Line::from(slider),
+            Line::from(""),
+            Line::styled(description, Style::default().fg(Color::DarkGray)),
+        ]))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title(format!(" {} · reasoning effort ", model.display_name))
+                .title_bottom(Line::from(" j/k change · Enter apply · Esc cancel "))
+                .borders(Borders::ALL)
+                .padding(Padding::horizontal(2))
+                .border_style(Style::default().fg(Color::Green)),
+        ),
+        popup,
+    );
+}
+
+fn render_side_chat_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let side_chats = app.current_side_chats();
+    let height = u16::try_from(side_chats.len().saturating_mul(2).saturating_add(2))
+        .unwrap_or(u16::MAX)
+        .clamp(7, area.height.saturating_sub(4).max(7));
+    let popup = centered_rect(64, height, area);
+    let items = side_chats.iter().enumerate().map(|(index, chat)| {
+        let state = if chat.active_turn_id.is_some() {
+            "working"
+        } else {
+            "ready"
+        };
+        ListItem::new(Text::from(vec![
+            Line::styled(
+                format!("{}. {}", index + 1, chat.title),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                format!(
+                    "{state} · {}",
+                    chat.reasoning_effort.as_deref().unwrap_or("default")
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]))
+    });
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(" Side chats ")
+                .title_bottom(Line::from(" j/k select · Enter open · Esc close "))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_symbol("› ")
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    let mut state = ListState::default().with_selected(
+        (!side_chats.is_empty()).then_some(
+            app.side_chat_picker_index
+                .min(side_chats.len().saturating_sub(1)),
+        ),
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_stateful_widget(list, popup, &mut state);
+}
+
+fn render_quit_side_chats_confirm(frame: &mut Frame, area: Rect, app: &App) {
+    let count = app.side_chat_count();
+    let popup = centered_rect(64, 7, area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{count} side chat{} will be discarded when wyard exits.\n\nQuit? [y/N]",
+            if count == 1 { "" } else { "s" }
+        ))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title(" Unsaved side chats ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        ),
+        popup,
+    );
+}
+
+fn chat_message_lines(
+    message: &ChatMessage,
+    available_width: usize,
+    animate_activity: bool,
+) -> Vec<Line<'static>> {
     if message.role == ChatRole::Activity {
-        return message
-            .content
-            .lines()
-            .map(|line| Line::styled(format!("  {line}"), Style::default().fg(Color::DarkGray)))
-            .collect();
+        let content = if animate_activity {
+            format!("{} {}", thinking_frame(), message.content)
+        } else {
+            message.content.clone()
+        };
+        return activity_message_lines(&content, available_width);
     }
     if message.role == ChatRole::User {
         return user_message_lines(message, available_width);
@@ -971,6 +1461,192 @@ fn chat_message_lines(message: &ChatMessage, available_width: usize) -> Vec<Line
             .map(|line| Line::from(line.to_owned())),
     );
     lines.push(Line::from(""));
+    lines
+}
+
+struct RenderedChat {
+    lines: Vec<Line<'static>>,
+    selected_range: Option<(usize, usize)>,
+}
+
+fn rendered_chat(chat: &ChatState, available_width: usize) -> RenderedChat {
+    let mut lines = Vec::new();
+    let mut selected_range = None;
+    let mut rendered_height = 0usize;
+    let line_count_width = u16::try_from(available_width).unwrap_or(u16::MAX);
+    let animated_activity_index = chat.active_turn_id.as_ref().and_then(|_| {
+        chat.messages
+            .last()
+            .is_some_and(|message| {
+                message.role == ChatRole::Activity && activity_is_in_progress(&message.content)
+            })
+            .then_some(chat.messages.len().saturating_sub(1))
+    });
+    for (index, message) in chat.messages.iter().enumerate() {
+        let mut message_lines = chat_message_lines(
+            message,
+            available_width,
+            animated_activity_index == Some(index),
+        );
+        let message_height = Paragraph::new(Text::from(message_lines.clone()))
+            .wrap(Wrap { trim: false })
+            .line_count(line_count_width);
+        if chat.mode == ChatMode::Scroll && chat.selected_message_index == Some(index) {
+            highlight_message_lines(&mut message_lines, available_width);
+            selected_range = Some((
+                rendered_height,
+                rendered_height.saturating_add(message_height),
+            ));
+        }
+        lines.extend(message_lines);
+        rendered_height = rendered_height.saturating_add(message_height);
+    }
+    if chat.is_waiting_for_activity() {
+        lines.extend(activity_message_lines(
+            &format!("{} Thinking…", thinking_frame()),
+            available_width,
+        ));
+    }
+    RenderedChat {
+        lines,
+        selected_range,
+    }
+}
+
+fn highlight_message_lines(lines: &mut [Line<'static>], available_width: usize) {
+    let background = Color::Rgb(52, 63, 72);
+    for line in lines {
+        for span in &mut line.spans {
+            span.style = span.style.bg(background);
+        }
+        let padding = available_width.saturating_sub(line.width());
+        if padding > 0 {
+            line.spans.push(Span::styled(
+                " ".repeat(padding),
+                Style::default().bg(background),
+            ));
+        }
+        line.style = line.style.bg(background);
+    }
+}
+
+fn activity_message_lines(content: &str, available_width: usize) -> Vec<Line<'static>> {
+    let background = Color::Rgb(32, 34, 36);
+    let header_color = activity_header_color(content);
+    if available_width < 3 {
+        let mut lines = wrap_activity(content, available_width.max(1))
+            .into_iter()
+            .enumerate()
+            .map(|(index, line)| {
+                Line::styled(
+                    line,
+                    Style::default()
+                        .fg(if index == 0 {
+                            header_color
+                        } else {
+                            Color::Gray
+                        })
+                        .bg(background),
+                )
+            })
+            .collect::<Vec<_>>();
+        lines.push(Line::from(""));
+        return lines;
+    }
+
+    let content_width = available_width - 2;
+    let mut lines = wrap_activity(content, content_width)
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let width = UnicodeWidthStr::width(line.as_str());
+            let foreground = if index == 0 {
+                header_color
+            } else {
+                Color::Gray
+            };
+            Line::from(vec![
+                Span::styled("  ", Style::default().bg(background)),
+                Span::styled(
+                    format!("{line}{}", " ".repeat(content_width.saturating_sub(width))),
+                    Style::default().fg(foreground).bg(background),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    lines.push(Line::from(""));
+    lines
+}
+
+fn activity_header_color(content: &str) -> Color {
+    let content = content
+        .strip_prefix(|character| {
+            matches!(character, '⠋' | '⠙' | '⠹' | '⠸' | '⠼' | '⠴' | '⠦' | '⠧')
+        })
+        .map(str::trim_start)
+        .unwrap_or(content);
+    if content.starts_with('✓') || content.starts_with("Thought") {
+        Color::Green
+    } else if content.starts_with('✗') {
+        Color::Red
+    } else {
+        Color::Yellow
+    }
+}
+
+fn activity_is_in_progress(content: &str) -> bool {
+    [
+        "Thinking…",
+        "Running:",
+        "Editing:",
+        "Tool:",
+        "Searching:",
+        "Compacting context…",
+        "Plan:",
+    ]
+    .iter()
+    .any(|prefix| content.starts_with(prefix))
+}
+
+fn wrap_activity(content: &str, max_width: usize) -> Vec<String> {
+    let max_width = max_width.max(1);
+    content
+        .split('\n')
+        .flat_map(|line| {
+            let body_start = line
+                .find(|character: char| !character.is_whitespace())
+                .unwrap_or(line.len());
+            let (indent, body) = line.split_at(body_start);
+            let indent_width = UnicodeWidthStr::width(indent);
+            if body.is_empty() || indent_width >= max_width {
+                return wrap_cells(line, max_width);
+            }
+            wrap_message_line(body, max_width - indent_width)
+                .into_iter()
+                .map(|part| format!("{indent}{part}"))
+                .collect()
+        })
+        .collect()
+}
+
+fn wrap_cells(line: &str, max_width: usize) -> Vec<String> {
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines = vec![String::new()];
+    let mut width = 0;
+    for grapheme in line.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if width + grapheme_width > max_width && !lines.last().is_some_and(String::is_empty) {
+            lines.push(String::new());
+            width = 0;
+        }
+        lines
+            .last_mut()
+            .expect("wrapped activity always has a line")
+            .push_str(grapheme);
+        width += grapheme_width;
+    }
     lines
 }
 
@@ -1111,7 +1787,7 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_navigation_tree(frame: &mut Frame, app: &App, area: Rect) {
-    let visible_thread_id = app.chat().map(|chat| chat.thread_id.as_str());
+    let visible_thread_id = app.main_chat().map(|chat| chat.thread_id.as_str());
     let rows = app.tree_rows();
     let items = rows.iter().map(|row| match row {
         TreeRow::Repository { repository_index } => {
@@ -1426,8 +2102,8 @@ fn render_archive_confirm(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(64, 20, area);
-    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand repository / focus chat input\nTab          focus the visible chat\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / remove thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ! approval waiting\nOnly clean wyard worktrees are removed on archive.\nPress any key to close";
+    let popup = centered_rect(64, 24, area);
+    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand repository / focus chat input\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ny / Y        copy selected message / full chat\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            commands, skills, model, and side chat\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / remove thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ! approval waiting\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(help).wrap(Wrap { trim: false }).block(
@@ -1459,6 +2135,16 @@ fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
+fn navigation_width(total_width: u16) -> u16 {
+    (total_width / 4)
+        .clamp(34, 42)
+        .min(total_width.saturating_sub(20))
+}
+
+fn quit_requires_side_chat_confirmation(side_chat_count: usize) -> bool {
+    side_chat_count > 0
+}
+
 fn focus_style(focused: bool) -> Style {
     if focused {
         Style::default().fg(Color::Cyan)
@@ -1472,10 +2158,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn navigation_width_is_bounded_and_preserves_chat_space() {
+        assert_eq!(navigation_width(200), 42);
+        assert_eq!(navigation_width(120), 34);
+        assert_eq!(navigation_width(80), 34);
+        assert_eq!(navigation_width(30), 10);
+    }
+
+    #[test]
+    fn any_remaining_side_chat_requires_quit_confirmation() {
+        assert!(!quit_requires_side_chat_confirmation(0));
+        assert!(quit_requires_side_chat_confirmation(1));
+        assert!(quit_requires_side_chat_confirmation(3));
+    }
+
+    #[test]
     fn user_message_is_a_full_width_colored_band() {
         let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
         chat.begin_user_turn("a message that wraps across the row".into(), "u".into());
-        let lines = chat_message_lines(&chat.messages[0], 30);
+        let lines = chat_message_lines(&chat.messages[0], 30, false);
 
         assert_eq!(lines[1].spans[0].content, "› ");
         assert!(lines.len() >= 3);
@@ -1489,6 +2190,34 @@ mod tests {
                         .all(|span| span.style.bg == Some(Color::Rgb(38, 45, 50)))
             );
         }
+    }
+
+    #[test]
+    fn activity_is_a_full_width_status_band_with_a_separator() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.push_notice("✓ build\n  preserved output".into());
+        let lines = chat_message_lines(&chat.messages[0], 30, false);
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].width(), 30);
+        assert_eq!(lines[1].width(), 30);
+        assert_eq!(lines[2].width(), 0);
+        assert_eq!(lines[0].spans[1].style.fg, Some(Color::Green));
+        assert!(lines[1].spans[1].content.starts_with("  preserved"));
+        for line in &lines[..2] {
+            assert!(
+                line.spans
+                    .iter()
+                    .all(|span| span.style.bg == Some(Color::Rgb(32, 34, 36)))
+            );
+        }
+    }
+
+    #[test]
+    fn activity_status_color_distinguishes_running_and_failure() {
+        assert_eq!(activity_header_color("Running: tests"), Color::Yellow);
+        assert_eq!(activity_header_color("✗ tests [failed]"), Color::Red);
+        assert_eq!(activity_header_color("Thought\nDone"), Color::Green);
     }
 
     #[test]
@@ -1506,5 +2235,56 @@ mod tests {
         assert_eq!(wrap_composer("日本語", 4), vec!["日本", "語"]);
         assert_eq!(wrap_composer("abcd", 4), vec!["abcd", ""]);
         assert_eq!(wrap_composer("", 4), vec![""]);
+    }
+
+    #[test]
+    fn chat_renders_thinking_while_waiting_for_activity() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.begin_user_turn("question".into(), "turn".into());
+
+        let lines = rendered_chat(&chat, 40).lines;
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("Thinking…"));
+    }
+
+    #[test]
+    fn active_reasoning_activity_gets_an_animated_frame() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.begin_user_turn("question".into(), "turn".into());
+        chat.push_notice("Thinking…".into());
+
+        let text = rendered_chat(&chat, 40)
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("Thinking…"));
+        assert!(
+            ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"]
+                .iter()
+                .any(|frame| text.contains(frame))
+        );
+    }
+
+    #[test]
+    fn selected_message_is_highlighted_in_scroll_mode() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.begin_user_turn("selected".into(), "turn".into());
+        chat.enter_scroll_mode();
+
+        let rendered = rendered_chat(&chat, 30);
+        let (start, end) = rendered.selected_range.expect("selected range");
+        assert!(rendered.lines[start..end].iter().all(|line| {
+            line.style.bg == Some(Color::Rgb(52, 63, 72))
+                || line
+                    .spans
+                    .iter()
+                    .all(|span| span.style.bg == Some(Color::Rgb(52, 63, 72)))
+        }));
     }
 }
