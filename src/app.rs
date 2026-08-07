@@ -1694,6 +1694,41 @@ impl App {
         Ok(())
     }
 
+    pub fn replace_empty_thread_id(
+        &mut self,
+        old_thread_id: &str,
+        new_thread_id: String,
+    ) -> Result<()> {
+        let thread = self
+            .threads
+            .iter()
+            .find(|thread| thread.record.id == old_thread_id)
+            .context("thread not found")?;
+        anyhow::ensure!(
+            thread.record.title == "Untitled thread",
+            "only an empty thread can be reconnected"
+        );
+        self.thread_registry
+            .replace_thread_id(old_thread_id, new_thread_id.clone())?;
+
+        let thread = self
+            .threads
+            .iter_mut()
+            .find(|thread| thread.record.id == old_thread_id)
+            .context("thread disappeared while reconnecting")?;
+        thread.record.id.clone_from(&new_thread_id);
+        if let Some(mut chat) = self.chats.remove(old_thread_id) {
+            chat.thread_id.clone_from(&new_thread_id);
+            self.chats.insert(new_thread_id.clone(), chat);
+        }
+        if self.visible_chat_id.as_deref() == Some(old_thread_id) {
+            self.visible_chat_id = Some(new_thread_id.clone());
+        }
+        self.resumed_threads.remove(old_thread_id);
+        self.read_only_threads.remove(old_thread_id);
+        Ok(())
+    }
+
     pub fn update_thread_title(&mut self, thread_id: &str, prompt: &str) -> Result<()> {
         self.thread_registry.set_title(thread_id, prompt)?;
         if let Some(thread) = self

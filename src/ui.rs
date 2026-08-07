@@ -1017,6 +1017,10 @@ fn is_missing_thread_error(error: &anyhow::Error) -> bool {
     message.contains("no rollout found for thread id") || message.contains("thread not found")
 }
 
+fn is_recoverable_empty_thread(title: &str, error: &anyhow::Error) -> bool {
+    title == "Untitled thread" && is_missing_thread_error(error)
+}
+
 async fn interrupt_chat(app: &App, server: &Arc<AppServer>) -> Result<()> {
     if let Some(chat) = app.chat()
         && let Some(turn_id) = &chat.active_turn_id
@@ -1071,16 +1075,16 @@ fn schedule_selected_chat_preview(
         if generation.load(Ordering::Relaxed) != current_generation {
             return;
         }
-        let result = match server.read_thread(&thread.record.id).await {
+        let mut chat = ChatState::new(thread.record.id, thread.record.cwd, thread.record.title);
+        if let Some((model, display_name, effort)) = model_settings {
+            chat.set_model(model, display_name, effort);
+        }
+        let result = match server.read_thread(&chat.thread_id).await {
             Ok(history) => {
-                let mut chat =
-                    ChatState::new(thread.record.id, thread.record.cwd, thread.record.title);
-                if let Some((model, display_name, effort)) = model_settings {
-                    chat.set_model(model, display_name, effort);
-                }
                 chat.load_history(&history);
                 Ok(chat)
             }
+            Err(error) if is_recoverable_empty_thread(&chat.title, &error) => Ok(chat),
             Err(error) => Err(format!("Could not load thread: {error}")),
         };
         if generation.load(Ordering::Relaxed) == current_generation {
@@ -1102,12 +1106,15 @@ async fn preview_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result
     if app.show_cached_chat(&thread.record.id) {
         return Ok(());
     }
-    let history = server.read_thread(&thread.record.id).await?;
     let mut chat = ChatState::new(thread.record.id, thread.record.cwd, thread.record.title);
     if let Some((model, display_name, effort)) = app.default_model_settings() {
         chat.set_model(model, display_name, effort);
     }
-    chat.load_history(&history);
+    match server.read_thread(&chat.thread_id).await {
+        Ok(history) => chat.load_history(&history),
+        Err(error) if is_recoverable_empty_thread(&chat.title, &error) => {}
+        Err(error) => return Err(error),
+    }
     app.show_chat(chat);
     Ok(())
 }
@@ -1120,6 +1127,7 @@ async fn focus_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result<(
     let thread_id = chat.thread_id.clone();
     let cwd = chat.cwd.clone();
     let model = chat.model.clone();
+    let title = chat.title.clone();
     if !app.resumed_threads.contains(&thread_id) {
         match server
             .resume_thread(&thread_id, &cwd, model.as_deref())
@@ -1135,6 +1143,16 @@ async fn focus_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result<(
                     "Opened read-only because another Codex session owns this thread; close it and use /threads to retry"
                         .into(),
                 );
+            }
+            Err(error) if is_recoverable_empty_thread(&title, &error) => {
+                let replacement_id = server.start_thread(&cwd, model.as_deref()).await?;
+                if let Err(error) = app.replace_empty_thread_id(&thread_id, replacement_id.clone())
+                {
+                    let _ = server.unsubscribe_thread(&replacement_id).await;
+                    return Err(error);
+                }
+                app.resumed_threads.insert(replacement_id.clone());
+                app.set_thread_read_only(&replacement_id, false);
             }
             Err(error) => return Err(error),
         }
@@ -2743,6 +2761,17 @@ mod tests {
         assert!(!is_missing_thread_error(&anyhow::anyhow!(
             "permission denied"
         )));
+    }
+
+    #[test]
+    fn only_missing_untitled_threads_are_recoverable() {
+        let missing = anyhow::anyhow!("no rollout found for thread id test");
+        assert!(is_recoverable_empty_thread("Untitled thread", &missing));
+        assert!(!is_recoverable_empty_thread("Existing thread", &missing));
+        assert!(!is_recoverable_empty_thread(
+            "Untitled thread",
+            &anyhow::anyhow!("permission denied")
+        ));
     }
 
     #[test]

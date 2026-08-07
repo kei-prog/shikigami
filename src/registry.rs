@@ -262,6 +262,20 @@ impl Registry {
         self.save(&threads)
     }
 
+    pub fn replace_thread_id(&self, old_thread_id: &str, new_thread_id: String) -> Result<()> {
+        let mut threads = self.load()?;
+        if old_thread_id != new_thread_id && threads.iter().any(|thread| thread.id == new_thread_id)
+        {
+            anyhow::bail!("replacement thread is already registered");
+        }
+        let thread = threads
+            .iter_mut()
+            .find(|thread| thread.id == old_thread_id)
+            .context("thread not found")?;
+        thread.id = new_thread_id;
+        self.save(&threads)
+    }
+
     pub fn register_thread(
         &self,
         thread_id: String,
@@ -495,6 +509,33 @@ mod tests {
             .unwrap();
         registry.remove("thread-1").unwrap();
         assert!(registry.load().unwrap().is_empty());
+    }
+
+    #[test]
+    fn replaces_only_a_thread_id() {
+        let temp = tempdir().unwrap();
+        let registry = Registry::at(temp.path().join("threads.json"));
+        let repository = temp.path().join("repo");
+        fs::create_dir(&repository).unwrap();
+        registry
+            .register_thread("missing-thread".into(), &repository, &repository)
+            .unwrap();
+        let original = registry.load().unwrap().remove(0);
+
+        registry
+            .replace_thread_id("missing-thread", "replacement-thread".into())
+            .unwrap();
+
+        let replacement = registry.load().unwrap().remove(0);
+        assert_eq!(replacement.id, "replacement-thread");
+        assert_eq!(replacement.repository_path, original.repository_path);
+        assert_eq!(replacement.cwd, original.cwd);
+        assert_eq!(replacement.title, original.title);
+        assert_eq!(replacement.created_at, original.created_at);
+        assert_eq!(replacement.updated_at, original.updated_at);
+        assert_eq!(replacement.archived_at, original.archived_at);
+        assert_eq!(replacement.managed_worktree, original.managed_worktree);
+        assert_eq!(replacement.worktree_branch, original.worktree_branch);
     }
 
     #[test]
