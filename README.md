@@ -81,6 +81,9 @@ User messages are shown as full-width colored input bands, while Codex responses
 use the normal chat background. Commands, reasoning, file changes, and other
 activity use compact full-width gray bands separated by one line. Their heading
 is yellow while running, green when completed, and red when failed.
+File-change activity automatically includes the unified diff supplied by App
+Server. Added lines are green, removed lines are red, and hunk headers are cyan;
+wyard does not run Git or an external diff formatter for this display.
 After sending a message, an animated `Thinking…` indicator appears until the
 first response, reasoning summary, or tool activity arrives. It is display-only
 and is not added to the saved conversation history. The latest in-progress
@@ -101,6 +104,10 @@ keeps it visible. Press `y` to copy that message without its rendered wrapping
 or borders, or `Y` to copy the full current chat with role labels. Main and side
 chats keep independent selections. Clipboard commands are launched only when a
 copy is requested (`pbcopy` on macOS, with native command fallbacks elsewhere).
+When a diff hunk is visible, `e` temporarily suspends wyard and opens Neovim at
+the hunk's new-file line. Exiting Neovim restores the same wyard chat and scroll
+position with a full redraw. Paths are resolved inside the thread workspace;
+deleted files and paths outside that workspace are rejected.
 
 Press `/` in an empty composer to open the command palette. Built-in wyard
 commands and enabled Codex skills for the current workspace appear in one

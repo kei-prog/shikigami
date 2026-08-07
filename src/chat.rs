@@ -9,6 +9,7 @@ pub enum ChatRole {
     User,
     Assistant,
     Activity,
+    Diff,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -205,10 +206,29 @@ fn is_word_separator(character: char) -> bool {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EditorTarget {
+    pub path: PathBuf,
+    pub line: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiffTarget {
+    pub content_line: usize,
+    pub editor: EditorTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
     item_id: Option<String>,
+    diff_targets: Vec<DiffTarget>,
+}
+
+impl ChatMessage {
+    pub fn diff_targets(&self) -> &[DiffTarget] {
+        &self.diff_targets
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -235,6 +255,7 @@ pub struct ChatState {
     pub skills_stale: bool,
     pub is_side_chat: bool,
     pub side_chat_has_activity: bool,
+    pub visible_editor_target: Option<EditorTarget>,
     waiting_for_activity: bool,
     streaming_message: Option<usize>,
     pending_user_message: Option<String>,
@@ -266,6 +287,7 @@ impl ChatState {
             skills_stale: false,
             is_side_chat: false,
             side_chat_has_activity: false,
+            visible_editor_target: None,
             waiting_for_activity: false,
             streaming_message: None,
             pending_user_message: None,
@@ -291,6 +313,7 @@ impl ChatState {
 
     pub fn load_history(&mut self, response: &Value) {
         self.messages.clear();
+        self.visible_editor_target = None;
         self.selected_message_index = None;
         self.message_selection_scroll_pending = false;
         self.waiting_for_activity = false;
@@ -311,6 +334,7 @@ impl ChatState {
             role: ChatRole::User,
             content: prompt.clone(),
             item_id: None,
+            diff_targets: Vec::new(),
         });
         self.pending_user_message = Some(prompt);
         self.active_turn_id = Some(turn_id);
@@ -355,6 +379,7 @@ impl ChatState {
             role: ChatRole::Activity,
             content,
             item_id: None,
+            diff_targets: Vec::new(),
         });
     }
 
@@ -370,6 +395,7 @@ impl ChatState {
 
     pub fn enter_scroll_mode(&mut self) {
         self.mode = ChatMode::Scroll;
+        self.visible_editor_target = None;
         self.selected_message_index = self.selectable_message_indices().last();
         self.message_selection_scroll_pending = self.selected_message_index.is_some();
         self.scroll_to_bottom();
@@ -417,7 +443,7 @@ impl ChatState {
                 let role = match message.role {
                     ChatRole::User => "User",
                     ChatRole::Assistant => "Assistant",
-                    ChatRole::Activity => "Activity",
+                    ChatRole::Activity | ChatRole::Diff => "Activity",
                 };
                 format!("{role}:\n{}", message.content)
             })
@@ -516,6 +542,7 @@ impl ChatState {
                         role: ChatRole::Assistant,
                         content: String::new(),
                         item_id: None,
+                        diff_targets: Vec::new(),
                     });
                     self.messages.len() - 1
                 });
@@ -578,6 +605,7 @@ impl ChatState {
                     role: ChatRole::Activity,
                     content: message.to_owned(),
                     item_id: None,
+                    diff_targets: Vec::new(),
                 });
             }
             _ => {}
@@ -605,6 +633,7 @@ impl ChatState {
                         role: ChatRole::User,
                         content,
                         item_id: None,
+                        diff_targets: Vec::new(),
                     });
                 }
             }
@@ -614,11 +643,12 @@ impl ChatState {
                         role: ChatRole::Assistant,
                         content: text.to_owned(),
                         item_id: None,
+                        diff_targets: Vec::new(),
                     });
                 }
             }
             Some("commandExecution") => self.finish_command(item),
-            Some("fileChange") => self.finish_activity(item, "Edited", file_change_detail(item)),
+            Some("fileChange") => self.finish_file_change(item),
             Some("mcpToolCall" | "dynamicToolCall" | "collabToolCall") => {
                 self.finish_activity(item, "Tool", tool_detail(item))
             }
@@ -637,10 +667,15 @@ impl ChatState {
         let Some(id) = item_id(item) else {
             return;
         };
+        if item.get("type").and_then(Value::as_str) == Some("fileChange") {
+            let display =
+                file_change_content(item, &format!("Editing: {}", file_change_detail(item)));
+            self.upsert_file_change(Some(id), display);
+            return;
+        }
         let content = match item.get("type").and_then(Value::as_str) {
             Some("reasoning") => "Thinking…".into(),
             Some("commandExecution") => format!("Running: {}", command_detail(item)),
-            Some("fileChange") => format!("Editing: {}", file_change_detail(item)),
             Some("mcpToolCall" | "dynamicToolCall" | "collabToolCall") => {
                 format!("Tool: {}", tool_detail(item))
             }
@@ -671,6 +706,11 @@ impl ChatState {
             item_id(item),
             completed_header(item, &format!("{kind}: {detail}")),
         );
+    }
+
+    fn finish_file_change(&mut self, item: &Value) {
+        let header = completed_header(item, &format!("Edited: {}", file_change_detail(item)));
+        self.upsert_file_change(item_id(item), file_change_content(item, &header));
     }
 
     fn finish_reasoning(&mut self, item: &Value) {
@@ -769,6 +809,27 @@ impl ChatState {
             role: ChatRole::Activity,
             content,
             item_id: item_id.map(str::to_owned),
+            diff_targets: Vec::new(),
+        });
+    }
+
+    fn upsert_file_change(&mut self, item_id: Option<&str>, display: FileChangeDisplay) {
+        if let Some(item_id) = item_id
+            && let Some(index) = self
+                .messages
+                .iter()
+                .position(|message| message.item_id.as_deref() == Some(item_id))
+        {
+            self.messages[index].role = ChatRole::Diff;
+            self.messages[index].content = display.content;
+            self.messages[index].diff_targets = display.targets;
+            return;
+        }
+        self.messages.push(ChatMessage {
+            role: ChatRole::Diff,
+            content: display.content,
+            item_id: item_id.map(str::to_owned),
+            diff_targets: display.targets,
         });
     }
 }
@@ -800,6 +861,61 @@ fn file_change_detail(item: &Value) -> String {
     } else {
         paths.join(", ")
     }
+}
+
+struct FileChangeDisplay {
+    content: String,
+    targets: Vec<DiffTarget>,
+}
+
+fn file_change_content(item: &Value, header: &str) -> FileChangeDisplay {
+    let mut parts = vec![header.to_owned()];
+    let mut targets = Vec::new();
+    let mut content_line = 1;
+    for change in item
+        .get("changes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(diff) = change
+            .get("diff")
+            .and_then(Value::as_str)
+            .filter(|diff| !diff.is_empty())
+        else {
+            continue;
+        };
+        if let Some(path) = change.get("path").and_then(Value::as_str) {
+            targets.extend(diff.split('\n').enumerate().filter_map(|(offset, line)| {
+                parse_hunk_new_line(line).map(|line| DiffTarget {
+                    content_line: content_line + offset,
+                    editor: EditorTarget {
+                        path: PathBuf::from(path),
+                        line,
+                    },
+                })
+            }));
+        }
+        parts.push(diff.to_owned());
+        content_line += diff.split('\n').count();
+    }
+    FileChangeDisplay {
+        content: parts.join("\n"),
+        targets,
+    }
+}
+
+fn parse_hunk_new_line(line: &str) -> Option<usize> {
+    let range = line
+        .strip_prefix("@@ ")?
+        .split_whitespace()
+        .find(|part| part.starts_with('+'))?;
+    range
+        .trim_start_matches('+')
+        .split(',')
+        .next()?
+        .parse()
+        .ok()
 }
 
 fn tool_detail(item: &Value) -> String {
@@ -969,6 +1085,51 @@ mod tests {
     }
 
     #[test]
+    fn file_change_keeps_the_app_server_diff_and_updates_in_place() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        let changes = json!([{
+            "path":"src/main.rs",
+            "kind":"update",
+            "diff":"@@ -1 +1 @@\n-old\n+new"
+        }]);
+        chat.apply(&event(
+            "item/started",
+            json!({"item":{"id":"edit-1","type":"fileChange","changes":changes,"status":"inProgress"}}),
+        ));
+
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, ChatRole::Diff);
+        assert_eq!(
+            chat.messages[0].content,
+            "Editing: src/main.rs\n@@ -1 +1 @@\n-old\n+new"
+        );
+        assert_eq!(chat.messages[0].diff_targets.len(), 1);
+        assert_eq!(chat.messages[0].diff_targets[0].content_line, 1);
+        assert_eq!(chat.messages[0].diff_targets[0].editor.line, 1);
+        assert_eq!(
+            chat.messages[0].diff_targets[0].editor.path,
+            PathBuf::from("src/main.rs")
+        );
+
+        chat.apply(&event(
+            "item/completed",
+            json!({"item":{"id":"edit-1","type":"fileChange","changes":changes,"status":"completed"}}),
+        ));
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(
+            chat.messages[0].content,
+            "✓ Edited: src/main.rs\n@@ -1 +1 @@\n-old\n+new"
+        );
+    }
+
+    #[test]
+    fn parses_new_file_lines_from_unified_diff_hunks() {
+        assert_eq!(parse_hunk_new_line("@@ -10,4 +20,7 @@ fn test"), Some(20));
+        assert_eq!(parse_hunk_new_line("@@ -1 +1 @@"), Some(1));
+        assert_eq!(parse_hunk_new_line("+not a hunk"), None);
+    }
+
+    #[test]
     fn shows_public_reasoning_summary_but_ignores_raw_reasoning() {
         let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
         chat.apply(&event(
@@ -1069,6 +1230,7 @@ mod tests {
             role: ChatRole::Assistant,
             content: String::new(),
             item_id: None,
+            diff_targets: Vec::new(),
         });
         chat.push_notice("last".into());
 
@@ -1117,6 +1279,7 @@ mod tests {
             role: ChatRole::Assistant,
             content: "answer\nsecond line".into(),
             item_id: None,
+            diff_targets: Vec::new(),
         });
 
         assert_eq!(

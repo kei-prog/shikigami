@@ -1,5 +1,6 @@
 use std::{
     io::{self, Stdout},
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -7,7 +8,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use crossterm::{
     cursor::{MoveTo, SetCursorStyle},
     event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -35,7 +36,8 @@ use crate::{
     app::{App, ChatPane, Focus, Mode, TreeRow},
     app_server::{AppServer, AppServerRequest},
     chat::{
-        ChatMessage, ChatMode, ChatRole, ChatState, CommandPalette, PaletteCommand, PaletteEntry,
+        ChatMessage, ChatMode, ChatRole, ChatState, CommandPalette, EditorTarget, PaletteCommand,
+        PaletteEntry,
     },
     clipboard,
     git_workspace::Workspace,
@@ -46,6 +48,10 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 struct ChatPreview {
     generation: u64,
     result: std::result::Result<ChatState, String>,
+}
+
+enum UiAction {
+    OpenEditor { cwd: PathBuf, target: EditorTarget },
 }
 
 pub async fn run(mut app: App) -> Result<()> {
@@ -84,6 +90,19 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     Ok(())
 }
 
+fn resume_terminal(terminal: &mut Tui) -> Result<()> {
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        ClearTerminal(ClearType::All),
+        SetCursorStyle::BlinkingBar,
+        MoveTo(0, 0)
+    )?;
+    terminal.resize(terminal.size()?.into())?;
+    Ok(())
+}
+
 async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> Result<()> {
     let mut inputs = EventStream::new();
     let mut server_events = server.subscribe();
@@ -109,13 +128,18 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
             input = inputs.next() => {
                 match input {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        handle_key(
+                        let action = handle_key(
                             app,
                             key,
                             &server,
                             &preview_generation,
                             &preview_sender,
                         ).await?;
+                        if let Some(UiAction::OpenEditor { cwd, target }) = action
+                            && let Err(error) = open_in_neovim(terminal, &cwd, &target).await
+                        {
+                            app.message = Some(format!("Could not open Neovim: {error}"));
+                        }
                         needs_draw = true;
                     }
                     Some(Ok(Event::Resize(_, _))) => {
@@ -173,7 +197,8 @@ async fn handle_key(
     server: &Arc<AppServer>,
     preview_generation: &Arc<AtomicU64>,
     preview_sender: &mpsc::UnboundedSender<ChatPreview>,
-) -> Result<()> {
+) -> Result<Option<UiAction>> {
+    let mut action = None;
     match app.mode {
         Mode::Chat if app.chat().is_some_and(|chat| chat.palette.is_some()) => {
             handle_palette_key(app, key, server).await?;
@@ -224,6 +249,20 @@ async fn handle_key(
                 }
                 KeyCode::Char('y') => copy_selected_message(app),
                 KeyCode::Char('Y') => copy_conversation(app),
+                KeyCode::Char('e') => {
+                    if app.has_active_turn() {
+                        app.message = Some("Wait for active turns before opening Neovim".into());
+                    } else if let Some(chat) = app.chat()
+                        && let Some(target) = chat.visible_editor_target.clone()
+                    {
+                        action = Some(UiAction::OpenEditor {
+                            cwd: chat.cwd.clone(),
+                            target,
+                        });
+                    } else {
+                        app.message = Some("Scroll a diff hunk into view first".into());
+                    }
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     if let Some(chat) = app.chat_mut() {
                         chat.scroll_up(1);
@@ -557,6 +596,38 @@ async fn handle_key(
             }
             _ => {}
         },
+    }
+    Ok(action)
+}
+
+async fn open_in_neovim(terminal: &mut Tui, cwd: &Path, target: &EditorTarget) -> Result<()> {
+    let root = cwd
+        .canonicalize()
+        .with_context(|| format!("workspace does not exist: {}", cwd.display()))?;
+    let candidate = if target.path.is_absolute() {
+        target.path.clone()
+    } else {
+        root.join(&target.path)
+    };
+    let path = candidate
+        .canonicalize()
+        .with_context(|| format!("file does not exist: {}", candidate.display()))?;
+    if !path.starts_with(&root) {
+        bail!("file is outside the workspace: {}", path.display());
+    }
+
+    restore_terminal(terminal)?;
+    let editor_result = tokio::process::Command::new("nvim")
+        .arg(format!("+{}", target.line))
+        .arg(&path)
+        .current_dir(&root)
+        .status()
+        .await;
+    resume_terminal(terminal)?;
+
+    let status = editor_result.context("could not start nvim")?;
+    if !status.success() {
+        bail!("nvim exited with {status}");
     }
     Ok(())
 }
@@ -1139,6 +1210,7 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane
     let RenderedChat {
         lines,
         selected_range,
+        editor_targets,
     } = rendered_chat(chat, text_width as usize);
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     let total_lines = paragraph.line_count(text_width);
@@ -1149,6 +1221,8 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane
     {
         chat.reveal_line_range(start, end);
     }
+    chat.visible_editor_target =
+        visible_editor_target(editor_targets, chat.scroll_top, visible_height);
     let scroll = u16::try_from(chat.scroll_top).unwrap_or(u16::MAX);
     frame.render_widget(paragraph.scroll((scroll, 0)), chunks[0]);
     let message_border = if chat.mode == ChatMode::Input && chat_focused {
@@ -1210,9 +1284,9 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane
         }
         ChatMode::Scroll => {
             if has_side_chat {
-                "SCROLL · j/k line · J/K msg · y copy · i input"
+                "SCROLL · j/k line · J/K msg · e nvim · y copy · i input"
             } else {
-                "SCROLL · j/k line · J/K message · y copy · Y all · u/d half · i input"
+                "SCROLL · j/k line · J/K msg · e nvim · y/Y copy · u/d half · i input"
             }
         }
     };
@@ -1437,21 +1511,35 @@ fn render_quit_side_chats_confirm(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+struct RenderedMessage {
+    lines: Vec<Line<'static>>,
+    editor_targets: Vec<(usize, EditorTarget)>,
+}
+
 fn chat_message_lines(
     message: &ChatMessage,
     available_width: usize,
     animate_activity: bool,
-) -> Vec<Line<'static>> {
+) -> RenderedMessage {
+    if message.role == ChatRole::Diff {
+        return diff_message_lines(message, available_width);
+    }
     if message.role == ChatRole::Activity {
         let content = if animate_activity {
             format!("{} {}", thinking_frame(), message.content)
         } else {
             message.content.clone()
         };
-        return activity_message_lines(&content, available_width);
+        return RenderedMessage {
+            lines: activity_message_lines(&content, available_width),
+            editor_targets: Vec::new(),
+        };
     }
     if message.role == ChatRole::User {
-        return user_message_lines(message, available_width);
+        return RenderedMessage {
+            lines: user_message_lines(message, available_width),
+            editor_targets: Vec::new(),
+        };
     }
     let mut lines = Vec::new();
     lines.extend(
@@ -1461,17 +1549,22 @@ fn chat_message_lines(
             .map(|line| Line::from(line.to_owned())),
     );
     lines.push(Line::from(""));
-    lines
+    RenderedMessage {
+        lines,
+        editor_targets: Vec::new(),
+    }
 }
 
 struct RenderedChat {
     lines: Vec<Line<'static>>,
     selected_range: Option<(usize, usize)>,
+    editor_targets: Vec<(usize, EditorTarget)>,
 }
 
 fn rendered_chat(chat: &ChatState, available_width: usize) -> RenderedChat {
     let mut lines = Vec::new();
     let mut selected_range = None;
+    let mut editor_targets = Vec::new();
     let mut rendered_height = 0usize;
     let line_count_width = u16::try_from(available_width).unwrap_or(u16::MAX);
     let animated_activity_index = chat.active_turn_id.as_ref().and_then(|_| {
@@ -1483,7 +1576,10 @@ fn rendered_chat(chat: &ChatState, available_width: usize) -> RenderedChat {
             .then_some(chat.messages.len().saturating_sub(1))
     });
     for (index, message) in chat.messages.iter().enumerate() {
-        let mut message_lines = chat_message_lines(
+        let RenderedMessage {
+            lines: mut message_lines,
+            editor_targets: message_targets,
+        } = chat_message_lines(
             message,
             available_width,
             animated_activity_index == Some(index),
@@ -1498,6 +1594,11 @@ fn rendered_chat(chat: &ChatState, available_width: usize) -> RenderedChat {
                 rendered_height.saturating_add(message_height),
             ));
         }
+        editor_targets.extend(
+            message_targets
+                .into_iter()
+                .map(|(line, target)| (rendered_height.saturating_add(line), target)),
+        );
         lines.extend(message_lines);
         rendered_height = rendered_height.saturating_add(message_height);
     }
@@ -1510,6 +1611,7 @@ fn rendered_chat(chat: &ChatState, available_width: usize) -> RenderedChat {
     RenderedChat {
         lines,
         selected_range,
+        editor_targets,
     }
 }
 
@@ -1592,6 +1694,79 @@ fn activity_header_color(content: &str) -> Color {
     } else {
         Color::Yellow
     }
+}
+
+fn diff_message_lines(message: &ChatMessage, available_width: usize) -> RenderedMessage {
+    let background = Color::Rgb(32, 34, 36);
+    let left_padding = usize::from(available_width >= 3) * 2;
+    let content_width = available_width.saturating_sub(left_padding).max(1);
+    let mut editor_targets = Vec::new();
+    let mut targets = message.diff_targets().iter().peekable();
+    let mut lines = Vec::new();
+    for (index, source_line) in message.content.split('\n').enumerate() {
+        while targets
+            .peek()
+            .is_some_and(|target| target.content_line == index)
+        {
+            editor_targets.push((
+                lines.len(),
+                targets
+                    .next()
+                    .expect("peeked diff target exists")
+                    .editor
+                    .clone(),
+            ));
+        }
+        let foreground = if index == 0 {
+            activity_header_color(source_line)
+        } else if source_line.starts_with("@@") {
+            Color::Cyan
+        } else if source_line.starts_with('+') {
+            Color::Green
+        } else if source_line.starts_with('-') {
+            Color::Red
+        } else {
+            Color::Gray
+        };
+        lines.extend(
+            wrap_activity(source_line, content_width)
+                .into_iter()
+                .map(|line| {
+                    let width = UnicodeWidthStr::width(line.as_str());
+                    let mut spans = Vec::with_capacity(2);
+                    if left_padding > 0 {
+                        spans.push(Span::styled(
+                            " ".repeat(left_padding),
+                            Style::default().bg(background),
+                        ));
+                    }
+                    spans.push(Span::styled(
+                        format!("{line}{}", " ".repeat(content_width.saturating_sub(width))),
+                        Style::default().fg(foreground).bg(background),
+                    ));
+                    Line::from(spans)
+                }),
+        );
+    }
+    lines.push(Line::from(""));
+    RenderedMessage {
+        lines,
+        editor_targets,
+    }
+}
+
+fn visible_editor_target(
+    targets: Vec<(usize, EditorTarget)>,
+    scroll_top: usize,
+    viewport_height: usize,
+) -> Option<EditorTarget> {
+    let viewport_end = scroll_top.saturating_add(viewport_height);
+    let viewport_center = scroll_top.saturating_add(viewport_height / 2);
+    targets
+        .into_iter()
+        .filter(|(line, _)| *line >= scroll_top && *line < viewport_end)
+        .min_by_key(|(line, _)| line.abs_diff(viewport_center))
+        .map(|(_, target)| target)
 }
 
 fn activity_is_in_progress(content: &str) -> bool {
@@ -2102,8 +2277,8 @@ fn render_archive_confirm(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(64, 24, area);
-    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand repository / focus chat input\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ny / Y        copy selected message / full chat\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            commands, skills, model, and side chat\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / remove thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ! approval waiting\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
+    let popup = centered_rect(64, 25, area);
+    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand repository / focus chat input\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            open the visible diff hunk in Neovim\ny / Y        copy selected message / full chat\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            commands, skills, model, and side chat\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / remove thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ! approval waiting\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(help).wrap(Wrap { trim: false }).block(
@@ -2176,7 +2351,7 @@ mod tests {
     fn user_message_is_a_full_width_colored_band() {
         let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
         chat.begin_user_turn("a message that wraps across the row".into(), "u".into());
-        let lines = chat_message_lines(&chat.messages[0], 30, false);
+        let lines = chat_message_lines(&chat.messages[0], 30, false).lines;
 
         assert_eq!(lines[1].spans[0].content, "› ");
         assert!(lines.len() >= 3);
@@ -2196,7 +2371,7 @@ mod tests {
     fn activity_is_a_full_width_status_band_with_a_separator() {
         let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
         chat.push_notice("✓ build\n  preserved output".into());
-        let lines = chat_message_lines(&chat.messages[0], 30, false);
+        let lines = chat_message_lines(&chat.messages[0], 30, false).lines;
 
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].width(), 30);
@@ -2218,6 +2393,60 @@ mod tests {
         assert_eq!(activity_header_color("Running: tests"), Color::Yellow);
         assert_eq!(activity_header_color("✗ tests [failed]"), Color::Red);
         assert_eq!(activity_header_color("Thought\nDone"), Color::Green);
+    }
+
+    #[test]
+    fn app_server_diff_lines_are_colored_without_external_tools() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.load_history(&json!({"thread":{"turns":[{"items":[{
+            "id":"edit-1",
+            "type":"fileChange",
+            "status":"completed",
+            "changes":[{
+                "path":"src/main.rs",
+                "kind":"update",
+                "diff":"diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new"
+            }]
+        }]}]}}));
+        let rendered = diff_message_lines(&chat.messages[0], 50);
+        let lines = rendered.lines;
+
+        assert_eq!(lines[0].spans.last().unwrap().style.fg, Some(Color::Green));
+        assert_eq!(lines[2].spans.last().unwrap().style.fg, Some(Color::Red));
+        assert_eq!(lines[3].spans.last().unwrap().style.fg, Some(Color::Green));
+        assert_eq!(lines[4].spans.last().unwrap().style.fg, Some(Color::Cyan));
+        assert_eq!(lines[5].spans.last().unwrap().style.fg, Some(Color::Red));
+        assert_eq!(lines[6].spans.last().unwrap().style.fg, Some(Color::Green));
+        assert!(lines[..7].iter().all(|line| line.width() == 50));
+        assert_eq!(lines[7].width(), 0);
+        assert_eq!(rendered.editor_targets[0].0, 4);
+        assert_eq!(
+            rendered.editor_targets[0].1.path,
+            PathBuf::from("src/main.rs")
+        );
+        assert_eq!(rendered.editor_targets[0].1.line, 1);
+    }
+
+    #[test]
+    fn editor_target_uses_the_hunk_nearest_the_viewport_center() {
+        let target = |path: &str, line| EditorTarget {
+            path: PathBuf::from(path),
+            line,
+        };
+        let selected = visible_editor_target(
+            vec![
+                (5, target("early.rs", 5)),
+                (14, target("middle.rs", 14)),
+                (19, target("late.rs", 19)),
+            ],
+            10,
+            10,
+        )
+        .expect("visible target");
+
+        assert_eq!(selected.path, PathBuf::from("middle.rs"));
+        assert_eq!(selected.line, 14);
+        assert!(visible_editor_target(vec![(9, target("hidden.rs", 9))], 10, 10).is_none());
     }
 
     #[test]
