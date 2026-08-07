@@ -136,10 +136,13 @@ Press `Ctrl-g` to switch focus. While the side pane is focused, `Ctrl-n` and
 `Ctrl-p` cycle through its forks. `/sides` opens the full list; moving with
 `j` / `k` previews immediately, `Enter` confirms, and `Esc` restores the
 previous selection. Use `/sideclose` to close the selected fork without
-confirmation. Moving to another
-main thread hides its side chats; returning restores them. Side chats are not
-added to the repository tree and disappear when Shikigami exits. Quitting asks for
-confirmation whenever at least one side chat remains open.
+confirmation. Use `/sidepromote` while the side pane is focused to move that
+fork into the repository tree as a persistent thread after its current turn has
+finished, preserving its conversation, workspace, and model. Moving to another
+main thread hides its remaining side chats; returning restores them. Unpromoted
+side chats are not added to the repository tree and disappear when Shikigami
+exits. Quitting asks for confirmation whenever at least one unpromoted side chat
+remains open.
 
 Existing Codex threads are not imported.
 

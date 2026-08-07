@@ -796,6 +796,9 @@ async fn select_palette_entry(app: &mut App, server: &Arc<AppServer>) -> Result<
         Some(PaletteEntry::Command(PaletteCommand::SideClose)) => {
             close_side_chat(app, server).await?;
         }
+        Some(PaletteEntry::Command(PaletteCommand::SidePromote)) => {
+            promote_side_chat(app, server).await?;
+        }
         Some(PaletteEntry::Command(PaletteCommand::Attention)) => {
             app.open_attention();
         }
@@ -869,6 +872,48 @@ async fn close_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
         app.message = Some(format!("Could not interrupt side chat: {error}"));
     }
     app.close_side_chat();
+    Ok(())
+}
+
+async fn promote_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
+    if app.active_chat_pane != ChatPane::Side {
+        app.message = Some("Focus a side chat before promoting it".into());
+        return Ok(());
+    }
+    let Some(side_chat) = app.side_chat() else {
+        app.message = Some("No side chat is selected".into());
+        return Ok(());
+    };
+    if side_chat.active_turn_id.is_some() {
+        app.message = Some("Wait for the side chat's current turn before promoting it".into());
+        return Ok(());
+    }
+
+    let source_thread_id = side_chat.thread_id.clone();
+    let cwd = side_chat.cwd.clone();
+    let title = side_chat.title.clone();
+    let model = side_chat.model.clone();
+    let model_display_name = side_chat.model_display_name.clone();
+    let reasoning_effort = side_chat.reasoning_effort.clone();
+    let (thread_id, history) = match server.fork_thread(&source_thread_id, &cwd, false).await {
+        Ok(result) => result,
+        Err(error) => {
+            app.message = Some(format!("Could not create persistent thread: {error}"));
+            return Ok(());
+        }
+    };
+
+    let mut promoted_chat = ChatState::new(thread_id, cwd, title);
+    if let (Some(model), Some(display_name)) = (model, model_display_name) {
+        promoted_chat.set_model(model, display_name, reasoning_effort);
+    }
+    promoted_chat.load_history(&history);
+    app.message = Some(
+        match app.promote_side_chat(&source_thread_id, promoted_chat) {
+            Ok(title) => format!("Promoted '{title}' to a persistent thread"),
+            Err(error) => format!("Could not register promoted thread: {error}"),
+        },
+    );
     Ok(())
 }
 

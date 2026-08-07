@@ -346,6 +346,75 @@ impl App {
         self.active_chat_pane = ChatPane::Main;
     }
 
+    pub fn promote_side_chat(
+        &mut self,
+        source_thread_id: &str,
+        mut promoted_chat: ChatState,
+    ) -> Result<String> {
+        if self.active_chat_pane != ChatPane::Side {
+            anyhow::bail!("focus a side chat before promoting it");
+        }
+        let selected_thread_id = self.side_chat_id.clone().context("no side chat selected")?;
+        if selected_thread_id != source_thread_id {
+            anyhow::bail!("the selected side chat changed during promotion");
+        }
+        if promoted_chat.thread_id == source_thread_id {
+            anyhow::bail!("promotion requires a persistent thread fork");
+        }
+        let parent_thread_id = self
+            .side_chat_parent_id
+            .clone()
+            .context("side chat has no parent thread")?;
+        let parent = self
+            .threads
+            .iter()
+            .find(|thread| thread.record.id == parent_thread_id)
+            .context("parent thread is not registered")?;
+        let repository_path = parent.record.repository_path.clone();
+        let thread_id = promoted_chat.thread_id.clone();
+        let cwd = promoted_chat.cwd.clone();
+        let title = promoted_chat.title.clone();
+
+        self.thread_registry.register_thread_named(
+            thread_id.clone(),
+            &repository_path,
+            &cwd,
+            &title,
+        )?;
+        promoted_chat.mark_as_main_chat();
+        self.chats.remove(source_thread_id);
+        self.chats.insert(thread_id.clone(), promoted_chat);
+        self.attention_items
+            .retain(|item| item.thread_id != source_thread_id);
+        self.resumed_threads.remove(source_thread_id);
+        self.resumed_threads.insert(thread_id.clone());
+        let mut remove_parent = false;
+        if let Some(side_chats) = self.side_chats_by_parent.get_mut(&parent_thread_id) {
+            side_chats.retain(|id| id != source_thread_id);
+            if side_chats.is_empty() {
+                remove_parent = true;
+            } else {
+                let index = self
+                    .selected_side_chat_by_parent
+                    .get(&parent_thread_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(side_chats.len() - 1);
+                self.selected_side_chat_by_parent
+                    .insert(parent_thread_id.clone(), index);
+            }
+        }
+        if remove_parent {
+            self.side_chats_by_parent.remove(&parent_thread_id);
+            self.selected_side_chat_by_parent.remove(&parent_thread_id);
+        }
+        self.refresh_current();
+        if !self.reveal_chat(&thread_id) {
+            anyhow::bail!("promoted thread is not available");
+        }
+        Ok(title)
+    }
+
     pub fn current_side_chats(&self) -> Vec<&ChatState> {
         let Some(parent_thread_id) = self.visible_chat_id.as_deref() else {
             return Vec::new();

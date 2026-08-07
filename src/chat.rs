@@ -26,6 +26,7 @@ pub enum PaletteCommand {
     SideChat,
     Sides,
     SideClose,
+    SidePromote,
     Attention,
     Status,
 }
@@ -39,6 +40,7 @@ impl PaletteCommand {
             Self::SideChat => "/sidechat",
             Self::Sides => "/sides",
             Self::SideClose => "/sideclose",
+            Self::SidePromote => "/sidepromote",
             Self::Attention => "/attention",
             Self::Status => "/status",
         }
@@ -52,6 +54,7 @@ impl PaletteCommand {
             Self::SideChat => "Fork this thread into a side chat",
             Self::Sides => "Choose a side chat for this thread",
             Self::SideClose => "Close the current side chat",
+            Self::SidePromote => "Promote the current side chat to a thread",
             Self::Attention => "Show threads that need attention",
             Self::Status => "Show the current thread and workspace",
         }
@@ -103,6 +106,7 @@ impl CommandPalette {
             PaletteEntry::Command(PaletteCommand::SideChat),
             PaletteEntry::Command(PaletteCommand::Sides),
             PaletteEntry::Command(PaletteCommand::SideClose),
+            PaletteEntry::Command(PaletteCommand::SidePromote),
             PaletteEntry::Command(PaletteCommand::Attention),
             PaletteEntry::Command(PaletteCommand::Status),
         ];
@@ -312,6 +316,11 @@ impl ChatState {
 
     pub fn mark_as_side_chat(&mut self) {
         self.is_side_chat = true;
+        self.side_chat_has_activity = false;
+    }
+
+    pub fn mark_as_main_chat(&mut self) {
+        self.is_side_chat = false;
         self.side_chat_has_activity = false;
     }
 
@@ -1342,6 +1351,9 @@ mod tests {
         palette.query = "sideclose".into();
         assert_eq!(palette.visible_entries()[0].label(), "/sideclose");
 
+        palette.query = "sidepromote".into();
+        assert_eq!(palette.visible_entries()[0].label(), "/sidepromote");
+
         palette.query = "attention".into();
         assert_eq!(palette.visible_entries()[0].label(), "/attention");
     }
@@ -1355,6 +1367,10 @@ mod tests {
 
         chat.begin_user_turn("new question".into(), "turn".into());
         assert!(chat.side_chat_has_activity);
+
+        chat.mark_as_main_chat();
+        assert!(!chat.is_side_chat);
+        assert!(!chat.side_chat_has_activity);
     }
 
     #[test]

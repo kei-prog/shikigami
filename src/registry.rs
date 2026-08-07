@@ -72,13 +72,23 @@ impl Registry {
         repository_path: &Path,
         cwd: &Path,
     ) -> Result<()> {
+        self.register_thread_named(thread_id, repository_path, cwd, "Untitled thread")
+    }
+
+    pub fn register_thread_named(
+        &self,
+        thread_id: String,
+        repository_path: &Path,
+        cwd: &Path,
+        title: &str,
+    ) -> Result<()> {
         let now = now_seconds()?;
         let worktree_branch = git_workspace::current_branch(cwd).ok().flatten();
         self.upsert(ThreadRecord {
             id: thread_id,
             repository_path: repository_path.to_path_buf(),
             cwd: cwd.to_path_buf(),
-            title: "Untitled thread".into(),
+            title: normalized_title(title),
             created_at: now,
             updated_at: now,
             archived_at: None,
@@ -94,13 +104,7 @@ impl Registry {
             .find(|thread| thread.id == thread_id)
             .context("thread not found")?;
         if thread.title == "Untitled thread" {
-            thread.title = title
-                .lines()
-                .next()
-                .unwrap_or(title)
-                .chars()
-                .take(80)
-                .collect();
+            thread.title = normalized_title(title);
         }
         thread.updated_at = now_seconds()?;
         self.save(&threads)
@@ -157,6 +161,16 @@ fn now_seconds() -> Result<u64> {
         .as_secs())
 }
 
+fn normalized_title(title: &str) -> String {
+    title
+        .lines()
+        .next()
+        .unwrap_or(title)
+        .chars()
+        .take(80)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
@@ -180,6 +194,25 @@ mod tests {
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].id, "thread-1");
         assert_eq!(threads[0].title, "Build the feature");
+    }
+
+    #[test]
+    fn registers_a_named_thread_in_one_write() {
+        let temp = tempdir().unwrap();
+        let registry = Registry::at(temp.path().join("threads.json"));
+        let repository = temp.path().join("repo");
+        fs::create_dir(&repository).unwrap();
+
+        registry
+            .register_thread_named(
+                "thread-1".into(),
+                &repository,
+                &repository,
+                "Promoted side chat\nextra",
+            )
+            .unwrap();
+
+        assert_eq!(registry.load().unwrap()[0].title, "Promoted side chat");
     }
 
     #[test]
