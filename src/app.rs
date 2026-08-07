@@ -10,7 +10,7 @@ use directories::BaseDirs;
 
 use crate::{
     app_server::{AppServerEvent, AppServerRequest, ModelMetadata},
-    chat::ChatState,
+    chat::{ChatState, fuzzy_score},
     git_workspace::{self, Workspace},
     registry::{
         AttentionRegistry, PersistentAttentionKind, Registry, SideChatRegistry, ThreadRecord,
@@ -45,6 +45,7 @@ pub enum Mode {
     ChooseModel,
     ChooseReasoningEffort,
     ChooseSideChat,
+    ChooseThread,
     Attention,
     ConfirmQuitSideChats,
     Approval,
@@ -144,6 +145,9 @@ pub struct App {
     pub side_chat_picker_index: usize,
     pub side_chat_picker_original_index: usize,
     pub side_chat_picker_original_pane: ChatPane,
+    pub thread_picker_query: String,
+    pub thread_picker_index: usize,
+    pub thread_picker_matches: Vec<usize>,
     pub active_chat_pane: ChatPane,
     pub resumed_threads: HashSet<String>,
     pub pending_approvals: VecDeque<AppServerRequest>,
@@ -232,6 +236,9 @@ impl App {
             side_chat_picker_index: 0,
             side_chat_picker_original_index: 0,
             side_chat_picker_original_pane: ChatPane::Main,
+            thread_picker_query: String::new(),
+            thread_picker_index: 0,
+            thread_picker_matches: Vec::new(),
             active_chat_pane: ChatPane::Main,
             resumed_threads: HashSet::new(),
             pending_approvals: VecDeque::new(),
@@ -556,6 +563,92 @@ impl App {
         self.focus = Focus::Chat;
         self.mode = Mode::Chat;
         self.mark_thread_seen();
+    }
+
+    pub fn open_thread_picker(&mut self) {
+        self.thread_picker_query.clear();
+        self.refresh_thread_picker_matches();
+        self.thread_picker_index = self
+            .visible_chat_id
+            .as_deref()
+            .and_then(|visible_id| {
+                self.thread_picker_matches
+                    .iter()
+                    .position(|thread_index| self.threads[*thread_index].record.id == visible_id)
+            })
+            .unwrap_or(0);
+        self.mode = Mode::ChooseThread;
+    }
+
+    pub fn thread_picker_threads(&self) -> impl Iterator<Item = &ThreadItem> {
+        self.thread_picker_matches
+            .iter()
+            .filter_map(|index| self.threads.get(*index))
+    }
+
+    pub fn move_thread_picker_up(&mut self) {
+        self.thread_picker_index = self.thread_picker_index.saturating_sub(1);
+    }
+
+    pub fn move_thread_picker_down(&mut self) {
+        if self.thread_picker_index + 1 < self.thread_picker_matches.len() {
+            self.thread_picker_index += 1;
+        }
+    }
+
+    pub fn push_thread_picker_query(&mut self, character: char) {
+        self.thread_picker_query.push(character);
+        self.refresh_thread_picker_matches();
+    }
+
+    pub fn pop_thread_picker_query(&mut self) {
+        self.thread_picker_query.pop();
+        self.refresh_thread_picker_matches();
+    }
+
+    pub fn cancel_thread_picker(&mut self) {
+        self.mode = Mode::Chat;
+        self.focus = Focus::Chat;
+    }
+
+    pub fn activate_selected_thread_picker(&mut self) -> bool {
+        let Some(thread_id) = self
+            .thread_picker_matches
+            .get(self.thread_picker_index)
+            .and_then(|index| self.threads.get(*index))
+            .map(|thread| thread.record.id.clone())
+        else {
+            return false;
+        };
+        self.reveal_chat(&thread_id)
+    }
+
+    pub fn repository_name_for_thread(&self, thread: &ThreadItem) -> &str {
+        self.repositories
+            .iter()
+            .find(|repository| repository.path == thread.record.repository_path)
+            .map(|repository| repository.name.as_str())
+            .unwrap_or("unknown repository")
+    }
+
+    pub fn thread_picker_status(&self, thread_id: &str) -> &'static str {
+        if self
+            .chats
+            .get(thread_id)
+            .is_some_and(|chat| chat.active_turn_id.is_some())
+        {
+            "working"
+        } else if self
+            .attention_items
+            .iter()
+            .any(|item| item.thread_id == thread_id)
+        {
+            "attention"
+        } else if self.visible_chat_id.as_deref() == Some(thread_id) {
+            "current"
+        } else {
+            "ready"
+        }
     }
 
     pub fn cycle_side_chat(&mut self, forward: bool) {
@@ -1719,6 +1812,44 @@ impl App {
         }
         self.select_repository_row(repository_index);
     }
+
+    fn refresh_thread_picker_matches(&mut self) {
+        self.thread_picker_matches =
+            thread_picker_matches(&self.threads, &self.repositories, &self.thread_picker_query);
+        self.thread_picker_index = 0;
+    }
+}
+
+fn thread_picker_matches(
+    threads: &[ThreadItem],
+    repositories: &[Repository],
+    query: &str,
+) -> Vec<usize> {
+    let mut matches = threads
+        .iter()
+        .enumerate()
+        .filter_map(|(index, thread)| {
+            let repository_name = repositories
+                .iter()
+                .find(|repository| repository.path == thread.record.repository_path)
+                .map(|repository| repository.name.as_str())
+                .unwrap_or_default();
+            let score = [
+                fuzzy_score(&thread.record.title, query),
+                fuzzy_score(repository_name, query).map(|score| score - 1_000),
+                fuzzy_score(&thread.location_name, query).map(|score| score - 1_500),
+                fuzzy_score(&thread.record.cwd.to_string_lossy(), query).map(|score| score - 2_000),
+            ]
+            .into_iter()
+            .flatten()
+            .max()?;
+            Some((index, score))
+        })
+        .collect::<Vec<_>>();
+    if !query.is_empty() {
+        matches.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    }
+    matches.into_iter().map(|(index, _)| index).collect()
 }
 
 fn preferred_reasoning_effort(model: &ModelMetadata) -> Option<&str> {
@@ -1953,6 +2084,40 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn thread_picker_fuzzy_search_prioritizes_title_matches() {
+        let repositories = vec![
+            Repository {
+                name: "frontend".into(),
+                path: "/frontend".into(),
+            },
+            Repository {
+                name: "backend".into(),
+                path: "/backend".into(),
+            },
+        ];
+        let threads = vec![
+            thread("code-review", "/frontend"),
+            thread("review", "/backend"),
+        ];
+
+        assert_eq!(
+            thread_picker_matches(&threads, &repositories, "rev"),
+            vec![1, 0]
+        );
+        assert_eq!(
+            thread_picker_matches(&threads, &repositories, "backend"),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn thread_picker_keeps_recent_order_without_a_query() {
+        let threads = vec![thread("newest", "/one"), thread("older", "/one")];
+
+        assert_eq!(thread_picker_matches(&threads, &[], ""), vec![0, 1]);
     }
 
     #[test]

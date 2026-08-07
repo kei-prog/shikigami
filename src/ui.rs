@@ -388,6 +388,37 @@ async fn handle_key(
             KeyCode::Enter => app.select_side_chat_from_picker(),
             _ => {}
         },
+        Mode::ChooseThread => match key.code {
+            KeyCode::Esc => app.cancel_thread_picker(),
+            KeyCode::Up => app.move_thread_picker_up(),
+            KeyCode::Down => app.move_thread_picker_down(),
+            KeyCode::Char('k') if app.thread_picker_query.is_empty() => app.move_thread_picker_up(),
+            KeyCode::Char('j') if app.thread_picker_query.is_empty() => {
+                app.move_thread_picker_down()
+            }
+            KeyCode::Backspace => {
+                if app.thread_picker_query.is_empty() {
+                    app.cancel_thread_picker();
+                } else {
+                    app.pop_thread_picker_query();
+                }
+            }
+            KeyCode::Enter => {
+                if app.activate_selected_thread_picker()
+                    && let Err(error) = focus_selected_chat(app, server).await
+                {
+                    app.message = Some(format!("Could not open thread: {error}"));
+                }
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                app.push_thread_picker_query(character);
+            }
+            _ => {}
+        },
         Mode::Attention => match key.code {
             KeyCode::Esc => app.close_attention(),
             KeyCode::Up | KeyCode::Char('k') => app.move_attention_up(),
@@ -779,8 +810,7 @@ async fn select_palette_entry(app: &mut App, server: &Arc<AppServer>) -> Result<
             }
         }
         Some(PaletteEntry::Command(PaletteCommand::Threads)) => {
-            app.mode = Mode::Normal;
-            app.focus = Focus::Navigation;
+            app.open_thread_picker();
         }
         Some(PaletteEntry::Command(PaletteCommand::Scroll)) => {
             if let Some(chat) = app.chat_mut() {
@@ -1257,6 +1287,7 @@ fn render(frame: &mut Frame, app: &mut App) {
         Mode::ChooseModel => render_model_picker(frame, area, app),
         Mode::ChooseReasoningEffort => render_reasoning_effort_picker(frame, area, app),
         Mode::ChooseSideChat => render_side_chat_picker(frame, area, app),
+        Mode::ChooseThread => render_thread_picker(frame, area, app),
         Mode::Attention => render_attention(frame, area, app),
         Mode::ConfirmQuitSideChats => render_quit_side_chats_confirm(frame, area, app),
         Mode::Help => render_help(frame, area),
@@ -1626,6 +1657,56 @@ fn render_side_chat_picker(frame: &mut Frame, area: Rect, app: &App) {
             app.side_chat_picker_index
                 .min(side_chats.len().saturating_sub(1)),
         ),
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_stateful_widget(list, popup, &mut state);
+}
+
+fn render_thread_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let thread_count = app.thread_picker_matches.len();
+    let height = u16::try_from(thread_count.saturating_mul(2).saturating_add(2))
+        .unwrap_or(u16::MAX)
+        .clamp(7, area.height.saturating_sub(4).max(7));
+    let popup = centered_rect(78, height, area);
+    let items = app.thread_picker_threads().map(|thread| {
+        let repository = app.repository_name_for_thread(thread);
+        let status = app.thread_picker_status(&thread.record.id);
+        let color = match status {
+            "working" => Color::Yellow,
+            "attention" => Color::Red,
+            "current" => Color::Green,
+            _ => Color::Cyan,
+        };
+        ListItem::new(Text::from(vec![
+            Line::styled(
+                thread.record.title.clone(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                format!("{repository} · {} · {status}", thread.location_name),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]))
+    });
+    let title = if app.thread_picker_query.is_empty() {
+        format!(" Threads · {thread_count} ")
+    } else {
+        format!(" Threads · {} · {thread_count} ", app.thread_picker_query)
+    };
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(title)
+                .title_bottom(Line::from(
+                    " type to filter · ↑/↓ select · Enter open · Esc close ",
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_symbol("› ")
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    let mut state = ListState::default().with_selected(
+        (thread_count > 0).then_some(app.thread_picker_index.min(thread_count.saturating_sub(1))),
     );
     frame.render_widget(Clear, popup);
     frame.render_stateful_widget(list, popup, &mut state);

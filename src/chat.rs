@@ -166,7 +166,7 @@ impl CommandPalette {
     }
 }
 
-fn fuzzy_score(candidate: &str, query: &str) -> Option<i32> {
+pub(crate) fn fuzzy_score(candidate: &str, query: &str) -> Option<i32> {
     let candidate = candidate.to_lowercase();
     let query = query.to_lowercase();
     if query.is_empty() {

@@ -123,8 +123,11 @@ Press `/` in an empty composer to open the command palette. Built-in Shikigami
 commands and enabled Codex skills for the current workspace appear in one
 fuzzy-searchable list, ranked by name and description matches. Selecting a
 skill inserts its `$skill-name` mention and sends the corresponding App Server
-skill input with the next message. Choose `/attention` to open the attention
-list or `/model` to select a model and its
+skill input with the next message. Choose `/threads` to fuzzy-search active
+threads across registered repositories by title, repository, location, or path;
+the picker also shows current, working, and attention state. `Enter` opens the
+selected thread and `Esc` returns to the current chat without changing it.
+Choose `/attention` to open the attention list or `/model` to select a model and its
 reasoning effort from the live App Server model catalog. The current selection
 appears in the header and applies to subsequent turns in that thread. Press
 `Ctrl-r` in chat input to open the current model's reasoning-effort slider;
