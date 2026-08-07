@@ -343,6 +343,7 @@ impl ChatState {
     }
 
     pub fn begin_user_turn(&mut self, prompt: String, turn_id: String) {
+        self.scroll_to_bottom();
         self.messages.push(ChatMessage {
             role: ChatRole::User,
             content: prompt.clone(),
@@ -1212,6 +1213,20 @@ mod tests {
         chat.scroll_to_bottom();
         chat.update_scroll_metrics(120, 20);
         assert_eq!(chat.scroll_top, 100);
+        assert!(chat.follow_tail);
+    }
+
+    #[test]
+    fn submitting_a_message_resumes_tail_following() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.update_scroll_metrics(100, 20);
+        chat.scroll_up(10);
+        assert!(!chat.follow_tail);
+
+        chat.begin_user_turn("new question".into(), "turn".into());
+        chat.update_scroll_metrics(110, 20);
+
+        assert_eq!(chat.scroll_top, 90);
         assert!(chat.follow_tail);
     }
 
