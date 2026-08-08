@@ -435,7 +435,8 @@ impl AppServer {
         skills: &[SkillMetadata],
         settings: TurnSettings<'_>,
     ) -> Result<String> {
-        let (approval_policy, sandbox) = execution_policy(settings.execution_mode);
+        let (approval_policy, _) = execution_policy(settings.execution_mode);
+        let sandbox_policy = turn_sandbox_policy(settings.execution_mode);
         let response = self
             .request(
                 "turn/start",
@@ -446,7 +447,7 @@ impl AppServer {
                     "model": settings.model,
                     "effort": settings.effort,
                     "approvalPolicy": approval_policy,
-                    "sandboxPolicy": {"type": sandbox}
+                    "sandboxPolicy": {"type": sandbox_policy}
                 }),
             )
             .await?;
@@ -503,8 +504,15 @@ impl AppServer {
 
 fn execution_policy(mode: ExecutionMode) -> (&'static str, &'static str) {
     match mode {
-        ExecutionMode::Auto => ("on-request", "workspaceWrite"),
-        ExecutionMode::Dangerous => ("never", "dangerFullAccess"),
+        ExecutionMode::Auto => ("on-request", "workspace-write"),
+        ExecutionMode::Dangerous => ("never", "danger-full-access"),
+    }
+}
+
+fn turn_sandbox_policy(mode: ExecutionMode) -> &'static str {
+    match mode {
+        ExecutionMode::Auto => "workspaceWrite",
+        ExecutionMode::Dangerous => "dangerFullAccess",
     }
 }
 
@@ -725,11 +733,16 @@ mod tests {
     fn execution_modes_map_to_app_server_policies() {
         assert_eq!(
             execution_policy(ExecutionMode::Auto),
-            ("on-request", "workspaceWrite")
+            ("on-request", "workspace-write")
         );
         assert_eq!(
             execution_policy(ExecutionMode::Dangerous),
-            ("never", "dangerFullAccess")
+            ("never", "danger-full-access")
+        );
+        assert_eq!(turn_sandbox_policy(ExecutionMode::Auto), "workspaceWrite");
+        assert_eq!(
+            turn_sandbox_policy(ExecutionMode::Dangerous),
+            "dangerFullAccess"
         );
     }
 
