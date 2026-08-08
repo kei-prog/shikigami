@@ -1332,11 +1332,34 @@ impl App {
         git_workspace::workspace_is_clean(&thread.record.cwd)
     }
 
+    pub fn selected_thread_has_active_turn(&self) -> Result<bool> {
+        let thread_id = &self
+            .selected_thread()
+            .context("no thread selected")?
+            .record
+            .id;
+        Ok(thread_group_has_active_turn(
+            thread_id,
+            &self.chats,
+            &self.side_chats_by_parent,
+            &self.owned_turns,
+        ))
+    }
+
     pub fn archive_selected_thread(&mut self, remove_worktree: bool) -> Result<()> {
         let record = self
             .selected_thread()
             .map(|thread| thread.record.clone())
             .context("no thread selected")?;
+        anyhow::ensure!(
+            !thread_group_has_active_turn(
+                &record.id,
+                &self.chats,
+                &self.side_chats_by_parent,
+                &self.owned_turns,
+            ),
+            "response is running; stop it before archiving"
+        );
         self.thread_registry.set_archived(&record.id, true)?;
         if remove_worktree
             && let Err(error) = git_workspace::remove_managed_workspace(
@@ -2044,6 +2067,28 @@ fn ensure_archived_deletion_context(show_archived: bool, record: &ThreadRecord) 
     Ok(())
 }
 
+fn thread_group_has_active_turn(
+    thread_id: &str,
+    chats: &HashMap<String, ChatState>,
+    side_chats_by_parent: &HashMap<String, Vec<String>>,
+    owned_turns: &HashMap<String, String>,
+) -> bool {
+    std::iter::once(thread_id)
+        .chain(
+            side_chats_by_parent
+                .get(thread_id)
+                .into_iter()
+                .flatten()
+                .map(String::as_str),
+        )
+        .any(|thread_id| {
+            owned_turns.contains_key(thread_id)
+                || chats
+                    .get(thread_id)
+                    .is_some_and(|chat| chat.active_turn_id.is_some())
+        })
+}
+
 fn thread_picker_return_mode(focus: Focus) -> Mode {
     match focus {
         Focus::Navigation => Mode::Normal,
@@ -2335,6 +2380,52 @@ mod tests {
         item.record.archived_at = Some(1);
         assert!(ensure_archived_deletion_context(false, &item.record).is_err());
         assert!(ensure_archived_deletion_context(true, &item.record).is_ok());
+    }
+
+    #[test]
+    fn active_parent_or_side_chat_prevents_archiving() {
+        let mut chats = HashMap::from([
+            (
+                "parent".into(),
+                ChatState::new("parent".into(), "/one".into(), "parent".into()),
+            ),
+            (
+                "side".into(),
+                ChatState::new("side".into(), "/one".into(), "side".into()),
+            ),
+        ]);
+        let side_chats = HashMap::from([("parent".into(), vec!["side".into()])]);
+        let mut owned_turns = HashMap::new();
+
+        assert!(!thread_group_has_active_turn(
+            "parent",
+            &chats,
+            &side_chats,
+            &owned_turns
+        ));
+
+        chats.get_mut("parent").unwrap().active_turn_id = Some("turn-parent".into());
+        assert!(thread_group_has_active_turn(
+            "parent",
+            &chats,
+            &side_chats,
+            &owned_turns
+        ));
+
+        chats.get_mut("parent").unwrap().active_turn_id = None;
+        owned_turns.insert("side".into(), "turn-side".into());
+        assert!(thread_group_has_active_turn(
+            "parent",
+            &chats,
+            &side_chats,
+            &owned_turns
+        ));
+        assert!(!thread_group_has_active_turn(
+            "unrelated",
+            &chats,
+            &side_chats,
+            &owned_turns
+        ));
     }
 
     #[test]

@@ -719,14 +719,21 @@ async fn handle_key(
                         Err(error) => error.to_string(),
                     });
                 } else {
-                    match app.selected_thread_has_clean_managed_worktree() {
-                        Ok(true) => app.mode = Mode::ConfirmArchiveCleanup,
-                        Ok(false) => {
-                            app.message = Some(match app.archive_selected_thread(false) {
-                                Ok(()) => "archived; worktree kept".into(),
-                                Err(error) => error.to_string(),
-                            });
+                    match app.selected_thread_has_active_turn() {
+                        Ok(true) => {
+                            app.message =
+                                Some("response is running; stop it before archiving".into());
                         }
+                        Ok(false) => match app.selected_thread_has_clean_managed_worktree() {
+                            Ok(true) => app.mode = Mode::ConfirmArchiveCleanup,
+                            Ok(false) => {
+                                app.message = Some(match app.archive_selected_thread(false) {
+                                    Ok(()) => "archived; worktree kept".into(),
+                                    Err(error) => error.to_string(),
+                                });
+                            }
+                            Err(error) => app.message = Some(error.to_string()),
+                        },
                         Err(error) => app.message = Some(error.to_string()),
                     }
                 }
