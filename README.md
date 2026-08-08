@@ -59,6 +59,11 @@ Each thread keeps an independent chat state, so multiple turns can continue in
 the background while another thread is displayed. The tree marks the visible,
 working, and approval-waiting threads separately.
 
+A chat can also create an independent thread when asked in natural language.
+Shikigami gives it a single `shikigami.start_thread` tool that starts the first
+turn in either the current workspace or a new managed worktree. The new thread
+does not inherit the current conversation and appears in the repository tree.
+
 A background turn that completes or fails stays in the attention list until its
 chat is viewed or the item is dismissed, including across Shikigami restarts.
 Entries for threads no longer registered with Shikigami are removed on startup.

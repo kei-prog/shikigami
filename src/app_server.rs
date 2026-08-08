@@ -327,7 +327,8 @@ impl AppServer {
                     "model": model,
                     "approvalPolicy": approval_policy,
                     "sandbox": sandbox,
-                    "ephemeral": false
+                    "ephemeral": false,
+                    "dynamicTools": shikigami_dynamic_tools()
                 }),
             )
             .await?;
@@ -349,7 +350,8 @@ impl AppServer {
                 "cwd": cwd,
                 "model": model,
                 "approvalPolicy": approval_policy,
-                "sandbox": sandbox
+                "sandbox": sandbox,
+                "dynamicTools": shikigami_dynamic_tools()
             }),
         )
         .await?;
@@ -606,6 +608,35 @@ fn extract_thread_id(response: &Value, method: &str) -> Result<String> {
         .with_context(|| format!("{method} response missing thread.id"))
 }
 
+fn shikigami_dynamic_tools() -> Value {
+    json!([{
+        "type": "namespace",
+        "name": "shikigami",
+        "description": "Create and start independent Shikigami threads when the user requests them",
+        "tools": [{
+            "type": "function",
+            "name": "start_thread",
+            "description": "Create a new independent thread in the current repository and immediately start the requested task. Call this only when the user explicitly asks to create or start a separate thread. This does not copy conversation history. Use current to reuse the same worktree, which can conflict with concurrent edits, or new_worktree to isolate code changes in a new managed worktree.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The first user prompt for the new thread"
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "enum": ["current", "new_worktree"],
+                        "description": "Where the new thread should work"
+                    }
+                },
+                "required": ["prompt", "workspace"],
+                "additionalProperties": false
+            }
+        }]
+    }])
+}
+
 fn preview_history(mut response: Value) -> Result<Value> {
     let turns = response
         .get_mut("data")
@@ -700,6 +731,60 @@ mod tests {
             execution_policy(ExecutionMode::Dangerous),
             ("never", "dangerFullAccess")
         );
+    }
+
+    #[test]
+    fn shikigami_exposes_only_the_start_thread_tool() {
+        let tools = shikigami_dynamic_tools();
+
+        assert_eq!(tools.as_array().unwrap().len(), 1);
+        assert_eq!(tools[0]["name"], "shikigami");
+        assert_eq!(tools[0]["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(tools[0]["tools"][0]["name"], "start_thread");
+        assert_eq!(
+            tools[0]["tools"][0]["inputSchema"]["required"],
+            json!(["prompt", "workspace"])
+        );
+    }
+
+    #[tokio::test]
+    async fn new_threads_receive_the_shikigami_tool() {
+        let (writer, mut messages) = mpsc::channel(1);
+        let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(1);
+        let (_request_tx, request_rx) = mpsc::channel(1);
+        let server = Arc::new(AppServer {
+            writer,
+            writer_task: Mutex::new(None),
+            reader_task: Mutex::new(None),
+            child: Mutex::new(None),
+            pending: pending.clone(),
+            next_id: AtomicU64::new(0),
+            events,
+            server_requests: Mutex::new(request_rx),
+            version: "test".into(),
+            request_timeout: Duration::from_secs(1),
+        });
+
+        let task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .start_thread(Path::new("/tmp/project"), None, ExecutionMode::Auto)
+                    .await
+            }
+        });
+        let OutgoingMessage::Json(message) = messages.recv().await.unwrap() else {
+            panic!("unexpected shutdown message");
+        };
+        assert_eq!(message["params"]["dynamicTools"], shikigami_dynamic_tools());
+        dispatch_response(
+            &pending,
+            &json!({"id":message["id"],"result":{"thread":{"id":"thread-1"}}}),
+        )
+        .await;
+
+        assert_eq!(task.await.unwrap().unwrap(), "thread-1");
     }
 
     #[tokio::test]

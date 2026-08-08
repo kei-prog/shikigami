@@ -9,7 +9,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use crossterm::{
     cursor::{MoveTo, SetCursorStyle},
     event::{
@@ -31,6 +31,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{broadcast::error::RecvError, mpsc};
 use tokio::task::JoinHandle;
@@ -46,7 +47,7 @@ use crate::{
         PaletteEntry,
     },
     clipboard,
-    git_workspace::Workspace,
+    git_workspace::{self, Workspace},
     settings::ExecutionMode,
 };
 
@@ -59,6 +60,25 @@ const PREVIEW_CACHE_CAPACITY: usize = 20;
 struct ChatPreview {
     generation: u64,
     result: std::result::Result<ChatState, String>,
+}
+
+#[derive(Deserialize)]
+struct StartThreadToolArguments {
+    prompt: String,
+    workspace: StartThreadWorkspace,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StartThreadWorkspace {
+    Current,
+    NewWorktree,
+}
+
+struct StartedThread {
+    id: String,
+    title: String,
+    workspace: PathBuf,
 }
 
 #[derive(Default)]
@@ -235,6 +255,9 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                     if is_approval(&request) {
                         app.enqueue_approval(request);
                         app.mode = Mode::Approval;
+                        needs_draw = true;
+                    } else if request.method == "item/tool/call" {
+                        handle_dynamic_tool_call(app, &server, request).await?;
                         needs_draw = true;
                     } else {
                         server.respond(request.id, Value::Null).await?;
@@ -1396,6 +1419,204 @@ async fn open_new_chat(app: &mut App, server: &Arc<AppServer>, workspace: Worksp
     app.focus = Focus::Chat;
     app.mode = Mode::Chat;
     Ok(())
+}
+
+async fn handle_dynamic_tool_call(
+    app: &mut App,
+    server: &Arc<AppServer>,
+    request: AppServerRequest,
+) -> Result<()> {
+    let response = if is_start_thread_tool(&request) {
+        match start_thread_from_tool(app, server, &request).await {
+            Ok(started) => dynamic_tool_response(
+                true,
+                format!(
+                    "Started independent thread.\nThread ID: {}\nTitle: {}\nWorkspace: {}",
+                    started.id,
+                    started.title,
+                    started.workspace.display()
+                ),
+            ),
+            Err(error) => dynamic_tool_response(false, format!("Could not start thread: {error}")),
+        }
+    } else {
+        dynamic_tool_response(false, "Unsupported Shikigami tool".into())
+    };
+    server.respond(request.id, response).await
+}
+
+fn is_start_thread_tool(request: &AppServerRequest) -> bool {
+    let namespace = request.params.get("namespace").and_then(Value::as_str);
+    let tool = request.params.get("tool").and_then(Value::as_str);
+    request.method == "item/tool/call"
+        && ((namespace == Some("shikigami") && tool == Some("start_thread"))
+            || tool == Some("shikigami.start_thread"))
+}
+
+fn dynamic_tool_response(success: bool, text: String) -> Value {
+    json!({
+        "contentItems": [{"type": "inputText", "text": text}],
+        "success": success
+    })
+}
+
+async fn start_thread_from_tool(
+    app: &mut App,
+    server: &Arc<AppServer>,
+    request: &AppServerRequest,
+) -> Result<StartedThread> {
+    let source_thread_id = request
+        .thread_id
+        .as_deref()
+        .context("tool request did not identify its source thread")?;
+    let arguments: StartThreadToolArguments = serde_json::from_value(
+        request
+            .params
+            .get("arguments")
+            .cloned()
+            .context("tool request did not include arguments")?,
+    )
+    .context("invalid start_thread arguments")?;
+    let prompt = arguments.prompt.trim();
+    anyhow::ensure!(!prompt.is_empty(), "prompt cannot be empty");
+    let create_worktree = matches!(arguments.workspace, StartThreadWorkspace::NewWorktree);
+    let (repository, workspace) =
+        app.prepare_thread_workspace(source_thread_id, create_worktree)?;
+    let model_settings = app.default_model_settings();
+    let thread_id = match server
+        .start_thread(
+            &workspace.path,
+            model_settings.as_ref().map(|(model, _, _)| model.as_str()),
+            app.execution_mode,
+        )
+        .await
+    {
+        Ok(thread_id) => thread_id,
+        Err(error) => {
+            let cleanup =
+                cleanup_created_tool_workspace(&repository.path, &workspace, create_worktree);
+            return Err(with_cleanup_error(error, cleanup));
+        }
+    };
+    if let Err(error) = app.register_app_server_thread_in_repository(
+        thread_id.clone(),
+        repository.path.clone(),
+        workspace.path.clone(),
+    ) {
+        let server_cleanup = delete_temporary_thread(server, &thread_id).await.err();
+        let workspace_cleanup =
+            cleanup_created_tool_workspace(&repository.path, &workspace, create_worktree).err();
+        return Err(with_cleanup_errors(
+            error,
+            server_cleanup,
+            workspace_cleanup,
+        ));
+    }
+    app.mark_thread_opened(thread_id.clone());
+    let mut chat = ChatState::new(
+        thread_id.clone(),
+        workspace.path.clone(),
+        "Untitled thread".into(),
+    );
+    if let Some((model, display_name, effort)) = model_settings {
+        chat.set_model(model, display_name, effort);
+    }
+    app.add_background_chat(chat);
+    let model = app.chats[&thread_id].model.clone();
+    let effort = app.chats[&thread_id].reasoning_effort.clone();
+    let turn_id = match server
+        .start_turn(
+            &thread_id,
+            &workspace.path,
+            prompt,
+            &[],
+            TurnSettings {
+                model: model.as_deref(),
+                effort: effort.as_deref(),
+                execution_mode: app.execution_mode,
+            },
+        )
+        .await
+    {
+        Ok(turn_id) => turn_id,
+        Err(error) => {
+            return Err(
+                rollback_tool_thread(app, server, &thread_id, create_worktree, error).await,
+            );
+        }
+    };
+    app.record_owned_turn(thread_id.clone(), turn_id.clone());
+    if let Some(chat) = app.chats.get_mut(&thread_id) {
+        chat.begin_user_turn(prompt.to_owned(), turn_id);
+    }
+    if let Err(error) = app.update_thread_title(&thread_id, prompt) {
+        app.message = Some(format!(
+            "Thread started, but its title could not be saved: {error}"
+        ));
+    }
+    Ok(StartedThread {
+        id: thread_id,
+        title: prompt_title(prompt),
+        workspace: workspace.path,
+    })
+}
+
+fn prompt_title(prompt: &str) -> String {
+    prompt
+        .lines()
+        .next()
+        .unwrap_or(prompt)
+        .chars()
+        .take(80)
+        .collect()
+}
+
+fn cleanup_created_tool_workspace(
+    repository_path: &Path,
+    workspace: &Workspace,
+    created: bool,
+) -> Result<()> {
+    if !created || !workspace.path.is_dir() {
+        return Ok(());
+    }
+    let branch = git_workspace::current_branch(&workspace.path)?;
+    git_workspace::remove_managed_workspace(repository_path, &workspace.path, branch.as_deref())
+}
+
+fn with_cleanup_error(error: anyhow::Error, cleanup: Result<()>) -> anyhow::Error {
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup_error) => anyhow!("{error}; workspace cleanup also failed: {cleanup_error}"),
+    }
+}
+
+fn with_cleanup_errors(
+    error: anyhow::Error,
+    server_cleanup: Option<anyhow::Error>,
+    local_cleanup: Option<anyhow::Error>,
+) -> anyhow::Error {
+    let mut message = error.to_string();
+    if let Some(cleanup) = server_cleanup {
+        message.push_str(&format!("; Codex cleanup also failed: {cleanup}"));
+    }
+    if let Some(cleanup) = local_cleanup {
+        message.push_str(&format!("; local cleanup also failed: {cleanup}"));
+    }
+    anyhow!(message)
+}
+
+async fn rollback_tool_thread(
+    app: &mut App,
+    server: &Arc<AppServer>,
+    thread_id: &str,
+    remove_workspace: bool,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let server_cleanup = delete_temporary_thread(server, thread_id).await.err();
+    let local_cleanup = app
+        .rollback_unstarted_thread(thread_id, remove_workspace)
+        .err();
+    with_cleanup_errors(error, server_cleanup, local_cleanup)
 }
 
 fn schedule_selected_chat_preview(
@@ -3470,6 +3691,39 @@ mod tests {
     use crate::app_server::AppServerEvent;
 
     use super::*;
+
+    #[test]
+    fn recognizes_only_the_shikigami_start_thread_tool() {
+        let request = AppServerRequest {
+            id: json!(1),
+            method: "item/tool/call".into(),
+            params: json!({
+                "namespace": "shikigami",
+                "tool": "start_thread",
+                "arguments": {"prompt": "Investigate", "workspace": "current"},
+                "threadId": "source",
+                "turnId": "turn"
+            }),
+            thread_id: Some("source".into()),
+            turn_id: Some("turn".into()),
+        };
+
+        assert!(is_start_thread_tool(&request));
+        let mut other = request;
+        other.params["tool"] = json!("get_thread_status");
+        assert!(!is_start_thread_tool(&other));
+    }
+
+    #[test]
+    fn dynamic_tool_responses_use_the_app_server_shape() {
+        assert_eq!(
+            dynamic_tool_response(true, "started".into()),
+            json!({
+                "contentItems": [{"type": "inputText", "text": "started"}],
+                "success": true
+            })
+        );
+    }
 
     #[test]
     fn navigation_width_is_bounded_and_preserves_chat_space() {

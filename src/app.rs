@@ -348,6 +348,13 @@ impl App {
         self.show_main_chat_id(thread_id);
     }
 
+    pub fn add_background_chat(&mut self, chat: ChatState) {
+        let thread_id = chat.thread_id.clone();
+        self.preview_cache_order
+            .retain(|cached| cached != &thread_id);
+        self.chats.insert(thread_id, chat);
+    }
+
     pub fn cache_chat_preview(&mut self, chat: ChatState, capacity: usize, show: bool) {
         let thread_id = chat.thread_id.clone();
         self.chats.insert(thread_id.clone(), chat);
@@ -1457,6 +1464,68 @@ impl App {
         Ok(workspace)
     }
 
+    pub fn prepare_thread_workspace(
+        &mut self,
+        source_thread_id: &str,
+        new_worktree: bool,
+    ) -> Result<(Repository, Workspace)> {
+        let registered_thread_id = if self.thread_is_registered(source_thread_id) {
+            source_thread_id
+        } else {
+            self.side_chats_by_parent
+                .iter()
+                .find_map(|(parent, side_chats)| {
+                    side_chats
+                        .iter()
+                        .any(|thread_id| thread_id == source_thread_id)
+                        .then_some(parent.as_str())
+                })
+                .context("source thread is not registered with Shikigami")?
+        };
+        let record = self
+            .threads
+            .iter()
+            .find(|thread| thread.record.id == registered_thread_id)
+            .map(|thread| thread.record.clone())
+            .context("source thread is not registered with Shikigami")?;
+        let repository = self
+            .repositories
+            .iter()
+            .find(|repository| repository.path == record.repository_path)
+            .cloned()
+            .context("source repository is not registered with Shikigami")?;
+        if new_worktree {
+            let workspace =
+                git_workspace::create_generated_workspace(&repository.path, &repository.name)?;
+            self.refresh_current();
+            return Ok((repository, workspace));
+        }
+
+        let cwd = self
+            .chats
+            .get(source_thread_id)
+            .map(|chat| chat.cwd.clone())
+            .unwrap_or(record.cwd);
+        let workspace = self
+            .workspaces_by_repository
+            .get(&repository.path)
+            .and_then(|workspaces| {
+                workspaces
+                    .iter()
+                    .find(|workspace| workspace.path == cwd)
+                    .cloned()
+            })
+            .unwrap_or_else(|| Workspace {
+                name: cwd
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| cwd.display().to_string()),
+                is_primary: cwd == repository.path,
+                path: cwd,
+            });
+        Ok((repository, workspace))
+    }
+
     pub fn selected_thread_has_active_turn(&self) -> Result<bool> {
         let thread_id = &self
             .selected_thread()
@@ -1949,8 +2018,50 @@ impl App {
             .selected_repository()
             .cloned()
             .context("no repository selected")?;
+        self.register_app_server_thread_in_repository(thread_id, repository.path, cwd)
+    }
+
+    pub fn register_app_server_thread_in_repository(
+        &mut self,
+        thread_id: String,
+        repository_path: PathBuf,
+        cwd: PathBuf,
+    ) -> Result<()> {
         self.thread_registry
-            .register_thread(thread_id, &repository.path, &cwd)?;
+            .register_thread(thread_id, &repository_path, &cwd)?;
+        self.refresh_current();
+        Ok(())
+    }
+
+    pub fn rollback_unstarted_thread(
+        &mut self,
+        thread_id: &str,
+        remove_workspace: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.owned_turns.contains_key(thread_id)
+                && self
+                    .chats
+                    .get(thread_id)
+                    .is_none_or(ChatState::is_unused_main_thread),
+            "thread has already started"
+        );
+        let record = self
+            .threads
+            .iter()
+            .find(|thread| thread.record.id == thread_id)
+            .map(|thread| thread.record.clone())
+            .context("thread not found")?;
+        if remove_workspace && record.cwd.is_dir() {
+            git_workspace::remove_managed_workspace(
+                &record.repository_path,
+                &record.cwd,
+                record.worktree_branch.as_deref(),
+            )?;
+        }
+        self.thread_registry.remove(thread_id)?;
+        self.discard_chat(thread_id);
+        self.forget_thread_subscription(thread_id);
         self.refresh_current();
         Ok(())
     }
