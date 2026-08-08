@@ -968,6 +968,10 @@ impl App {
         }
     }
 
+    pub fn resync_chat_history(&mut self, thread_id: &str, history: &serde_json::Value) -> bool {
+        resync_chat_history(&mut self.chats, &mut self.owned_turns, thread_id, history)
+    }
+
     pub fn enqueue_approval(&mut self, request: AppServerRequest) {
         if let Some(thread_id) = request.thread_id.clone() {
             upsert_attention(
@@ -2171,6 +2175,22 @@ fn apply_chat_event_to(chats: &mut HashMap<String, ChatState>, event: &AppServer
     }
 }
 
+fn resync_chat_history(
+    chats: &mut HashMap<String, ChatState>,
+    owned_turns: &mut HashMap<String, String>,
+    thread_id: &str,
+    history: &serde_json::Value,
+) -> bool {
+    let Some(chat) = chats.get_mut(thread_id) else {
+        return false;
+    };
+    chat.load_history(history);
+    if chat.active_turn_id.is_none() {
+        owned_turns.remove(thread_id);
+    }
+    true
+}
+
 fn attention_kind_for_event(event: &AppServerEvent) -> Option<AttentionKind> {
     match event.method.as_str() {
         "error" => Some(AttentionKind::Failed),
@@ -2466,6 +2486,23 @@ mod tests {
         assert!(chats["one"].messages.is_empty());
         assert_eq!(chats["two"].messages.len(), 1);
         assert_eq!(chats["two"].messages[0].content, "hello");
+    }
+
+    #[test]
+    fn history_resync_clears_a_stale_owned_turn() {
+        let mut chat = ChatState::new("one".into(), "/one".into(), "one".into());
+        chat.begin_user_turn("question".into(), "turn-one".into());
+        let mut chats = HashMap::from([("one".into(), chat)]);
+        let mut owned_turns = HashMap::from([("one".into(), "turn-one".into())]);
+
+        assert!(resync_chat_history(
+            &mut chats,
+            &mut owned_turns,
+            "one",
+            &json!({"thread":{"turns":[]}}),
+        ));
+        assert!(chats["one"].active_turn_id.is_none());
+        assert!(owned_turns.is_empty());
     }
 
     #[test]
