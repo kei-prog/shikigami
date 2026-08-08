@@ -275,6 +275,7 @@ pub struct ChatState {
     pending_steers: VecDeque<String>,
     interrupt_requested: bool,
     message_selection_scroll_pending: bool,
+    history_complete: bool,
 }
 
 impl ChatState {
@@ -312,7 +313,20 @@ impl ChatState {
             pending_steers: VecDeque::new(),
             interrupt_requested: false,
             message_selection_scroll_pending: false,
+            history_complete: true,
         }
+    }
+
+    pub fn mark_history_partial(&mut self) {
+        self.history_complete = false;
+    }
+
+    pub fn mark_history_complete(&mut self) {
+        self.history_complete = true;
+    }
+
+    pub fn history_is_complete(&self) -> bool {
+        self.history_complete
     }
 
     pub fn set_model(
@@ -1324,6 +1338,18 @@ mod tests {
         assert_eq!(chat.messages.len(), 2);
         assert_eq!(chat.messages[0].role, ChatRole::User);
         assert_eq!(chat.messages[1].role, ChatRole::Assistant);
+    }
+
+    #[test]
+    fn tracks_whether_cached_history_is_complete() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        assert!(chat.history_is_complete());
+
+        chat.mark_history_partial();
+        assert!(!chat.history_is_complete());
+
+        chat.mark_history_complete();
+        assert!(chat.history_is_complete());
     }
 
     #[test]

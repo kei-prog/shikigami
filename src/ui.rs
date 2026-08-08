@@ -33,6 +33,7 @@ use ratatui::{
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -51,6 +52,8 @@ use crate::{
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 const REDRAW_INTERVAL: Duration = Duration::from_millis(16);
+const PREVIEW_TURN_LIMIT: u32 = 5;
+const PREVIEW_CACHE_CAPACITY: usize = 20;
 
 struct ChatPreview {
     generation: u64,
@@ -129,6 +132,7 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
     let mut server_events = server.subscribe();
     let preview_generation = Arc::new(AtomicU64::new(0));
     let (preview_sender, mut preview_receiver) = mpsc::unbounded_channel();
+    let mut preview_task = None;
     let mut redraw_ticker = tokio::time::interval(REDRAW_INTERVAL);
     redraw_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
@@ -160,6 +164,7 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                             &server,
                             &preview_generation,
                             &preview_sender,
+                            &mut preview_task,
                         ).await?;
                         if let Some(UiAction::OpenEditor { cwd, target }) = action
                             && let Err(error) = open_in_neovim(terminal, &cwd, &target).await
@@ -188,15 +193,20 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                                 });
                             if still_selected {
                                 if !app.show_cached_chat(&thread_id) {
-                                    app.show_chat(chat);
+                                    app.cache_chat_preview(
+                                        chat,
+                                        PREVIEW_CACHE_CAPACITY,
+                                        true,
+                                    );
                                 }
-                            } else {
-                                app.chats.entry(thread_id).or_insert(chat);
+                            } else if !app.chats.contains_key(&thread_id) {
+                                app.cache_chat_preview(chat, PREVIEW_CACHE_CAPACITY, false);
                             }
                             reconcile_thread_subscriptions(app, &server).await;
                         }
                         Err(error) => app.message = Some(error),
                     }
+                    preview_task = None;
                     needs_draw = true;
                 }
             }
@@ -220,6 +230,9 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
             }
         }
     }
+    if let Some(task) = preview_task.take() {
+        task.abort();
+    }
     Ok(())
 }
 
@@ -229,6 +242,7 @@ async fn handle_key(
     server: &Arc<AppServer>,
     preview_generation: &Arc<AtomicU64>,
     preview_sender: &mpsc::UnboundedSender<ChatPreview>,
+    preview_task: &mut Option<JoinHandle<()>>,
 ) -> Result<Option<UiAction>> {
     let mut action = None;
     match app.mode {
@@ -492,10 +506,11 @@ async fn handle_key(
                 }
             }
             KeyCode::Enter => {
-                if app.activate_selected_thread_picker()
-                    && let Err(error) = focus_selected_chat(app, server).await
-                {
-                    app.message = Some(format!("Could not open thread: {error}"));
+                if app.activate_selected_thread_picker() {
+                    cancel_chat_preview(preview_generation, preview_task);
+                    if let Err(error) = focus_selected_chat(app, server).await {
+                        app.message = Some(format!("Could not open thread: {error}"));
+                    }
                 }
             }
             KeyCode::Char('y') if app.thread_picker_query.is_empty() => {
@@ -687,11 +702,23 @@ async fn handle_key(
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 app.move_up();
-                schedule_selected_chat_preview(app, server, preview_generation, preview_sender);
+                schedule_selected_chat_preview(
+                    app,
+                    server,
+                    preview_generation,
+                    preview_sender,
+                    preview_task,
+                );
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 app.move_down();
-                schedule_selected_chat_preview(app, server, preview_generation, preview_sender);
+                schedule_selected_chat_preview(
+                    app,
+                    server,
+                    preview_generation,
+                    preview_sender,
+                    preview_task,
+                );
             }
             KeyCode::Char('a') => app.open_repository_add(),
             KeyCode::Char('A') => app.toggle_archive_view(),
@@ -757,7 +784,7 @@ async fn handle_key(
                 app.toggle_selected_repository();
             }
             KeyCode::Enter if app.selected_tree_is_thread() && !app.show_archived => {
-                preview_generation.fetch_add(1, Ordering::Relaxed);
+                cancel_chat_preview(preview_generation, preview_task);
                 if let Err(error) = focus_selected_chat(app, server).await {
                     app.message = Some(format!("Could not open thread: {error}"));
                 }
@@ -1306,7 +1333,9 @@ fn schedule_selected_chat_preview(
     server: &Arc<AppServer>,
     generation: &Arc<AtomicU64>,
     sender: &mpsc::UnboundedSender<ChatPreview>,
+    preview_task: &mut Option<JoinHandle<()>>,
 ) {
+    cancel_chat_preview(generation, preview_task);
     let current_generation = generation.fetch_add(1, Ordering::Relaxed) + 1;
     if !app.selected_tree_is_thread() {
         return;
@@ -1321,7 +1350,7 @@ fn schedule_selected_chat_preview(
     let model_settings = app.default_model_settings();
     let generation = Arc::clone(generation);
     let sender = sender.clone();
-    tokio::spawn(async move {
+    *preview_task = Some(tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(150)).await;
         if generation.load(Ordering::Relaxed) != current_generation {
             return;
@@ -1330,9 +1359,13 @@ fn schedule_selected_chat_preview(
         if let Some((model, display_name, effort)) = model_settings {
             chat.set_model(model, display_name, effort);
         }
-        let result = match server.read_thread(&chat.thread_id).await {
+        let result = match server
+            .read_thread_preview(&chat.thread_id, PREVIEW_TURN_LIMIT)
+            .await
+        {
             Ok(history) => {
                 chat.load_history(&history);
+                chat.mark_history_partial();
                 Ok(chat)
             }
             Err(error) if is_recoverable_empty_thread(&chat.title, &error) => Ok(chat),
@@ -1344,34 +1377,54 @@ fn schedule_selected_chat_preview(
                 result,
             });
         }
-    });
+    }));
 }
 
-async fn preview_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
+fn cancel_chat_preview(generation: &Arc<AtomicU64>, preview_task: &mut Option<JoinHandle<()>>) {
+    generation.fetch_add(1, Ordering::Relaxed);
+    if let Some(task) = preview_task.take() {
+        task.abort();
+    }
+}
+
+async fn load_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     if !app.selected_tree_is_thread() {
         return Ok(());
     }
     let Some(thread) = app.selected_thread().cloned() else {
         return Ok(());
     };
-    if app.show_cached_chat(&thread.record.id) {
+    if app.show_cached_chat(&thread.record.id)
+        && app.chat().is_some_and(ChatState::history_is_complete)
+    {
         return Ok(());
     }
-    let mut chat = ChatState::new(thread.record.id, thread.record.cwd, thread.record.title);
+    let thread_id = thread.record.id;
+    let history = match server.read_thread(&thread_id).await {
+        Ok(history) => Some(history),
+        Err(error) if is_recoverable_empty_thread(&thread.record.title, &error) => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(chat) = app.chats.get_mut(&thread_id) {
+        if let Some(history) = history {
+            chat.load_history(&history);
+        }
+        app.mark_chat_history_complete(&thread_id);
+        return Ok(());
+    }
+    let mut chat = ChatState::new(thread_id, thread.record.cwd, thread.record.title);
     if let Some((model, display_name, effort)) = app.default_model_settings() {
         chat.set_model(model, display_name, effort);
     }
-    match server.read_thread(&chat.thread_id).await {
-        Ok(history) => chat.load_history(&history),
-        Err(error) if is_recoverable_empty_thread(&chat.title, &error) => {}
-        Err(error) => return Err(error),
+    if let Some(history) = history {
+        chat.load_history(&history);
     }
     app.show_chat(chat);
     Ok(())
 }
 
 async fn focus_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
-    preview_selected_chat(app, server).await?;
+    load_selected_chat(app, server).await?;
     let Some(chat) = app.chat() else {
         return Ok(());
     };

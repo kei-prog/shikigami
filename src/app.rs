@@ -138,6 +138,7 @@ pub struct App {
     pub message: Option<String>,
     pub should_quit: bool,
     pub chats: HashMap<String, ChatState>,
+    preview_cache_order: VecDeque<String>,
     pub visible_chat_id: Option<String>,
     pub side_chat_id: Option<String>,
     pub side_chat_parent_id: Option<String>,
@@ -233,6 +234,7 @@ impl App {
             message: ui_state_error,
             should_quit: false,
             chats: HashMap::new(),
+            preview_cache_order: VecDeque::new(),
             visible_chat_id: None,
             side_chat_id: None,
             side_chat_parent_id: None,
@@ -320,16 +322,50 @@ impl App {
 
     pub fn show_chat(&mut self, chat: ChatState) {
         let thread_id = chat.thread_id.clone();
+        self.preview_cache_order
+            .retain(|cached| cached != &thread_id);
         self.chats.insert(thread_id.clone(), chat);
         self.show_main_chat_id(thread_id);
     }
 
+    pub fn cache_chat_preview(&mut self, chat: ChatState, capacity: usize, show: bool) {
+        let thread_id = chat.thread_id.clone();
+        self.chats.insert(thread_id.clone(), chat);
+        for evicted in touch_preview_cache(&mut self.preview_cache_order, &thread_id, capacity) {
+            if self
+                .chats
+                .get(&evicted)
+                .is_some_and(|chat| !chat.history_is_complete())
+            {
+                self.chats.remove(&evicted);
+            }
+        }
+        if show {
+            self.show_main_chat_id(thread_id);
+        }
+    }
+
     pub fn show_cached_chat(&mut self, thread_id: &str) -> bool {
         if self.chats.contains_key(thread_id) {
+            if self
+                .chats
+                .get(thread_id)
+                .is_some_and(|chat| !chat.history_is_complete())
+            {
+                let _ = touch_preview_cache(&mut self.preview_cache_order, thread_id, usize::MAX);
+            }
             self.show_main_chat_id(thread_id.to_owned());
             true
         } else {
             false
+        }
+    }
+
+    pub fn mark_chat_history_complete(&mut self, thread_id: &str) {
+        self.preview_cache_order
+            .retain(|cached| cached != thread_id);
+        if let Some(chat) = self.chats.get_mut(thread_id) {
+            chat.mark_history_complete();
         }
     }
 
@@ -2177,6 +2213,22 @@ fn cycle_index(current: usize, count: usize, forward: bool) -> usize {
     }
 }
 
+fn touch_preview_cache(
+    order: &mut VecDeque<String>,
+    thread_id: &str,
+    capacity: usize,
+) -> Vec<String> {
+    order.retain(|cached| cached != thread_id);
+    order.push_back(thread_id.to_owned());
+    let mut evicted = Vec::new();
+    while order.len() > capacity {
+        if let Some(thread_id) = order.pop_front() {
+            evicted.push(thread_id);
+        }
+    }
+    evicted
+}
+
 fn tree_rows_for(
     repositories: &[Repository],
     threads: &[ThreadItem],
@@ -2315,6 +2367,17 @@ mod tests {
         assert_eq!(cycle_index(2, 3, false), 1);
         assert_eq!(cycle_index(0, 3, false), 2);
         assert_eq!(cycle_index(0, 0, true), 0);
+    }
+
+    #[test]
+    fn preview_cache_evicts_the_least_recently_used_thread() {
+        let mut order = VecDeque::new();
+        assert!(touch_preview_cache(&mut order, "one", 2).is_empty());
+        assert!(touch_preview_cache(&mut order, "two", 2).is_empty());
+        assert!(touch_preview_cache(&mut order, "one", 2).is_empty());
+
+        assert_eq!(touch_preview_cache(&mut order, "three", 2), ["two"]);
+        assert_eq!(order, ["one", "three"]);
     }
 
     #[test]

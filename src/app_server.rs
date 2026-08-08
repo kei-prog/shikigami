@@ -371,6 +371,21 @@ impl AppServer {
         .await
     }
 
+    pub async fn read_thread_preview(&self, thread_id: &str, limit: u32) -> Result<Value> {
+        let response = self
+            .request(
+                "thread/turns/list",
+                json!({
+                    "threadId": thread_id,
+                    "limit": limit,
+                    "sortDirection": "desc",
+                    "itemsView": "full"
+                }),
+            )
+            .await?;
+        preview_history(response)
+    }
+
     pub async fn unsubscribe_thread(&self, thread_id: &str) -> Result<()> {
         self.request("thread/unsubscribe", json!({"threadId": thread_id}))
             .await?;
@@ -565,6 +580,15 @@ fn extract_thread_id(response: &Value, method: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .with_context(|| format!("{method} response missing thread.id"))
+}
+
+fn preview_history(mut response: Value) -> Result<Value> {
+    let turns = response
+        .get_mut("data")
+        .and_then(Value::as_array_mut)
+        .context("thread/turns/list response did not contain data")?;
+    turns.reverse();
+    Ok(json!({"thread": {"turns": std::mem::take(turns)}}))
 }
 
 async fn dispatch_message(
@@ -792,6 +816,53 @@ mod tests {
         .await;
 
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn thread_preview_requests_recent_full_turns_in_display_order() {
+        let (writer, mut messages) = mpsc::channel(1);
+        let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(1);
+        let (_request_tx, request_rx) = mpsc::channel(1);
+        let server = Arc::new(AppServer {
+            writer,
+            writer_task: Mutex::new(None),
+            reader_task: Mutex::new(None),
+            child: Mutex::new(None),
+            pending: pending.clone(),
+            next_id: AtomicU64::new(0),
+            events,
+            server_requests: Mutex::new(request_rx),
+            version: "test".into(),
+            request_timeout: Duration::from_secs(1),
+        });
+
+        let task = tokio::spawn({
+            let server = server.clone();
+            async move { server.read_thread_preview("thread-1", 5).await }
+        });
+        let OutgoingMessage::Json(message) = messages.recv().await.unwrap() else {
+            panic!("unexpected shutdown message");
+        };
+        assert_eq!(message["method"], "thread/turns/list");
+        assert_eq!(message["params"]["threadId"], "thread-1");
+        assert_eq!(message["params"]["limit"], 5);
+        assert_eq!(message["params"]["sortDirection"], "desc");
+        assert_eq!(message["params"]["itemsView"], "full");
+        dispatch_response(
+            &pending,
+            &json!({
+                "id": message["id"],
+                "result": {"data": [{"id": "new"}, {"id": "old"}]}
+            }),
+        )
+        .await;
+
+        let history = task.await.unwrap().unwrap();
+        assert_eq!(
+            history.pointer("/thread/turns").unwrap(),
+            &json!([{"id": "old"}, {"id": "new"}])
+        );
     }
 
     #[tokio::test]
