@@ -3336,11 +3336,14 @@ mod tests {
     }
 
     #[test]
-    fn selected_message_is_highlighted_in_scroll_mode() {
+    fn message_is_highlighted_only_after_selection_navigation() {
         let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
         chat.begin_user_turn("selected".into(), "turn".into());
         chat.enter_scroll_mode();
 
+        assert!(rendered_chat(&chat, 30).selected_range.is_none());
+
+        chat.move_message_selection(false);
         let rendered = rendered_chat(&chat, 30);
         let (start, end) = rendered.selected_range.expect("selected range");
         assert!(rendered.lines[start..end].iter().all(|line| {

@@ -470,8 +470,8 @@ impl ChatState {
     pub fn enter_scroll_mode(&mut self) {
         self.mode = ChatMode::Scroll;
         self.visible_editor_target = None;
-        self.selected_message_index = self.selectable_message_indices().last();
-        self.message_selection_scroll_pending = self.selected_message_index.is_some();
+        self.selected_message_index = None;
+        self.message_selection_scroll_pending = false;
         self.scroll_to_bottom();
     }
 
@@ -479,6 +479,11 @@ impl ChatState {
         let selectable = self.selectable_message_indices().collect::<Vec<_>>();
         if selectable.is_empty() {
             self.selected_message_index = None;
+            return;
+        }
+        if self.selected_message_index.is_none() {
+            self.selected_message_index = selectable.last().copied();
+            self.message_selection_scroll_pending = true;
             return;
         }
         let current = self
@@ -1460,7 +1465,7 @@ mod tests {
     }
 
     #[test]
-    fn scroll_mode_selects_messages_and_clamps_navigation() {
+    fn message_navigation_selects_lazily_and_clamps_to_bounds() {
         let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
         chat.push_notice("first".into());
         chat.messages.push(ChatMessage {
@@ -1472,6 +1477,10 @@ mod tests {
         chat.push_notice("last".into());
 
         chat.enter_scroll_mode();
+        assert_eq!(chat.selected_message(), None);
+        assert_eq!(chat.selected_message_position(), None);
+
+        chat.move_message_selection(false);
         assert_eq!(
             chat.selected_message()
                 .map(|message| message.content.as_str()),
@@ -1491,11 +1500,8 @@ mod tests {
         chat.scroll_to_top();
         chat.mode = ChatMode::Input;
         chat.enter_scroll_mode();
-        assert_eq!(
-            chat.selected_message()
-                .map(|message| message.content.as_str()),
-            Some("last")
-        );
+        assert_eq!(chat.selected_message(), None);
+        assert_eq!(chat.selected_message_position(), None);
         assert_eq!(chat.scroll_top, chat.max_scroll);
         assert!(chat.follow_tail);
 
