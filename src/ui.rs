@@ -59,6 +59,7 @@ struct ChatPreview {
 
 enum UiAction {
     OpenEditor { cwd: PathBuf, target: EditorTarget },
+    OpenCodex { thread_id: String, cwd: PathBuf },
 }
 
 pub async fn run(mut app: App) -> Result<()> {
@@ -161,10 +162,24 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                             &preview_generation,
                             &preview_sender,
                         ).await?;
-                        if let Some(UiAction::OpenEditor { cwd, target }) = action
-                            && let Err(error) = open_in_neovim(terminal, &cwd, &target).await
-                        {
-                            app.message = Some(format!("Could not open Neovim: {error}"));
+                        match action {
+                            Some(UiAction::OpenEditor { cwd, target }) => {
+                                if let Err(error) = open_in_neovim(terminal, &cwd, &target).await {
+                                    app.message = Some(format!("Could not open Neovim: {error}"));
+                                }
+                            }
+                            Some(UiAction::OpenCodex { thread_id, cwd }) => {
+                                if let Err(error) = open_in_codex(
+                                    terminal,
+                                    app,
+                                    &server,
+                                    &thread_id,
+                                    &cwd,
+                                ).await {
+                                    app.message = Some(format!("Could not open Codex CLI: {error}"));
+                                }
+                            }
+                            None => {}
                         }
                         needs_draw = true;
                     }
@@ -495,6 +510,27 @@ async fn handle_key(
                     app.message = Some(format!("Could not open thread: {error}"));
                 }
             }
+            KeyCode::Char('o') if app.thread_picker_query.is_empty() => {
+                if let Some(thread) = app.selected_thread_picker() {
+                    if app.thread_has_active_turn(&thread.record.id) {
+                        app.message = Some(
+                            "Stop the running response before opening this thread in Codex CLI"
+                                .into(),
+                        );
+                    } else {
+                        action = Some(UiAction::OpenCodex {
+                            thread_id: thread.record.id.clone(),
+                            cwd: thread.record.cwd.clone(),
+                        });
+                    }
+                }
+            }
+            KeyCode::Char('y') if app.thread_picker_query.is_empty() => {
+                copy_thread_picker_value(app, ThreadCopy::Id);
+            }
+            KeyCode::Char('Y') if app.thread_picker_query.is_empty() => {
+                copy_thread_picker_value(app, ThreadCopy::ResumeCommand);
+            }
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -785,6 +821,69 @@ async fn open_in_neovim(terminal: &mut Tui, cwd: &Path, target: &EditorTarget) -
     Ok(())
 }
 
+async fn open_in_codex(
+    terminal: &mut Tui,
+    app: &mut App,
+    server: &Arc<AppServer>,
+    thread_id: &str,
+    cwd: &Path,
+) -> Result<()> {
+    let cwd = cwd
+        .canonicalize()
+        .with_context(|| format!("workspace does not exist: {}", cwd.display()))?;
+    let was_resumed = app.resumed_threads.contains(thread_id);
+    if was_resumed {
+        server
+            .unsubscribe_thread(thread_id)
+            .await
+            .context("release thread before starting Codex CLI")?;
+        app.resumed_threads.remove(thread_id);
+    }
+    let model = app.chats.get(thread_id).and_then(|chat| chat.model.clone());
+
+    restore_terminal(terminal)?;
+    let codex_result = tokio::process::Command::new("codex")
+        .arg("resume")
+        .arg(thread_id)
+        .current_dir(&cwd)
+        .status()
+        .await;
+    let resume_terminal_result = resume_terminal(terminal);
+
+    let mut restore_subscription_error = None;
+    if was_resumed {
+        match server
+            .resume_thread(thread_id, &cwd, model.as_deref())
+            .await
+        {
+            Ok(()) => {
+                app.resumed_threads.insert(thread_id.to_owned());
+                app.set_thread_read_only(thread_id, false);
+            }
+            Err(error) => {
+                app.set_thread_read_only(thread_id, true);
+                restore_subscription_error = Some(error);
+            }
+        }
+    }
+    if let Ok(history) = server.read_thread(thread_id).await
+        && let Some(chat) = app.chats.get_mut(thread_id)
+    {
+        chat.load_history(&history);
+    }
+
+    resume_terminal_result?;
+    let status = codex_result.context("could not start codex")?;
+    if !status.success() {
+        bail!("codex exited with {status}");
+    }
+    if let Some(error) = restore_subscription_error {
+        bail!("Codex CLI closed, but the thread could not be reopened in shikigami: {error}");
+    }
+    app.message = Some(format!("Codex CLI closed for thread {thread_id}"));
+    Ok(())
+}
+
 async fn open_command_palette(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     let Some(chat) = app.chat() else {
         return Ok(());
@@ -837,6 +936,42 @@ fn copy_conversation(app: &mut App) {
         },
         _ => "Chat is empty".into(),
     });
+}
+
+#[derive(Clone, Copy)]
+enum ThreadCopy {
+    Id,
+    ResumeCommand,
+}
+
+fn copy_thread_picker_value(app: &mut App, value: ThreadCopy) {
+    let Some(thread_id) = app
+        .selected_thread_picker()
+        .map(|thread| thread.record.id.clone())
+    else {
+        app.message = Some("No thread selected".into());
+        return;
+    };
+    let (text, success, failure) = match value {
+        ThreadCopy::Id => (
+            thread_id.clone(),
+            "Copied thread ID",
+            "Could not copy thread ID",
+        ),
+        ThreadCopy::ResumeCommand => (
+            codex_resume_command(&thread_id),
+            "Copied Codex resume command",
+            "Could not copy Codex resume command",
+        ),
+    };
+    app.message = Some(match clipboard::copy(&text) {
+        Ok(()) => format!("{success}: {thread_id}"),
+        Err(error) => format!("{failure}: {error}"),
+    });
+}
+
+fn codex_resume_command(thread_id: &str) -> String {
+    format!("codex resume {thread_id}")
 }
 
 async fn handle_palette_key(app: &mut App, key: KeyEvent, server: &Arc<AppServer>) -> Result<()> {
@@ -2092,7 +2227,7 @@ fn render_thread_picker(frame: &mut Frame, area: Rect, app: &App) {
             Block::default()
                 .title(title)
                 .title_bottom(Line::from(
-                    " type to filter · ↑/↓ select · Enter open · Esc close ",
+                    " type filter · ↑/↓ · Enter open · o CLI · y ID · Y command · Esc ",
                 ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
@@ -3336,6 +3471,14 @@ mod tests {
         assert_eq!(wrap_composer("日本語", 4), vec!["日本", "語"]);
         assert_eq!(wrap_composer("abcd", 4), vec!["abcd", ""]);
         assert_eq!(wrap_composer("", 4), vec![""]);
+    }
+
+    #[test]
+    fn codex_resume_command_targets_the_selected_thread() {
+        assert_eq!(
+            codex_resume_command("019-test-thread"),
+            "codex resume 019-test-thread"
+        );
     }
 
     #[test]

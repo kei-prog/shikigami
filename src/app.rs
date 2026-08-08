@@ -594,6 +594,12 @@ impl App {
             .filter_map(|index| self.threads.get(*index))
     }
 
+    pub fn selected_thread_picker(&self) -> Option<&ThreadItem> {
+        self.thread_picker_matches
+            .get(self.thread_picker_index)
+            .and_then(|index| self.threads.get(*index))
+    }
+
     pub fn move_thread_picker_up(&mut self) {
         self.thread_picker_index = self.thread_picker_index.saturating_sub(1);
     }
@@ -761,6 +767,13 @@ impl App {
         self.chats
             .values()
             .any(|chat| chat.active_turn_id.is_some())
+    }
+
+    pub fn thread_has_active_turn(&self, thread_id: &str) -> bool {
+        self.chats
+            .get(thread_id)
+            .is_some_and(|chat| chat.active_turn_id.is_some())
+            || self.owned_turns.contains_key(thread_id)
     }
 
     pub fn thread_is_registered(&self, thread_id: &str) -> bool {
