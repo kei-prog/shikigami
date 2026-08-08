@@ -49,22 +49,9 @@ pub enum ScanEvent {
 impl RepositoryStore {
     pub fn discover() -> Result<Self> {
         let dirs = paths::project_dirs()?;
-        let legacy_dirs = paths::legacy_project_dirs()?;
         let registered_path = dirs.data_local_dir().join("repositories.json");
         let candidates_path = dirs.cache_dir().join("repository-candidates.json");
         let ui_state_path = dirs.data_local_dir().join("repository-ui.json");
-        paths::migrate_file(
-            &legacy_dirs.data_local_dir().join("repositories.json"),
-            &registered_path,
-        )?;
-        paths::migrate_file(
-            &legacy_dirs.cache_dir().join("repository-candidates.json"),
-            &candidates_path,
-        )?;
-        paths::migrate_file(
-            &legacy_dirs.data_local_dir().join("repository-ui.json"),
-            &ui_state_path,
-        )?;
         Ok(Self {
             registered_path,
             candidates_path,

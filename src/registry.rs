@@ -234,9 +234,7 @@ impl SideChatRegistry {
 impl Registry {
     pub fn discover() -> Result<Self> {
         let dirs = paths::project_dirs()?;
-        let legacy_dirs = paths::legacy_project_dirs()?;
         let path = dirs.data_local_dir().join("threads.json");
-        paths::migrate_file(&legacy_dirs.data_local_dir().join("threads.json"), &path)?;
         Ok(Self { path })
     }
 

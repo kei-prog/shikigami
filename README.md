@@ -185,10 +185,6 @@ preserving its branch. Dirty worktrees, primary repositories, and worktrees not
 created by Shikigami are always kept. Restoring an archived thread recreates a
 removed Shikigami worktree from its preserved branch.
 
-Shikigami copies repository, thread, and UI state from the legacy `wyard` data
-directory on first launch. Existing `wyard/<id>` managed worktrees remain supported
-in place; newly created managed worktrees use the `shi/<id>` branch prefix.
-
 Repositories can also be listed non-interactively:
 
 ```bash

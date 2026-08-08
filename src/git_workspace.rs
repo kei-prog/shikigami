@@ -71,9 +71,6 @@ pub fn is_managed_workspace(path: &Path, branch: Option<&str>) -> bool {
         Some(branch) if branch.starts_with("shi/") => {
             managed_worktrees_root().is_ok_and(|root| path_is_within(path, &root))
         }
-        Some(branch) if branch.starts_with("wyard/") => {
-            legacy_managed_worktrees_root().is_ok_and(|root| path_is_within(path, &root))
-        }
         _ => false,
     }
 }
@@ -132,12 +129,6 @@ pub fn restore_managed_workspace(
 
 fn managed_worktrees_root() -> Result<PathBuf> {
     Ok(paths::project_dirs()?.data_local_dir().join("worktrees"))
-}
-
-fn legacy_managed_worktrees_root() -> Result<PathBuf> {
-    Ok(paths::legacy_project_dirs()?
-        .data_local_dir()
-        .join("worktrees"))
 }
 
 fn path_is_within(path: &Path, root: &Path) -> bool {
@@ -303,15 +294,6 @@ mod tests {
         assert!(!is_managed_workspace(
             Path::new("/tmp/abc123"),
             Some("shi/abc123")
-        ));
-        let legacy_root = legacy_managed_worktrees_root().unwrap();
-        assert!(is_managed_workspace(
-            &legacy_root.join("owner-repo/abc123"),
-            Some("wyard/abc123")
-        ));
-        assert!(!is_managed_workspace(
-            &root.join("owner-repo/abc123"),
-            Some("wyard/abc123")
         ));
     }
 
