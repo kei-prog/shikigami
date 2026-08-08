@@ -103,30 +103,6 @@ pub fn remove_managed_workspace(
     ensure_success("git worktree remove", &output)
 }
 
-pub fn restore_managed_workspace(
-    repository_path: &Path,
-    workspace_path: &Path,
-    branch: Option<&str>,
-) -> Result<()> {
-    let branch = branch.context("archived thread has no worktree branch")?;
-    if !is_managed_workspace(workspace_path, Some(branch)) {
-        bail!("refusing to restore a worktree not owned by Shikigami");
-    }
-    if workspace_path.exists() {
-        return Ok(());
-    }
-    let parent = workspace_path.parent().context("worktree has no parent")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("create worktree directory {}", parent.display()))?;
-    let output = git(repository_path)
-        .args(["worktree", "add"])
-        .arg(workspace_path)
-        .arg(branch)
-        .output()
-        .context("restore managed worktree")?;
-    ensure_success("git worktree add", &output)
-}
-
 fn managed_worktrees_root() -> Result<PathBuf> {
     Ok(paths::project_dirs()?.data_local_dir().join("worktrees"))
 }

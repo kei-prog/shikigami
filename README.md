@@ -41,8 +41,7 @@ results are cached, while the main screen only shows repositories you register.
 - `x`: archive the selected thread, or restore it from the archived view
 - `A`: switch between active and archived threads
 - `!`: show threads that completed, failed, or need approval
-- `d`: unregister a repository, remove an active thread from Shikigami only, or
-  permanently delete a thread from the archived view
+- `d`: unregister a repository or permanently delete a thread
 - `r`: reload registered repositories and threads
 - `?`: show all keys
 - `q`: quit
@@ -183,13 +182,10 @@ an unrelated thread.
 
 Existing Codex threads are not imported.
 
-Archiving hides a thread without deleting its Codex history. If the thread uses
-a clean worktree created by Shikigami, Shikigami offers to remove that worktree while
-preserving its branch. Dirty worktrees, primary repositories, and worktrees not
-created by Shikigami are always kept. Restoring an archived thread recreates a
-removed Shikigami worktree from its preserved branch.
-Only archived threads can be permanently deleted. Press `d` in the archived
-view and confirm to delete the Codex history and local Shikigami record. A clean
+Archiving hides a thread while preserving its Codex history, worktree, and branch.
+Restoring an archived thread only returns it to the active view.
+Press `d` in either the active or archived view and confirm to delete the Codex
+history and local Shikigami record. A clean
 Shikigami-managed worktree is removed; deletion is refused while it is dirty.
 User-owned worktrees and the managed branch are preserved.
 

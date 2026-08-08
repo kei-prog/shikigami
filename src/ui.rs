@@ -638,40 +638,12 @@ async fn handle_key(
             }
             _ => {}
         },
-        Mode::ConfirmRemoveThread => match key.code {
+        Mode::ConfirmDeleteThread => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 app.mode = Mode::Normal;
-                app.message = Some(match app.remove_selected_thread() {
-                    Ok(()) => "removed from Shikigami; Codex history remains".into(),
-                    Err(error) => error.to_string(),
-                });
-            }
-            _ => app.mode = Mode::Normal,
-        },
-        Mode::ConfirmArchiveCleanup => match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                app.mode = Mode::Normal;
-                app.message = Some(match app.archive_selected_thread(true) {
-                    Ok(()) => "archived; clean Shikigami worktree removed".into(),
-                    Err(error) => error.to_string(),
-                });
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') => {
-                app.mode = Mode::Normal;
-                app.message = Some(match app.archive_selected_thread(false) {
-                    Ok(()) => "archived; worktree kept".into(),
-                    Err(error) => error.to_string(),
-                });
-            }
-            KeyCode::Esc => app.mode = Mode::Normal,
-            _ => {}
-        },
-        Mode::ConfirmDeleteArchivedThread => match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                app.mode = Mode::Normal;
-                app.message = Some(match delete_selected_archived_thread(app, server).await {
-                    Ok(()) => "archived thread permanently deleted".into(),
-                    Err(error) => format!("Could not delete archived thread: {error}"),
+                app.message = Some(match delete_selected_thread(app, server).await {
+                    Ok(()) => "thread permanently deleted".into(),
+                    Err(error) => format!("Could not delete thread: {error}"),
                 });
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.mode = Mode::Normal,
@@ -745,13 +717,9 @@ async fn handle_key(
                 app.mode = Mode::ConfirmRemoveRepository;
             }
             KeyCode::Char('d') if app.selected_tree_is_thread() => {
-                if app.show_archived {
-                    match app.selected_archived_thread_delete_target() {
-                        Ok(_) => app.mode = Mode::ConfirmDeleteArchivedThread,
-                        Err(error) => app.message = Some(error.to_string()),
-                    }
-                } else {
-                    app.mode = Mode::ConfirmRemoveThread;
+                match app.selected_thread_delete_target() {
+                    Ok(_) => app.mode = Mode::ConfirmDeleteThread,
+                    Err(error) => app.message = Some(error.to_string()),
                 }
             }
             KeyCode::Char('x') if app.selected_tree_is_thread() => {
@@ -766,16 +734,12 @@ async fn handle_key(
                             app.message =
                                 Some("response is running; stop it before archiving".into());
                         }
-                        Ok(false) => match app.selected_thread_has_clean_managed_worktree() {
-                            Ok(true) => app.mode = Mode::ConfirmArchiveCleanup,
-                            Ok(false) => {
-                                app.message = Some(match app.archive_selected_thread(false) {
-                                    Ok(()) => "archived; worktree kept".into(),
-                                    Err(error) => error.to_string(),
-                                });
-                            }
-                            Err(error) => app.message = Some(error.to_string()),
-                        },
+                        Ok(false) => {
+                            app.message = Some(match app.archive_selected_thread() {
+                                Ok(()) => "thread archived".into(),
+                                Err(error) => error.to_string(),
+                            });
+                        }
                         Err(error) => app.message = Some(error.to_string()),
                     }
                 }
@@ -1231,14 +1195,14 @@ async fn delete_temporary_thread(server: &Arc<AppServer>, thread_id: &str) -> Re
     }
 }
 
-async fn delete_selected_archived_thread(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
-    let record = app.selected_archived_thread_delete_target()?;
+async fn delete_selected_thread(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
+    let record = app.selected_thread_delete_target()?;
     match server.delete_thread(&record.id).await {
         Ok(()) => {}
         Err(error) if is_missing_thread_history_error(&error) => {}
         Err(error) => return Err(error),
     }
-    app.complete_archived_thread_deletion(&record.id)
+    app.complete_thread_deletion(&record.id)
         .context("Codex history was deleted, but local cleanup failed")
 }
 
@@ -1735,11 +1699,7 @@ fn render(frame: &mut Frame, app: &mut App) {
         Mode::ChooseThreadTarget => render_thread_targets(frame, area, app),
         Mode::ChooseExistingWorktree => render_existing_worktrees(frame, area, app),
         Mode::ConfirmRemoveRepository => render_repository_remove_confirm(frame, area, app),
-        Mode::ConfirmRemoveThread => render_remove_confirm(frame, area, app),
-        Mode::ConfirmArchiveCleanup => render_archive_confirm(frame, area, app),
-        Mode::ConfirmDeleteArchivedThread => {
-            render_archived_thread_delete_confirm(frame, area, app)
-        }
+        Mode::ConfirmDeleteThread => render_thread_delete_confirm(frame, area, app),
         Mode::ChooseModel => render_model_picker(frame, area, app),
         Mode::ChooseReasoningEffort => render_reasoning_effort_picker(frame, area, app),
         Mode::ChooseSideChat => render_side_chat_picker(frame, area, app),
@@ -2877,6 +2837,8 @@ fn render_navigation_tree(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(focus_style(app.focus == Focus::Navigation));
     if app.show_archived {
         block = block.title_bottom(Line::from(" x restore · d delete · A active threads "));
+    } else {
+        block = block.title_bottom(Line::from(" x archive · d delete · A archived threads "));
     }
     let list = List::new(items)
         .block(block)
@@ -3046,28 +3008,6 @@ fn render_browser(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(list, popup, &mut state);
 }
 
-fn render_remove_confirm(frame: &mut Frame, area: Rect, app: &App) {
-    let popup = centered_rect(68, 8, area);
-    let title = app
-        .selected_thread()
-        .map(|thread| thread.record.title.as_str())
-        .unwrap_or("thread");
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(format!(
-            "Remove '{title}' from Shikigami?\n\nCodex history is not deleted. [y/N]"
-        ))
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .title(" Remove thread ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
-        ),
-        popup,
-    );
-}
-
 fn render_repository_remove_confirm(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(68, 8, area);
     let name = app
@@ -3090,29 +3030,7 @@ fn render_repository_remove_confirm(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn render_archive_confirm(frame: &mut Frame, area: Rect, app: &App) {
-    let popup = centered_rect(72, 9, area);
-    let title = app
-        .selected_thread()
-        .map(|thread| thread.record.title.as_str())
-        .unwrap_or("thread");
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(format!(
-            "Archive '{title}'?\n\nThe Shikigami-created worktree is clean.\nRemove it now? The branch and Codex history remain. [y/N]"
-        ))
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .title(" Archive thread ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
-        ),
-        popup,
-    );
-}
-
-fn render_archived_thread_delete_confirm(frame: &mut Frame, area: Rect, app: &App) {
+fn render_thread_delete_confirm(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(76, 10, area);
     let title = app
         .selected_thread()
@@ -3121,12 +3039,12 @@ fn render_archived_thread_delete_confirm(frame: &mut Frame, area: Rect, app: &Ap
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(format!(
-            "Permanently delete archived thread '{title}'?\n\nCodex history cannot be recovered.\nA clean Shikigami worktree is removed; other worktrees are kept. [y/N]"
+            "Permanently delete thread '{title}'?\n\nCodex history cannot be recovered.\nA clean Shikigami worktree is removed; other worktrees are kept. [y/N]"
         ))
         .wrap(Wrap { trim: false })
         .block(
             Block::default()
-                .title(" Delete archived thread ")
+                .title(" Delete thread ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Red)),
         ),
@@ -3205,7 +3123,7 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_help(frame: &mut Frame, area: Rect) {
     let popup = centered_rect(72, 32, area);
-    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            open the visible diff hunk in Neovim\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / remove thread / delete archived thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
+    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            open the visible diff hunk in Neovim\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / permanently delete thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(help).wrap(Wrap { trim: false }).block(

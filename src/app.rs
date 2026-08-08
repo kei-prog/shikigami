@@ -39,9 +39,7 @@ pub enum Mode {
     ChooseThreadTarget,
     ChooseExistingWorktree,
     ConfirmRemoveRepository,
-    ConfirmRemoveThread,
-    ConfirmArchiveCleanup,
-    ConfirmDeleteArchivedThread,
+    ConfirmDeleteThread,
     Chat,
     ChooseModel,
     ChooseReasoningEffort,
@@ -1393,14 +1391,6 @@ impl App {
         Ok(workspace)
     }
 
-    pub fn selected_thread_has_clean_managed_worktree(&self) -> Result<bool> {
-        let thread = self.selected_thread().context("no thread selected")?;
-        if !thread.record.managed_worktree || !thread.record.cwd.is_dir() {
-            return Ok(false);
-        }
-        git_workspace::workspace_is_clean(&thread.record.cwd)
-    }
-
     pub fn selected_thread_has_active_turn(&self) -> Result<bool> {
         let thread_id = &self
             .selected_thread()
@@ -1415,7 +1405,7 @@ impl App {
         ))
     }
 
-    pub fn archive_selected_thread(&mut self, remove_worktree: bool) -> Result<()> {
+    pub fn archive_selected_thread(&mut self) -> Result<()> {
         let record = self
             .selected_thread()
             .map(|thread| thread.record.clone())
@@ -1430,16 +1420,6 @@ impl App {
             "response is running; stop it before archiving"
         );
         self.thread_registry.set_archived(&record.id, true)?;
-        if remove_worktree
-            && let Err(error) = git_workspace::remove_managed_workspace(
-                &record.repository_path,
-                &record.cwd,
-                record.worktree_branch.as_deref(),
-            )
-        {
-            self.refresh_current();
-            return Err(error);
-        }
         self.discard_chat(&record.id);
         self.refresh_current();
         Ok(())
@@ -1450,41 +1430,48 @@ impl App {
             .selected_thread()
             .map(|thread| thread.record.clone())
             .context("no thread selected")?;
-        if record.managed_worktree && !record.cwd.exists() {
-            git_workspace::restore_managed_workspace(
-                &record.repository_path,
-                &record.cwd,
-                record.worktree_branch.as_deref(),
-            )?;
-        }
         self.thread_registry.set_archived(&record.id, false)?;
         self.refresh_current();
         Ok(())
     }
 
-    pub fn selected_archived_thread_delete_target(&self) -> Result<ThreadRecord> {
+    pub fn selected_thread_delete_target(&self) -> Result<ThreadRecord> {
         let record = self
             .selected_thread()
             .map(|thread| thread.record.clone())
             .context("no thread selected")?;
-        ensure_archived_deletion_context(self.show_archived, &record)?;
+        ensure_thread_deletion_context(self.show_archived, &record)?;
+        anyhow::ensure!(
+            !thread_group_has_active_turn(
+                &record.id,
+                &self.chats,
+                &self.side_chats_by_parent,
+                &self.owned_turns,
+            ),
+            "response is running; stop it before deleting"
+        );
         if record.managed_worktree
             && record.cwd.is_dir()
             && !git_workspace::workspace_is_clean(&record.cwd)?
         {
-            anyhow::bail!("worktree has changes; restore the thread and clean it before deleting");
+            if record.archived_at.is_some() {
+                anyhow::bail!(
+                    "worktree has changes; restore the thread and clean it before deleting"
+                );
+            }
+            anyhow::bail!("worktree has changes; clean it before deleting");
         }
         Ok(record)
     }
 
-    pub fn complete_archived_thread_deletion(&mut self, thread_id: &str) -> Result<()> {
+    pub fn complete_thread_deletion(&mut self, thread_id: &str) -> Result<()> {
         let record = self
             .threads
             .iter()
             .find(|thread| thread.record.id == thread_id)
             .map(|thread| thread.record.clone())
-            .context("archived thread is no longer selected")?;
-        ensure_archived_deletion_context(self.show_archived, &record)?;
+            .context("thread is no longer selected")?;
+        ensure_thread_deletion_context(self.show_archived, &record)?;
         if record.managed_worktree && record.cwd.is_dir() {
             git_workspace::remove_managed_workspace(
                 &record.repository_path,
@@ -1841,17 +1828,6 @@ impl App {
         Ok(())
     }
 
-    pub fn remove_selected_thread(&mut self) -> Result<()> {
-        let thread_id = self
-            .selected_thread()
-            .map(|thread| thread.record.id.clone())
-            .context("no thread selected")?;
-        self.thread_registry.remove(&thread_id)?;
-        self.discard_chat(&thread_id);
-        self.refresh_current();
-        Ok(())
-    }
-
     pub fn unused_main_chat_cleanup_target(&self) -> Result<Option<String>> {
         let Some(thread_id) = self.visible_chat_id.as_deref() else {
             return Ok(None);
@@ -2125,14 +2101,10 @@ fn thread_picker_matches(
     matches.into_iter().map(|(index, _)| index).collect()
 }
 
-fn ensure_archived_deletion_context(show_archived: bool, record: &ThreadRecord) -> Result<()> {
+fn ensure_thread_deletion_context(show_archived: bool, record: &ThreadRecord) -> Result<()> {
     anyhow::ensure!(
-        show_archived,
-        "thread deletion is only available in archived view"
-    );
-    anyhow::ensure!(
-        record.archived_at.is_some(),
-        "only archived threads can be deleted"
+        record.archived_at.is_some() == show_archived,
+        "thread is no longer in the current view"
     );
     Ok(())
 }
@@ -2536,15 +2508,15 @@ mod tests {
     }
 
     #[test]
-    fn permanent_deletion_requires_an_archived_thread_in_archived_view() {
+    fn permanent_deletion_requires_the_thread_to_match_the_current_view() {
         let mut item = thread("thread-1", "/one");
 
-        assert!(ensure_archived_deletion_context(false, &item.record).is_err());
-        assert!(ensure_archived_deletion_context(true, &item.record).is_err());
+        assert!(ensure_thread_deletion_context(false, &item.record).is_ok());
+        assert!(ensure_thread_deletion_context(true, &item.record).is_err());
 
         item.record.archived_at = Some(1);
-        assert!(ensure_archived_deletion_context(false, &item.record).is_err());
-        assert!(ensure_archived_deletion_context(true, &item.record).is_ok());
+        assert!(ensure_thread_deletion_context(false, &item.record).is_err());
+        assert!(ensure_thread_deletion_context(true, &item.record).is_ok());
     }
 
     #[test]
