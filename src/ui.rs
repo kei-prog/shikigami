@@ -12,7 +12,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use crossterm::{
     cursor::{MoveTo, SetCursorStyle},
-    event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{
         Clear as ClearTerminal, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
@@ -89,6 +92,7 @@ fn init_terminal() -> Result<Tui> {
         EnterAlternateScreen,
         ClearTerminal(ClearType::All),
         SetCursorStyle::BlinkingBar,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
         MoveTo(0, 0)
     )?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
@@ -99,6 +103,7 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     execute!(
         terminal.backend_mut(),
         SetCursorStyle::DefaultUserShape,
+        PopKeyboardEnhancementFlags,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -112,6 +117,7 @@ fn resume_terminal(terminal: &mut Tui) -> Result<()> {
         EnterAlternateScreen,
         ClearTerminal(ClearType::All),
         SetCursorStyle::BlinkingBar,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
         MoveTo(0, 0)
     )?;
     terminal.resize(terminal.size()?.into())?;
@@ -351,8 +357,18 @@ async fn handle_key(
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(chat) = app.chat_mut() {
-                    chat.composer.clear();
+                    chat.clear_composer();
                     chat.selected_skills.clear();
+                }
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(chat) = app.chat_mut() {
+                    chat.move_composer_line_start();
+                }
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(chat) = app.chat_mut() {
+                    chat.move_composer_line_end();
                 }
             }
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -364,7 +380,47 @@ async fn handle_key(
             }
             KeyCode::Backspace => {
                 if let Some(chat) = app.chat_mut() {
-                    chat.composer.pop();
+                    chat.backspace_composer();
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(chat) = app.chat_mut() {
+                    chat.delete_composer();
+                }
+            }
+            KeyCode::Left => {
+                if let Some(chat) = app.chat_mut() {
+                    chat.move_composer_left();
+                }
+            }
+            KeyCode::Right => {
+                if let Some(chat) = app.chat_mut() {
+                    chat.move_composer_right();
+                }
+            }
+            KeyCode::Up => {
+                if let Some(chat) = app.chat_mut() {
+                    chat.move_composer_up();
+                }
+            }
+            KeyCode::Down => {
+                if let Some(chat) = app.chat_mut() {
+                    chat.move_composer_down();
+                }
+            }
+            KeyCode::Home => {
+                if let Some(chat) = app.chat_mut() {
+                    chat.move_composer_line_start();
+                }
+            }
+            KeyCode::End => {
+                if let Some(chat) = app.chat_mut() {
+                    chat.move_composer_line_end();
+                }
+            }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if let Some(chat) = app.chat_mut() {
+                    chat.insert_composer_newline();
                 }
             }
             KeyCode::Enter => submit_chat(app, server).await?,
@@ -382,7 +438,7 @@ async fn handle_key(
                             .into(),
                     );
                 } else if let Some(chat) = app.chat_mut() {
-                    chat.composer.push(character);
+                    chat.insert_composer_char(character);
                 }
             }
             _ => {}
@@ -1321,7 +1377,7 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
             return Ok(());
         }
         if let Some(chat) = app.chat_mut() {
-            chat.composer.clear();
+            chat.clear_composer();
             chat.steer_submitted(prompt);
         }
         return Ok(());
@@ -1339,7 +1395,7 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     app.record_owned_turn(thread_id.clone(), turn_id.clone());
     if let Some(chat) = app.chat_mut() {
         let first_side_message = chat.is_side_chat && !chat.side_chat_has_activity;
-        chat.composer.clear();
+        chat.clear_composer();
         chat.begin_user_turn(prompt.clone(), turn_id);
         if first_side_message {
             chat.title = prompt
@@ -1670,20 +1726,25 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane
         .border_style(Style::default().fg(message_border));
     let message_inner = message_block.inner(message_area);
     let composer_width = message_inner.width.max(1) as usize;
-    let composer_lines = if read_only {
-        wrap_composer(
-            "Another Codex session owns this thread. Use /threads to retry.",
-            composer_width,
+    chat.set_composer_width(composer_width);
+    let (composer_lines, cursor_line, cursor_column) = if read_only {
+        (
+            wrap_composer(
+                "Another Codex session owns this thread. Use /threads to retry.",
+                composer_width,
+            ),
+            0,
+            0,
         )
     } else {
-        wrap_composer(&chat.composer, composer_width)
+        let layout = chat.composer_layout();
+        (layout.lines, layout.cursor_line, layout.cursor_column)
     };
     let composer_height = message_inner.height.max(1) as usize;
-    let composer_scroll = composer_lines.len().saturating_sub(composer_height);
-    let cursor_column = composer_lines
-        .last()
-        .map(|line| UnicodeWidthStr::width(line.as_str()))
-        .unwrap_or(0);
+    let composer_scroll = cursor_line
+        .saturating_add(1)
+        .saturating_sub(composer_height)
+        .min(composer_lines.len().saturating_sub(composer_height));
     frame.render_widget(
         Paragraph::new(Text::from(
             composer_lines
@@ -1704,10 +1765,7 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane
             .x
             .saturating_add(u16::try_from(cursor_column).unwrap_or(u16::MAX))
             .min(message_inner.right().saturating_sub(1));
-        let visible_cursor_line = composer_lines
-            .len()
-            .saturating_sub(1)
-            .saturating_sub(composer_scroll);
+        let visible_cursor_line = cursor_line.saturating_sub(composer_scroll);
         let y = message_inner
             .y
             .saturating_add(u16::try_from(visible_cursor_line).unwrap_or(u16::MAX))
@@ -1735,11 +1793,11 @@ fn chat_help(read_only: bool, mode: ChatMode, has_side_chat: bool, active_turn: 
     } else {
         match (mode, has_side_chat) {
             (ChatMode::Input, true) => format!(
-                "INPUT · Ctrl-G pane · Ctrl-N/P side · Enter {}",
+                "INPUT · Shift-Enter newline · Ctrl-G pane · Ctrl-N/P side · Enter {}",
                 if active_turn { "steer" } else { "send" }
             ),
             (ChatMode::Input, false) => format!(
-                "INPUT · Enter {} · / palette · Ctrl-R effort · Ctrl-U clear · Tab scroll · Esc threads",
+                "INPUT · Shift-Enter newline · Enter {} · / palette · Ctrl-R effort · Ctrl-U clear · Tab scroll · Esc threads",
                 if active_turn { "steer" } else { "send" }
             ),
             (ChatMode::Scroll, true) => {
@@ -2963,8 +3021,8 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(64, 28, area);
-    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            open the visible diff hunk in Neovim\ny / Y        copy selected message / full chat\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / remove thread / delete archived thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
+    let popup = centered_rect(64, 31, area);
+    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            open the visible diff hunk in Neovim\ny / Y        copy selected message / full chat\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / remove thread / delete archived thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(help).wrap(Wrap { trim: false }).block(

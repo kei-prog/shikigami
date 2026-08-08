@@ -1,6 +1,8 @@
 use std::{collections::VecDeque, path::PathBuf};
 
 use serde_json::Value;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app_server::{AppServerEvent, SkillMetadata};
 
@@ -249,6 +251,9 @@ pub struct ChatState {
     pub reasoning_effort: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub composer: String,
+    composer_cursor: usize,
+    composer_width: usize,
+    composer_preferred_column: Option<usize>,
     pub active_turn_id: Option<String>,
     pub mode: ChatMode,
     pub selected_message_index: Option<usize>,
@@ -283,6 +288,9 @@ impl ChatState {
             reasoning_effort: None,
             messages: Vec::new(),
             composer: String::new(),
+            composer_cursor: 0,
+            composer_width: 1,
+            composer_preferred_column: None,
             active_turn_id: None,
             mode: ChatMode::Input,
             selected_message_index: None,
@@ -430,6 +438,8 @@ impl ChatState {
 
     pub fn select_skill(&mut self, skill: SkillMetadata) {
         self.composer = format!("${} ", skill.name);
+        self.composer_cursor = self.composer.len();
+        self.composer_preferred_column = None;
         if !self
             .selected_skills
             .iter()
@@ -438,6 +448,133 @@ impl ChatState {
             self.selected_skills.push(skill);
         }
         self.palette = None;
+    }
+
+    pub fn set_composer_width(&mut self, width: usize) {
+        self.composer_width = width.max(1);
+    }
+
+    pub fn composer_layout(&self) -> ComposerLayout {
+        composer_layout(
+            &self.composer,
+            self.composer_cursor.min(self.composer.len()),
+            self.composer_width,
+        )
+    }
+
+    pub fn clear_composer(&mut self) {
+        self.composer.clear();
+        self.composer_cursor = 0;
+        self.composer_preferred_column = None;
+    }
+
+    pub fn insert_composer_char(&mut self, character: char) {
+        self.normalize_composer_cursor();
+        self.composer.insert(self.composer_cursor, character);
+        self.composer_cursor += character.len_utf8();
+        self.composer_preferred_column = None;
+    }
+
+    pub fn insert_composer_newline(&mut self) {
+        self.insert_composer_char('\n');
+    }
+
+    pub fn backspace_composer(&mut self) {
+        self.normalize_composer_cursor();
+        let Some(previous) = previous_grapheme_boundary(&self.composer, self.composer_cursor)
+        else {
+            return;
+        };
+        self.composer.drain(previous..self.composer_cursor);
+        self.composer_cursor = previous;
+        self.composer_preferred_column = None;
+    }
+
+    pub fn delete_composer(&mut self) {
+        self.normalize_composer_cursor();
+        let Some(next) = next_grapheme_boundary(&self.composer, self.composer_cursor) else {
+            return;
+        };
+        self.composer.drain(self.composer_cursor..next);
+        self.composer_preferred_column = None;
+    }
+
+    pub fn move_composer_left(&mut self) {
+        self.normalize_composer_cursor();
+        if let Some(previous) = previous_grapheme_boundary(&self.composer, self.composer_cursor) {
+            self.composer_cursor = previous;
+        }
+        self.composer_preferred_column = None;
+    }
+
+    pub fn move_composer_right(&mut self) {
+        self.normalize_composer_cursor();
+        if let Some(next) = next_grapheme_boundary(&self.composer, self.composer_cursor) {
+            self.composer_cursor = next;
+        }
+        self.composer_preferred_column = None;
+    }
+
+    pub fn move_composer_line_start(&mut self) {
+        self.normalize_composer_cursor();
+        self.composer_cursor = self.composer[..self.composer_cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        self.composer_preferred_column = None;
+    }
+
+    pub fn move_composer_line_end(&mut self) {
+        self.normalize_composer_cursor();
+        self.composer_cursor = self.composer[self.composer_cursor..]
+            .find('\n')
+            .map_or(self.composer.len(), |index| self.composer_cursor + index);
+        self.composer_preferred_column = None;
+    }
+
+    pub fn move_composer_up(&mut self) {
+        self.move_composer_vertical(false);
+    }
+
+    pub fn move_composer_down(&mut self) {
+        self.move_composer_vertical(true);
+    }
+
+    fn move_composer_vertical(&mut self, down: bool) {
+        self.normalize_composer_cursor();
+        let layout = self.composer_layout();
+        let target_line = if down {
+            layout.cursor_line.checked_add(1)
+        } else {
+            layout.cursor_line.checked_sub(1)
+        };
+        let Some(target_line) = target_line.filter(|line| *line < layout.lines.len()) else {
+            return;
+        };
+        let preferred_column = self
+            .composer_preferred_column
+            .unwrap_or(layout.cursor_column);
+        let mut best = None;
+        for boundary in composer_boundaries(&self.composer) {
+            let position = composer_layout(&self.composer, boundary, self.composer_width);
+            if position.cursor_line != target_line {
+                continue;
+            }
+            let distance = position.cursor_column.abs_diff(preferred_column);
+            if best.is_none_or(|(_, best_distance)| distance < best_distance) {
+                best = Some((boundary, distance));
+            }
+        }
+        if let Some((boundary, _)) = best {
+            self.composer_cursor = boundary;
+            self.composer_preferred_column = Some(preferred_column);
+        }
+    }
+
+    fn normalize_composer_cursor(&mut self) {
+        self.composer_cursor = self.composer_cursor.min(self.composer.len());
+        while !self.composer.is_char_boundary(self.composer_cursor) {
+            self.composer_cursor -= 1;
+        }
     }
 
     pub fn skills_for_prompt(&self, prompt: &str) -> Vec<SkillMetadata> {
@@ -927,6 +1064,73 @@ impl ChatState {
             diff_targets: display.targets,
         });
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComposerLayout {
+    pub lines: Vec<String>,
+    pub cursor_line: usize,
+    pub cursor_column: usize,
+}
+
+fn composer_layout(composer: &str, cursor: usize, max_width: usize) -> ComposerLayout {
+    let max_width = max_width.max(1);
+    let cursor = cursor.min(composer.len());
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut width = 0;
+    let mut cursor_position = None;
+
+    for (index, grapheme) in composer.grapheme_indices(true) {
+        if grapheme == "\n" {
+            if index == cursor {
+                cursor_position = Some((lines.len(), width));
+            }
+            lines.push(std::mem::take(&mut current));
+            width = 0;
+            continue;
+        }
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if width + grapheme_width > max_width && !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+            width = 0;
+        }
+        if index == cursor {
+            cursor_position = Some((lines.len(), width));
+        }
+        current.push_str(grapheme);
+        width += grapheme_width;
+    }
+
+    if cursor == composer.len() && width == max_width && !current.is_empty() {
+        lines.push(std::mem::take(&mut current));
+        width = 0;
+    }
+    let cursor_position = cursor_position.unwrap_or((lines.len(), width));
+    lines.push(current);
+    ComposerLayout {
+        lines,
+        cursor_line: cursor_position.0,
+        cursor_column: cursor_position.1,
+    }
+}
+
+fn composer_boundaries(composer: &str) -> impl Iterator<Item = usize> + '_ {
+    std::iter::once(0).chain(
+        composer
+            .grapheme_indices(true)
+            .map(|(index, grapheme)| index + grapheme.len()),
+    )
+}
+
+fn previous_grapheme_boundary(composer: &str, cursor: usize) -> Option<usize> {
+    composer_boundaries(composer)
+        .take_while(|boundary| *boundary < cursor)
+        .last()
+}
+
+fn next_grapheme_boundary(composer: &str, cursor: usize) -> Option<usize> {
+    composer_boundaries(composer).find(|boundary| *boundary > cursor)
 }
 
 fn item_id(item: &Value) -> Option<&str> {
@@ -1617,6 +1821,71 @@ mod tests {
         assert_eq!(chat.composer, "$review ");
         assert_eq!(chat.skills_for_prompt("$review inspect this").len(), 1);
         assert!(chat.skills_for_prompt("inspect this").is_empty());
+    }
+
+    #[test]
+    fn composer_edits_at_the_cursor_without_splitting_graphemes() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        for character in "a🇯🇵b".chars() {
+            chat.insert_composer_char(character);
+        }
+
+        chat.move_composer_left();
+        chat.backspace_composer();
+        chat.insert_composer_char('X');
+        assert_eq!(chat.composer, "aXb");
+
+        chat.delete_composer();
+        assert_eq!(chat.composer, "aX");
+    }
+
+    #[test]
+    fn composer_moves_to_logical_line_boundaries() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        for character in "one\ntwo".chars() {
+            chat.insert_composer_char(character);
+        }
+
+        chat.move_composer_line_start();
+        chat.insert_composer_char('X');
+        chat.move_composer_line_end();
+        chat.insert_composer_char('!');
+
+        assert_eq!(chat.composer, "one\nXtwo!");
+    }
+
+    #[test]
+    fn composer_vertical_movement_follows_wrapped_display_lines() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.set_composer_width(4);
+        for character in "abcdef".chars() {
+            chat.insert_composer_char(character);
+        }
+        assert_eq!(chat.composer_layout().cursor_line, 1);
+
+        chat.move_composer_up();
+        chat.insert_composer_char('X');
+
+        assert_eq!(chat.composer, "abXcdef");
+        assert_eq!(chat.composer_layout().cursor_column, 3);
+    }
+
+    #[test]
+    fn composer_layout_preserves_explicit_newlines_and_wide_characters() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.set_composer_width(4);
+        for character in "日本\n語".chars() {
+            chat.insert_composer_char(character);
+        }
+
+        assert_eq!(
+            chat.composer_layout(),
+            ComposerLayout {
+                lines: vec!["日本".into(), "語".into()],
+                cursor_line: 1,
+                cursor_column: 2,
+            }
+        );
     }
 
     fn event(method: &str, params: Value) -> AppServerEvent {
