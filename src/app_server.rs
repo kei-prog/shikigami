@@ -1,32 +1,36 @@
 use std::{
     collections::HashMap,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::ErrorKind,
-    os::unix::net::UnixStream as StdUnixStream,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use futures::{SinkExt, StreamExt};
+use fs2::FileExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
-    net::UnixStream,
-    process::Command,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::{Child, Command},
     sync::{Mutex, broadcast, mpsc, oneshot},
-    time::{sleep, timeout},
+    task::JoinHandle,
+    time::timeout,
 };
-use tokio_tungstenite::{client_async, tungstenite::Message};
 
 use crate::paths;
 
 type PendingResponses = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+
+enum OutgoingMessage {
+    Json(Value),
+    Shutdown,
+}
 
 #[derive(Clone, Debug)]
 pub struct AppServerEvent {
@@ -80,7 +84,10 @@ struct ModelListResponse {
 }
 
 pub struct AppServer {
-    writer: mpsc::Sender<Value>,
+    writer: mpsc::Sender<OutgoingMessage>,
+    writer_task: Mutex<Option<JoinHandle<()>>>,
+    reader_task: Mutex<Option<JoinHandle<()>>>,
+    child: Mutex<Option<Child>>,
     pending: PendingResponses,
     next_id: AtomicU64,
     events: broadcast::Sender<AppServerEvent>,
@@ -102,21 +109,81 @@ impl AppServer {
         let version = String::from_utf8_lossy(&version_output.stdout)
             .trim()
             .to_owned();
-        let socket_path = ensure_shared_app_server(command).await?;
-        let stream = UnixStream::connect(&socket_path)
-            .await
-            .with_context(|| format!("connect App Server socket {}", socket_path.display()))?;
-        let (socket, _) = client_async("ws://localhost/", stream)
-            .await
-            .context("upgrade App Server Unix socket")?;
-        let (mut socket_writer, mut socket_reader) = socket.split();
-        let (writer, mut writer_rx) = mpsc::channel::<Value>(128);
+        let cache_dir = paths::project_dirs()?.cache_dir().to_path_buf();
+        fs::create_dir_all(&cache_dir).with_context(|| {
+            format!("create App Server cache directory {}", cache_dir.display())
+        })?;
+        let log_path = cache_dir.join("app-server.log");
+        let log = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log_path)
+            .with_context(|| format!("open App Server log {}", log_path.display()))?;
+        let mut child = Command::new(command)
+            .args(["app-server", "--listen", "stdio://"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(log))
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("start {command} app-server"))?;
+        let mut child_stdin = child.stdin.take().context("open App Server stdin")?;
+        let child_stdout = child.stdout.take().context("open App Server stdout")?;
+        let (writer, mut writer_rx) = mpsc::channel::<OutgoingMessage>(128);
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (events, _) = broadcast::channel(1024);
         let (request_tx, request_rx) = mpsc::channel(128);
 
+        let writer_task = tokio::spawn(async move {
+            while let Some(message) = writer_rx.recv().await {
+                match message {
+                    OutgoingMessage::Json(message) => {
+                        let Ok(mut encoded) = serde_json::to_vec(&message) else {
+                            continue;
+                        };
+                        encoded.push(b'\n');
+                        if child_stdin.write_all(&encoded).await.is_err()
+                            || child_stdin.flush().await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    OutgoingMessage::Shutdown => break,
+                }
+            }
+        });
+
+        let reader_pending = Arc::clone(&pending);
+        let reader_events = events.clone();
+        let reader_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(child_stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                dispatch_message(
+                    &reader_pending,
+                    &reader_events,
+                    &request_tx,
+                    line.as_bytes(),
+                )
+                .await;
+            }
+            let mut pending = reader_pending.lock().await;
+            for (_, sender) in pending.drain() {
+                let _ = sender.send(Err("Codex app-server exited".into()));
+            }
+            let _ = reader_events.send(AppServerEvent {
+                method: "shikigami/processExited".into(),
+                params: Value::Null,
+                thread_id: None,
+                turn_id: None,
+            });
+        });
+
         let server = Arc::new(Self {
             writer,
+            writer_task: Mutex::new(Some(writer_task)),
+            reader_task: Mutex::new(Some(reader_task)),
+            child: Mutex::new(Some(child)),
             pending: pending.clone(),
             next_id: AtomicU64::new(1),
             events: events.clone(),
@@ -125,44 +192,10 @@ impl AppServer {
             request_timeout,
         });
 
-        tokio::spawn(async move {
-            while let Some(message) = writer_rx.recv().await {
-                let Ok(encoded) = serde_json::to_string(&message) else {
-                    continue;
-                };
-                if socket_writer
-                    .send(Message::Text(encoded.into()))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-
-        tokio::spawn(async move {
-            while let Some(Ok(frame)) = socket_reader.next().await {
-                let bytes = match frame {
-                    Message::Text(text) => text.as_bytes().to_vec(),
-                    Message::Binary(bytes) => bytes.to_vec(),
-                    Message::Close(_) => break,
-                    _ => continue,
-                };
-                dispatch_message(&pending, &events, &request_tx, &bytes).await;
-            }
-            let mut pending = pending.lock().await;
-            for (_, sender) in pending.drain() {
-                let _ = sender.send(Err("Codex app-server exited".into()));
-            }
-            let _ = events.send(AppServerEvent {
-                method: "shikigami/processExited".into(),
-                params: Value::Null,
-                thread_id: None,
-                turn_id: None,
-            });
-        });
-
-        server.initialize().await?;
+        if let Err(error) = server.initialize().await {
+            let _ = server.shutdown().await;
+            return Err(error);
+        }
         Ok(server)
     }
 
@@ -224,6 +257,28 @@ impl AppServer {
 
     pub async fn respond(&self, id: Value, result: Value) -> Result<()> {
         self.write(&json!({"id": id, "result": result})).await
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        let _ = self.writer.send(OutgoingMessage::Shutdown).await;
+        if let Some(task) = self.writer_task.lock().await.take() {
+            finish_task(task).await;
+        }
+        if let Some(mut child) = self.child.lock().await.take() {
+            match timeout(Duration::from_secs(2), child.wait()).await {
+                Ok(result) => {
+                    result.context("wait for Codex app-server")?;
+                }
+                Err(_) => {
+                    child.start_kill().context("kill Codex app-server")?;
+                    child.wait().await.context("wait for Codex app-server")?;
+                }
+            }
+        }
+        if let Some(task) = self.reader_task.lock().await.take() {
+            finish_task(task).await;
+        }
+        Ok(())
     }
 
     pub async fn list_models(&self) -> Result<Vec<ModelMetadata>> {
@@ -406,7 +461,7 @@ impl AppServer {
 
     async fn write(&self, message: &Value) -> Result<()> {
         self.writer
-            .send(message.clone())
+            .send(OutgoingMessage::Json(message.clone()))
             .await
             .context("write App Server message")
     }
@@ -422,103 +477,45 @@ fn turn_input(prompt: &str, skills: &[SkillMetadata]) -> Vec<Value> {
     input
 }
 
-async fn ensure_shared_app_server(command: &str) -> Result<PathBuf> {
-    let cache_dir = paths::project_dirs()?.cache_dir().to_path_buf();
-    fs::create_dir_all(&cache_dir)
-        .with_context(|| format!("create App Server cache directory {}", cache_dir.display()))?;
-    let socket_path = cache_dir.join("app-server.sock");
-    if socket_is_live(&socket_path) {
-        return Ok(socket_path);
-    }
-    let lock_path = cache_dir.join("app-server-start.lock");
-    let _startup_lock = acquire_startup_lock(&lock_path, &socket_path).await?;
-    if socket_is_live(&socket_path) {
-        return Ok(socket_path);
-    }
-    if socket_path.exists() {
-        fs::remove_file(&socket_path)
-            .with_context(|| format!("remove stale App Server socket {}", socket_path.display()))?;
-    }
-
-    let log_path = cache_dir.join("app-server.log");
-    let log = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&log_path)
-        .with_context(|| format!("open App Server log {}", log_path.display()))?;
-    let stderr = log
-        .try_clone()
-        .with_context(|| format!("clone App Server log {}", log_path.display()))?;
-    let listen = format!("unix://{}", socket_path.display());
-    let mut child = Command::new(command)
-        .args(["app-server", "--listen"])
-        .arg(listen)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(stderr))
-        .kill_on_drop(false)
-        .spawn()
-        .with_context(|| format!("start shared {command} app-server"))?;
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if socket_is_live(&socket_path) {
-            tokio::spawn(async move {
-                let _ = child.wait().await;
-            });
-            return Ok(socket_path);
-        }
-        if child.try_wait()?.is_some() {
-            break;
-        }
-        sleep(Duration::from_millis(25)).await;
-    }
-    bail!(
-        "shared {command} app-server did not start; see {}",
-        log_path.display()
-    )
+#[derive(Debug)]
+pub struct InstanceLock {
+    _file: File,
 }
 
-struct StartupLock(PathBuf);
-
-impl Drop for StartupLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.0);
+impl InstanceLock {
+    pub fn acquire() -> Result<Self> {
+        let cache_dir = paths::project_dirs()?.cache_dir().to_path_buf();
+        fs::create_dir_all(&cache_dir)
+            .with_context(|| format!("create Shikigami cache directory {}", cache_dir.display()))?;
+        Self::acquire_in(&cache_dir)
     }
-}
 
-async fn acquire_startup_lock(lock_path: &Path, socket_path: &Path) -> Result<StartupLock> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match fs::create_dir(lock_path) {
-            Ok(()) => return Ok(StartupLock(lock_path.to_path_buf())),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                if socket_is_live(socket_path) {
-                    continue;
-                }
-                if Instant::now() >= deadline {
-                    fs::remove_dir(lock_path).with_context(|| {
-                        format!(
-                            "remove stale App Server startup lock {}",
-                            lock_path.display()
-                        )
-                    })?;
-                } else {
-                    sleep(Duration::from_millis(25)).await;
-                }
+    fn acquire_in(cache_dir: &Path) -> Result<Self> {
+        let path = cache_dir.join("shikigami.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open Shikigami instance lock {}", path.display()))?;
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                bail!("Shikigami is already running")
             }
             Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("create App Server startup lock {}", lock_path.display())
-                });
+                Err(error).with_context(|| format!("lock Shikigami instance {}", path.display()))
             }
         }
     }
 }
 
-fn socket_is_live(path: &Path) -> bool {
-    StdUnixStream::connect(path).is_ok()
+async fn finish_task(mut task: JoinHandle<()>) {
+    if timeout(Duration::from_secs(1), &mut task).await.is_err() {
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 fn decode_model_list_response(response: Value) -> Result<ModelListResponse> {
@@ -641,7 +638,19 @@ async fn dispatch_response(pending: &PendingResponses, message: &Value) {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
+
+    #[test]
+    fn second_shikigami_instance_is_rejected_until_first_exits() {
+        let directory = tempdir().unwrap();
+        let first = InstanceLock::acquire_in(directory.path()).unwrap();
+        let error = InstanceLock::acquire_in(directory.path()).unwrap_err();
+        assert!(error.to_string().contains("already running"));
+        drop(first);
+        InstanceLock::acquire_in(directory.path()).unwrap();
+    }
 
     #[test]
     fn extracts_thread_ids_from_start_and_fork_responses() {
@@ -747,6 +756,9 @@ mod tests {
         let (_request_tx, request_rx) = mpsc::channel(1);
         let server = Arc::new(AppServer {
             writer,
+            writer_task: Mutex::new(None),
+            reader_task: Mutex::new(None),
+            child: Mutex::new(None),
             pending: pending.clone(),
             next_id: AtomicU64::new(0),
             events,
@@ -763,7 +775,9 @@ mod tests {
                     .await
             }
         });
-        let message = messages.recv().await.unwrap();
+        let OutgoingMessage::Json(message) = messages.recv().await.unwrap() else {
+            panic!("unexpected shutdown message");
+        };
         assert_eq!(message["method"], "turn/steer");
         assert_eq!(message["params"]["threadId"], "thread-1");
         assert_eq!(message["params"]["expectedTurnId"], "turn-1");
@@ -782,7 +796,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires an installed Codex binary"]
-    async fn installed_codex_initializes_over_shared_socket() {
+    async fn installed_codex_initializes_over_stdio() {
         let server = AppServer::spawn("codex", Duration::from_secs(10))
             .await
             .expect("initialize installed Codex App Server");
@@ -796,19 +810,9 @@ mod tests {
             .await
             .expect("list models from installed Codex App Server");
         assert!(!models.is_empty());
-    }
-
-    #[tokio::test]
-    #[ignore = "requires an installed Codex binary"]
-    async fn installed_codex_accepts_multiple_shared_clients() {
-        let first = AppServer::spawn("codex", Duration::from_secs(10))
+        server
+            .shutdown()
             .await
-            .expect("initialize first client");
-        let second = AppServer::spawn("codex", Duration::from_secs(10))
-            .await
-            .expect("initialize second client");
-        assert!(!first.list_models().await.unwrap().is_empty());
-        drop(first);
-        assert!(!second.list_models().await.unwrap().is_empty());
+            .expect("stop installed Codex App Server");
     }
 }

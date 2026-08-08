@@ -41,7 +41,8 @@ results are cached, while the main screen only shows repositories you register.
 - `x`: archive the selected thread, or restore it from the archived view
 - `A`: switch between active and archived threads
 - `!`: show threads that completed, failed, or need approval
-- `d`: unregister a repository or remove a thread from Shikigami only
+- `d`: unregister a repository, remove an active thread from Shikigami only, or
+  permanently delete a thread from the archived view
 - `r`: reload registered repositories and threads
 - `?`: show all keys
 - `q`: quit
@@ -80,13 +81,16 @@ non-primary entries returned by `git worktree list`.
 
 ## Chat runtime
 
-Shikigami starts one local Codex App Server on a private Unix socket when needed,
-then connects every `shi` process to that shared server. Multiple Shikigami
-terminals therefore reuse one App Server instead of competing for the same thread
-store or launching one Codex process each.
+Shikigami allows one interactive `shi` process at a time. It holds an OS file
+lock while running, so a second process exits with a clear already-running error.
+The active process starts a dedicated Codex App Server over stdio and stops that
+child process when Shikigami exits.
 New threads are registered immediately from `thread/start`; existing threads use
 `thread/resume` and `thread/read`. Each connection unsubscribes from its resumed
-threads on exit. Messages, streamed reasoning summaries, plans, command output
+threads on exit. Pressing `q` asks for confirmation when responses started by that
+Shikigami process are still running or temporary side chats remain. Confirming
+interrupts those responses and deletes the temporary chats before exit. Messages,
+streamed reasoning summaries, plans, command output
 tails, tool activity, and approvals stay inside the Shikigami TUI instead of
 opening the Codex terminal UI. App Server stderr is captured instead of being
 written over the terminal interface.
@@ -98,7 +102,7 @@ managed worktree has changes is kept. If an empty thread remains after an
 interrupted session and its temporary App Server thread has expired, opening it
 starts a replacement in the same worktree and updates the stored thread id.
 
-If another, non-shared Codex process already owns a thread, Shikigami keeps the
+If another Codex process already owns a thread, Shikigami keeps the
 history visible using `thread/read` and marks the chat `READ ONLY`. Close the
 other Codex session and select the thread again through `/threads` to retry
 `thread/resume`; a successful retry restores normal input.
@@ -184,6 +188,10 @@ a clean worktree created by Shikigami, Shikigami offers to remove that worktree 
 preserving its branch. Dirty worktrees, primary repositories, and worktrees not
 created by Shikigami are always kept. Restoring an archived thread recreates a
 removed Shikigami worktree from its preserved branch.
+Only archived threads can be permanently deleted. Press `d` in the archived
+view and confirm to delete the Codex history and local Shikigami record. A clean
+Shikigami-managed worktree is removed; deletion is refused while it is dirty.
+User-owned worktrees and the managed branch are preserved.
 
 Repositories can also be listed non-interactively:
 

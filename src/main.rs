@@ -39,7 +39,10 @@ enum RepoCommand {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        None => ui::run(App::load()?).await?,
+        None => {
+            let _instance_lock = app_server::InstanceLock::acquire()?;
+            ui::run(App::load()?).await?
+        }
         Some(Command::Repo { command }) => run_repo_command(command)?,
     }
 

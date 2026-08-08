@@ -41,13 +41,14 @@ pub enum Mode {
     ConfirmRemoveRepository,
     ConfirmRemoveThread,
     ConfirmArchiveCleanup,
+    ConfirmDeleteArchivedThread,
     Chat,
     ChooseModel,
     ChooseReasoningEffort,
     ChooseSideChat,
     ChooseThread,
     Attention,
-    ConfirmQuitSideChats,
+    ConfirmQuit,
     Approval,
     Help,
 }
@@ -152,6 +153,7 @@ pub struct App {
     pub active_chat_pane: ChatPane,
     pub resumed_threads: HashSet<String>,
     pub read_only_threads: HashSet<String>,
+    owned_turns: HashMap<String, String>,
     pub pending_approvals: VecDeque<AppServerRequest>,
     pub attention_items: VecDeque<AttentionItem>,
     pub attention_index: usize,
@@ -245,6 +247,7 @@ impl App {
             active_chat_pane: ChatPane::Main,
             resumed_threads: HashSet::new(),
             read_only_threads: HashSet::new(),
+            owned_turns: HashMap::new(),
             pending_approvals: VecDeque::new(),
             attention_items: VecDeque::new(),
             attention_index: 0,
@@ -716,6 +719,27 @@ impl App {
         self.side_chats_by_parent.values().map(Vec::len).sum()
     }
 
+    pub fn record_owned_turn(&mut self, thread_id: String, turn_id: String) {
+        self.owned_turns.insert(thread_id, turn_id);
+    }
+
+    pub fn owned_turn_count(&self) -> usize {
+        self.owned_turns.len()
+    }
+
+    pub fn owned_turn_targets(&self) -> Vec<(String, String)> {
+        self.owned_turns
+            .iter()
+            .map(|(thread_id, turn_id)| (thread_id.clone(), turn_id.clone()))
+            .collect()
+    }
+
+    pub fn forget_owned_turn(&mut self, thread_id: &str, turn_id: &str) {
+        if self.owned_turns.get(thread_id).map(String::as_str) == Some(turn_id) {
+            self.owned_turns.remove(thread_id);
+        }
+    }
+
     pub fn toggle_chat_pane(&mut self) {
         if self.has_side_chat() {
             self.active_chat_pane = match self.active_chat_pane {
@@ -900,6 +924,19 @@ impl App {
 
     pub fn apply_chat_event(&mut self, event: &AppServerEvent) {
         let thread_id = event.thread_id.clone();
+        if event.method == "turn/completed"
+            && let Some(thread_id) = thread_id.as_deref()
+        {
+            let completed_turn_id = event
+                .params
+                .pointer("/turn/id")
+                .and_then(serde_json::Value::as_str);
+            if completed_turn_id.is_none()
+                || self.owned_turns.get(thread_id).map(String::as_str) == completed_turn_id
+            {
+                self.owned_turns.remove(thread_id);
+            }
+        }
         let was_visible = thread_id
             .as_deref()
             .is_some_and(|thread_id| self.thread_is_visible(thread_id));
@@ -1056,6 +1093,7 @@ impl App {
     pub fn discard_chat(&mut self, thread_id: &str) {
         self.discard_side_chats_for_parent(thread_id);
         self.chats.remove(thread_id);
+        self.owned_turns.remove(thread_id);
         self.attention_items
             .retain(|item| item.thread_id != thread_id);
         self.persist_attention();
@@ -1328,6 +1366,42 @@ impl App {
             )?;
         }
         self.thread_registry.set_archived(&record.id, false)?;
+        self.refresh_current();
+        Ok(())
+    }
+
+    pub fn selected_archived_thread_delete_target(&self) -> Result<ThreadRecord> {
+        let record = self
+            .selected_thread()
+            .map(|thread| thread.record.clone())
+            .context("no thread selected")?;
+        ensure_archived_deletion_context(self.show_archived, &record)?;
+        if record.managed_worktree
+            && record.cwd.is_dir()
+            && !git_workspace::workspace_is_clean(&record.cwd)?
+        {
+            anyhow::bail!("worktree has changes; restore the thread and clean it before deleting");
+        }
+        Ok(record)
+    }
+
+    pub fn complete_archived_thread_deletion(&mut self, thread_id: &str) -> Result<()> {
+        let record = self
+            .threads
+            .iter()
+            .find(|thread| thread.record.id == thread_id)
+            .map(|thread| thread.record.clone())
+            .context("archived thread is no longer selected")?;
+        ensure_archived_deletion_context(self.show_archived, &record)?;
+        if record.managed_worktree && record.cwd.is_dir() {
+            git_workspace::remove_managed_workspace(
+                &record.repository_path,
+                &record.cwd,
+                record.worktree_branch.as_deref(),
+            )?;
+        }
+        self.thread_registry.remove(thread_id)?;
+        self.discard_chat(thread_id);
         self.refresh_current();
         Ok(())
     }
@@ -1958,6 +2032,18 @@ fn thread_picker_matches(
     matches.into_iter().map(|(index, _)| index).collect()
 }
 
+fn ensure_archived_deletion_context(show_archived: bool, record: &ThreadRecord) -> Result<()> {
+    anyhow::ensure!(
+        show_archived,
+        "thread deletion is only available in archived view"
+    );
+    anyhow::ensure!(
+        record.archived_at.is_some(),
+        "only archived threads can be deleted"
+    );
+    Ok(())
+}
+
 fn thread_picker_return_mode(focus: Focus) -> Mode {
     match focus {
         Focus::Navigation => Mode::Normal,
@@ -2237,6 +2323,18 @@ mod tests {
     fn thread_picker_returns_to_its_opening_pane_when_cancelled() {
         assert_eq!(thread_picker_return_mode(Focus::Navigation), Mode::Normal);
         assert_eq!(thread_picker_return_mode(Focus::Chat), Mode::Chat);
+    }
+
+    #[test]
+    fn permanent_deletion_requires_an_archived_thread_in_archived_view() {
+        let mut item = thread("thread-1", "/one");
+
+        assert!(ensure_archived_deletion_context(false, &item.record).is_err());
+        assert!(ensure_archived_deletion_context(true, &item.record).is_err());
+
+        item.record.archived_at = Some(1);
+        assert!(ensure_archived_deletion_context(false, &item.record).is_err());
+        assert!(ensure_archived_deletion_context(true, &item.record).is_ok());
     }
 
     #[test]

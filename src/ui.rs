@@ -62,11 +62,20 @@ pub async fn run(mut app: App) -> Result<()> {
         Ok(models) => app.set_models(models),
         Err(error) => app.message = Some(format!("Could not load models: {error}")),
     }
-    let mut terminal = init_terminal()?;
+    let mut terminal = match init_terminal() {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            let _ = server.shutdown().await;
+            return Err(error);
+        }
+    };
     let result = run_loop(&mut terminal, &mut app, Arc::clone(&server)).await;
     unsubscribe_all_threads(&mut app, &server).await;
-    restore_terminal(&mut terminal)?;
-    result
+    let restore_result = restore_terminal(&mut terminal);
+    let shutdown_result = server.shutdown().await;
+    result?;
+    restore_result?;
+    shutdown_result
 }
 
 fn init_terminal() -> Result<Tui> {
@@ -439,9 +448,9 @@ async fn handle_key(
             KeyCode::Enter => app.activate_selected_attention(),
             _ => {}
         },
-        Mode::ConfirmQuitSideChats => match key.code {
+        Mode::ConfirmQuit => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if cleanup_open_side_chats(app, server).await {
+                if prepare_to_quit(app, server).await {
                     app.should_quit = true;
                 } else {
                     app.mode = Mode::Normal;
@@ -458,7 +467,7 @@ async fn handle_key(
             _ => {}
         },
         Mode::AddRepositories => match key.code {
-            KeyCode::Char('q') if app.repositories.is_empty() => app.should_quit = true,
+            KeyCode::Char('q') if app.repositories.is_empty() => request_quit(app),
             KeyCode::Esc if !app.repositories.is_empty() => app.mode = Mode::Normal,
             KeyCode::Up | KeyCode::Char('k') => app.move_up(),
             KeyCode::Down | KeyCode::Char('j') => app.move_down(),
@@ -569,6 +578,17 @@ async fn handle_key(
             KeyCode::Esc => app.mode = Mode::Normal,
             _ => {}
         },
+        Mode::ConfirmDeleteArchivedThread => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                app.mode = Mode::Normal;
+                app.message = Some(match delete_selected_archived_thread(app, server).await {
+                    Ok(()) => "archived thread permanently deleted".into(),
+                    Err(error) => format!("Could not delete archived thread: {error}"),
+                });
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.mode = Mode::Normal,
+            _ => {}
+        },
         Mode::ConfirmRemoveRepository => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 app.mode = Mode::Normal;
@@ -581,13 +601,7 @@ async fn handle_key(
         },
         Mode::Help => app.mode = Mode::Normal,
         Mode::Normal => match key.code {
-            KeyCode::Char('q') => {
-                if !quit_requires_side_chat_confirmation(app.side_chat_count()) {
-                    app.should_quit = true;
-                } else {
-                    app.mode = Mode::ConfirmQuitSideChats;
-                }
-            }
+            KeyCode::Char('q') => request_quit(app),
             KeyCode::Char('?') => app.mode = Mode::Help,
             KeyCode::Char('!') => app.open_attention(),
             KeyCode::Char('/') => app.open_thread_picker(),
@@ -625,7 +639,14 @@ async fn handle_key(
                 app.mode = Mode::ConfirmRemoveRepository;
             }
             KeyCode::Char('d') if app.selected_tree_is_thread() => {
-                app.mode = Mode::ConfirmRemoveThread;
+                if app.show_archived {
+                    match app.selected_archived_thread_delete_target() {
+                        Ok(_) => app.mode = Mode::ConfirmDeleteArchivedThread,
+                        Err(error) => app.message = Some(error.to_string()),
+                    }
+                } else {
+                    app.mode = Mode::ConfirmRemoveThread;
+                }
             }
             KeyCode::Char('x') if app.selected_tree_is_thread() => {
                 if app.show_archived {
@@ -1011,12 +1032,59 @@ async fn cleanup_open_side_chats(app: &mut App, server: &Arc<AppServer>) -> bool
     }
 }
 
+async fn prepare_to_quit(app: &mut App, server: &Arc<AppServer>) -> bool {
+    if !cleanup_open_side_chats(app, server).await {
+        return false;
+    }
+    interrupt_owned_turns(app, server).await
+}
+
+async fn interrupt_owned_turns(app: &mut App, server: &Arc<AppServer>) -> bool {
+    let mut failures = Vec::new();
+    for (thread_id, turn_id) in app.owned_turn_targets() {
+        match server.interrupt_turn(&thread_id, &turn_id).await {
+            Ok(()) => app.forget_owned_turn(&thread_id, &turn_id),
+            Err(error) if is_inactive_turn_error(&error) => {
+                app.forget_owned_turn(&thread_id, &turn_id);
+            }
+            Err(error) => failures.push(format!("{thread_id}: {error}")),
+        }
+    }
+    if failures.is_empty() {
+        true
+    } else {
+        app.message = Some(format!(
+            "Could not stop {} response(s); quit cancelled",
+            failures.len()
+        ));
+        false
+    }
+}
+
+fn is_inactive_turn_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("no active turn")
+        || message.contains("turn not found")
+        || message.contains("turn is not active")
+}
+
 async fn delete_temporary_thread(server: &Arc<AppServer>, thread_id: &str) -> Result<()> {
     match server.delete_thread(thread_id).await {
         Ok(()) => Ok(()),
         Err(error) if is_missing_thread_error(&error) => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+async fn delete_selected_archived_thread(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
+    let record = app.selected_archived_thread_delete_target()?;
+    match server.delete_thread(&record.id).await {
+        Ok(()) => {}
+        Err(error) if is_missing_thread_history_error(&error) => {}
+        Err(error) => return Err(error),
+    }
+    app.complete_archived_thread_deletion(&record.id)
+        .context("Codex history was deleted, but local cleanup failed")
 }
 
 async fn cleanup_unused_main_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
@@ -1032,6 +1100,13 @@ fn is_missing_thread_error(error: &anyhow::Error) -> bool {
     message.contains("no rollout found for thread id")
         || message.contains("thread not found")
         || message.contains("thread not loaded:")
+        || (message.contains("thread ") && message.contains(" not found"))
+}
+
+fn is_missing_thread_history_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("no rollout found for thread id")
+        || message.contains("thread not found")
         || (message.contains("thread ") && message.contains(" not found"))
 }
 
@@ -1253,6 +1328,7 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
             effort.as_deref(),
         )
         .await?;
+    app.record_owned_turn(thread_id.clone(), turn_id.clone());
     if let Some(chat) = app.chat_mut() {
         let first_side_message = chat.is_side_chat && !chat.side_chat_has_activity;
         chat.composer.clear();
@@ -1414,12 +1490,15 @@ fn render(frame: &mut Frame, app: &mut App) {
         Mode::ConfirmRemoveRepository => render_repository_remove_confirm(frame, area, app),
         Mode::ConfirmRemoveThread => render_remove_confirm(frame, area, app),
         Mode::ConfirmArchiveCleanup => render_archive_confirm(frame, area, app),
+        Mode::ConfirmDeleteArchivedThread => {
+            render_archived_thread_delete_confirm(frame, area, app)
+        }
         Mode::ChooseModel => render_model_picker(frame, area, app),
         Mode::ChooseReasoningEffort => render_reasoning_effort_picker(frame, area, app),
         Mode::ChooseSideChat => render_side_chat_picker(frame, area, app),
         Mode::ChooseThread => render_thread_picker(frame, area, app),
         Mode::Attention => render_attention(frame, area, app),
-        Mode::ConfirmQuitSideChats => render_quit_side_chats_confirm(frame, area, app),
+        Mode::ConfirmQuit => render_quit_confirm(frame, area, app),
         Mode::Help => render_help(frame, area),
         Mode::Normal | Mode::Chat | Mode::Approval => {}
     }
@@ -1954,22 +2033,33 @@ fn render_thread_picker(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(list, popup, &mut state);
 }
 
-fn render_quit_side_chats_confirm(frame: &mut Frame, area: Rect, app: &App) {
-    let count = app.side_chat_count();
-    let popup = centered_rect(64, 7, area);
+fn render_quit_confirm(frame: &mut Frame, area: Rect, app: &App) {
+    let side_chat_count = app.side_chat_count();
+    let turn_count = app.owned_turn_count();
+    let mut warnings = Vec::new();
+    if turn_count > 0 {
+        warnings.push(format!(
+            "• {turn_count} running response{} will be stopped",
+            if turn_count == 1 { "" } else { "s" }
+        ));
+    }
+    if side_chat_count > 0 {
+        warnings.push(format!(
+            "• {side_chat_count} temporary side chat{} will be deleted",
+            if side_chat_count == 1 { "" } else { "s" }
+        ));
+    }
+    let popup = centered_rect(68, u16::try_from(warnings.len()).unwrap_or(2) + 6, area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(format!(
-            "{count} side chat{} will be deleted when Shikigami exits.\n\nQuit? [y/N]",
-            if count == 1 { "" } else { "s" }
-        ))
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .title(" Unsaved side chats ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
-        ),
+        Paragraph::new(format!("{}\n\nStop and quit? [y/N]", warnings.join("\n")))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(" Quit Shikigami ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow)),
+            ),
         popup,
     );
 }
@@ -2527,13 +2617,15 @@ fn render_navigation_tree(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         " Repositories "
     };
+    let mut block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(focus_style(app.focus == Focus::Navigation));
+    if app.show_archived {
+        block = block.title_bottom(Line::from(" x restore · d delete · A active threads "));
+    }
     let list = List::new(items)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(focus_style(app.focus == Focus::Navigation)),
-        )
+        .block(block)
         .highlight_symbol("› ")
         .highlight_style(
             Style::default()
@@ -2766,6 +2858,28 @@ fn render_archive_confirm(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+fn render_archived_thread_delete_confirm(frame: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(76, 10, area);
+    let title = app
+        .selected_thread()
+        .map(|thread| thread.record.title.as_str())
+        .unwrap_or("thread");
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Permanently delete archived thread '{title}'?\n\nCodex history cannot be recovered.\nA clean Shikigami worktree is removed; other worktrees are kept. [y/N]"
+        ))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title(" Delete archived thread ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        ),
+        popup,
+    );
+}
+
 fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
     let height = u16::try_from(
         app.attention_items
@@ -2837,7 +2951,7 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_help(frame: &mut Frame, area: Rect) {
     let popup = centered_rect(64, 28, area);
-    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            open the visible diff hunk in Neovim\ny / Y        copy selected message / full chat\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / remove thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
+    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            open the visible diff hunk in Neovim\ny / Y        copy selected message / full chat\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / remove thread / delete archived thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(help).wrap(Wrap { trim: false }).block(
@@ -2875,8 +2989,16 @@ fn navigation_width(total_width: u16) -> u16 {
         .min(total_width.saturating_sub(20))
 }
 
-fn quit_requires_side_chat_confirmation(side_chat_count: usize) -> bool {
-    side_chat_count > 0
+fn request_quit(app: &mut App) {
+    if quit_requires_confirmation(app.side_chat_count(), app.owned_turn_count()) {
+        app.mode = Mode::ConfirmQuit;
+    } else {
+        app.should_quit = true;
+    }
+}
+
+fn quit_requires_confirmation(side_chat_count: usize, owned_turn_count: usize) -> bool {
+    side_chat_count > 0 || owned_turn_count > 0
 }
 
 fn focus_style(focused: bool) -> Style {
@@ -2900,10 +3022,11 @@ mod tests {
     }
 
     #[test]
-    fn any_remaining_side_chat_requires_quit_confirmation() {
-        assert!(!quit_requires_side_chat_confirmation(0));
-        assert!(quit_requires_side_chat_confirmation(1));
-        assert!(quit_requires_side_chat_confirmation(3));
+    fn running_turns_or_side_chats_require_quit_confirmation() {
+        assert!(!quit_requires_confirmation(0, 0));
+        assert!(quit_requires_confirmation(1, 0));
+        assert!(quit_requires_confirmation(0, 1));
+        assert!(quit_requires_confirmation(3, 2));
     }
 
     #[test]
@@ -2965,6 +3088,19 @@ mod tests {
         )));
         assert!(!is_missing_thread_error(&anyhow::anyhow!(
             "permission denied"
+        )));
+    }
+
+    #[test]
+    fn permanent_deletion_does_not_treat_an_unloaded_thread_as_deleted() {
+        assert!(is_missing_thread_history_error(&anyhow::anyhow!(
+            "no rollout found for thread id test"
+        )));
+        assert!(is_missing_thread_history_error(&anyhow::anyhow!(
+            "thread test not found"
+        )));
+        assert!(!is_missing_thread_history_error(&anyhow::anyhow!(
+            "thread not loaded: test"
         )));
     }
 
