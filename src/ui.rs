@@ -61,7 +61,7 @@ struct ChatPreview {
 }
 
 enum UiAction {
-    OpenEditor { cwd: PathBuf, target: EditorTarget },
+    CopyEditorCommand { cwd: PathBuf, target: EditorTarget },
 }
 
 pub async fn run(mut app: App) -> Result<()> {
@@ -113,20 +113,6 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     Ok(())
 }
 
-fn resume_terminal(terminal: &mut Tui) -> Result<()> {
-    enable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        ClearTerminal(ClearType::All),
-        SetCursorStyle::BlinkingBar,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-        MoveTo(0, 0)
-    )?;
-    terminal.resize(terminal.size()?.into())?;
-    Ok(())
-}
-
 async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> Result<()> {
     let mut inputs = EventStream::new();
     let mut server_events = server.subscribe();
@@ -166,10 +152,15 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                             &preview_sender,
                             &mut preview_task,
                         ).await?;
-                        if let Some(UiAction::OpenEditor { cwd, target }) = action
-                            && let Err(error) = open_in_neovim(terminal, &cwd, &target).await
-                        {
-                            app.message = Some(format!("Could not open Neovim: {error}"));
+                        if let Some(UiAction::CopyEditorCommand { cwd, target }) = action {
+                            app.message = Some(match copy_editor_command(&cwd, &target).await {
+                                Ok(()) => format!(
+                                    "Copied editor command: {}:{}",
+                                    target.path.display(),
+                                    target.line
+                                ),
+                                Err(error) => format!("Could not copy editor command: {error}"),
+                            });
                         }
                         reconcile_thread_subscriptions(app, &server).await;
                         needs_draw = true;
@@ -296,12 +287,10 @@ async fn handle_key(
                 KeyCode::Char('y') => copy_selected_message(app),
                 KeyCode::Char('Y') => copy_conversation(app),
                 KeyCode::Char('e') => {
-                    if app.has_active_turn() {
-                        app.message = Some("Wait for active turns before opening Neovim".into());
-                    } else if let Some(chat) = app.chat()
+                    if let Some(chat) = app.chat()
                         && let Some(target) = chat.visible_editor_target.clone()
                     {
-                        action = Some(UiAction::OpenEditor {
+                        action = Some(UiAction::CopyEditorCommand {
                             cwd: chat.cwd.clone(),
                             target,
                         });
@@ -762,7 +751,7 @@ async fn handle_key(
     Ok(action)
 }
 
-async fn open_in_neovim(terminal: &mut Tui, cwd: &Path, target: &EditorTarget) -> Result<()> {
+async fn copy_editor_command(cwd: &Path, target: &EditorTarget) -> Result<()> {
     let root = cwd
         .canonicalize()
         .with_context(|| format!("workspace does not exist: {}", cwd.display()))?;
@@ -778,20 +767,82 @@ async fn open_in_neovim(terminal: &mut Tui, cwd: &Path, target: &EditorTarget) -
         bail!("file is outside the workspace: {}", path.display());
     }
 
-    restore_terminal(terminal)?;
-    let editor_result = tokio::process::Command::new("nvim")
-        .arg(format!("+{}", target.line))
-        .arg(&path)
+    let output = tokio::process::Command::new("git")
+        .args(["var", "GIT_EDITOR"])
         .current_dir(&root)
-        .status()
-        .await;
-    resume_terminal(terminal)?;
-
-    let status = editor_result.context("could not start nvim")?;
-    if !status.success() {
-        bail!("nvim exited with {status}");
+        .output()
+        .await
+        .context("could not resolve Git editor")?;
+    if !output.status.success() {
+        bail!("git var GIT_EDITOR exited with {}", output.status);
     }
+
+    let editor = String::from_utf8(output.stdout).context("Git editor is not valid UTF-8")?;
+    let editor = editor.trim();
+    if editor.is_empty() {
+        bail!("git var GIT_EDITOR returned an empty editor");
+    }
+    let path = path.to_str().context("file path is not valid UTF-8")?;
+    let command = editor_command(editor, path, target.line);
+    clipboard::copy(&command).context("copy command to clipboard")?;
     Ok(())
+}
+
+fn editor_command(editor: &str, path: &str, line: usize) -> String {
+    let program = editor_program_name(editor);
+    match program.as_str() {
+        "vi" | "vim" | "nvim" | "gvim" | "mvim" => {
+            format!("{editor} +{line} -- {}", shell_quote(path))
+        }
+        "code" | "code-insiders" | "codium" | "cursor" => {
+            format!("{editor} --goto {}", shell_quote(&format!("{path}:{line}")))
+        }
+        "hx" | "helix" | "zed" | "zeditor" | "subl" | "sublime_text" => {
+            format!("{editor} {}", shell_quote(&format!("{path}:{line}")))
+        }
+        "emacs" | "emacsclient" => {
+            format!("{editor} +{line} {}", shell_quote(path))
+        }
+        "nano" => format!("{editor} +{line},1 {}", shell_quote(path)),
+        "notepad++" => format!("{editor} -n{line} {}", shell_quote(path)),
+        "idea" | "clion" | "goland" | "phpstorm" | "pycharm" | "rider" | "rubymine"
+        | "rustrover" | "webstorm" => {
+            format!("{editor} --line {line} {}", shell_quote(path))
+        }
+        _ => format!("{editor} {}", shell_quote(path)),
+    }
+}
+
+fn editor_program_name(editor: &str) -> String {
+    let editor = editor.trim_start();
+    let program = match editor.as_bytes().first() {
+        Some(b'\'') => editor[1..].split('\'').next().unwrap_or_default(),
+        Some(b'"') => editor[1..].split('"').next().unwrap_or_default(),
+        _ => editor.split_whitespace().next().unwrap_or_default(),
+    };
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let lowercase = name.to_ascii_lowercase();
+    lowercase
+        .strip_suffix(".exe")
+        .or_else(|| lowercase.strip_suffix(".cmd"))
+        .or_else(|| lowercase.strip_suffix(".bat"))
+        .unwrap_or(&lowercase)
+        .to_owned()
+}
+
+#[cfg(unix)]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(windows)]
+fn shell_quote(value: &str) -> String {
+    format!("\"{value}\"")
+}
+
+#[cfg(not(any(unix, windows)))]
+fn shell_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\\\""))
 }
 
 async fn open_command_palette(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
@@ -1947,10 +1998,10 @@ fn chat_help(read_only: bool, mode: ChatMode, has_side_chat: bool, active_turn: 
                 if active_turn { "steer" } else { "send" }
             ),
             (ChatMode::Scroll, true) => {
-                "SCROLL · j/k line · J/K msg · e nvim · y copy · i input".into()
+                "SCROLL · j/k line · J/K msg · e editor cmd · y copy · i input".into()
             }
             (ChatMode::Scroll, false) => {
-                "SCROLL · j/k line · J/K msg · e nvim · y/Y copy · u/d half · i input".into()
+                "SCROLL · j/k line · J/K msg · e editor cmd · y/Y copy · u/d half · i input".into()
             }
         }
     };
@@ -3126,7 +3177,7 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_help(frame: &mut Frame, area: Rect) {
     let popup = centered_rect(72, 32, area);
-    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            open the visible diff hunk in Neovim\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / permanently delete thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
+    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / permanently delete thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(help).wrap(Wrap { trim: false }).block(
@@ -3441,6 +3492,53 @@ mod tests {
             codex_resume_command("019-test-thread"),
             "codex resume 019-test-thread"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn editor_commands_use_known_line_number_syntax() {
+        let path = "/tmp/project/file name.rs";
+
+        assert_eq!(
+            editor_command("nvim", path, 42),
+            "nvim +42 -- '/tmp/project/file name.rs'"
+        );
+        assert_eq!(
+            editor_command("code --wait", path, 42),
+            "code --wait --goto '/tmp/project/file name.rs:42'"
+        );
+        assert_eq!(
+            editor_command("zed", path, 42),
+            "zed '/tmp/project/file name.rs:42'"
+        );
+        assert_eq!(
+            editor_command("idea", path, 42),
+            "idea --line 42 '/tmp/project/file name.rs'"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unknown_editor_opens_the_file_without_guessing_line_syntax() {
+        assert_eq!(
+            editor_command("my-editor --reuse", "/tmp/file.rs", 42),
+            "my-editor --reuse '/tmp/file.rs'"
+        );
+    }
+
+    #[test]
+    fn editor_program_name_handles_paths_options_and_windows_extensions() {
+        assert_eq!(editor_program_name("/usr/local/bin/nvim -f"), "nvim");
+        assert_eq!(
+            editor_program_name(r#""C:\Program Files\Microsoft VS Code\bin\code.cmd" --wait"#),
+            "code"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shell_quote_escapes_apostrophes() {
+        assert_eq!(shell_quote("/tmp/it's.rs"), "'/tmp/it'\\''s.rs'");
     }
 
     #[test]

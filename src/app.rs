@@ -800,12 +800,6 @@ impl App {
                 .is_some_and(|chat| chat.active_turn_id.is_some())
     }
 
-    pub fn has_active_turn(&self) -> bool {
-        self.chats
-            .values()
-            .any(|chat| chat.active_turn_id.is_some())
-    }
-
     pub fn mark_thread_opened(&mut self, thread_id: String) {
         self.opened_threads.insert(thread_id.clone());
         self.resumed_threads.insert(thread_id);

@@ -143,10 +143,12 @@ keeps it visible. Press `y` to copy that message without its rendered wrapping
 or borders, or `Y` to copy the full current chat with role labels. Main and side
 chats keep independent selections. Clipboard commands are launched only when a
 copy is requested (`pbcopy` on macOS, with native command fallbacks elsewhere).
-When a diff hunk is visible, `e` temporarily suspends Shikigami and opens Neovim at
-the hunk's new-file line. Exiting Neovim restores the same Shikigami chat and scroll
-position with a full redraw. Paths are resolved inside the thread workspace;
-deleted files and paths outside that workspace are rejected.
+When a diff hunk is visible, `e` copies a command that opens the hunk's new-file
+line in the configured Git editor. Shikigami resolves the editor with
+`git var GIT_EDITOR`, recognizes the line-number syntax of common editors, and
+falls back to opening the file without a line number for unknown editors. Paths
+are resolved inside the thread workspace; deleted files and paths outside that
+workspace are rejected.
 
 Press `/` in the repository tree to open the thread search directly. Press `/`
 in an empty composer to open the command palette. Built-in Shikigami
