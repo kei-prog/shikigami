@@ -40,7 +40,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    app::{App, AttentionKind, ChatPane, Focus, Mode, TreeRow},
+    app::{App, AttentionKind, ChatPane, Focus, Mode, ThreadDeletionPhase, TreeRow},
     app_server::{AppServer, AppServerRequest, TurnSettings},
     chat::{
         ChatMessage, ChatMode, ChatRole, ChatState, CommandPalette, EditorTarget, PaletteCommand,
@@ -48,6 +48,7 @@ use crate::{
     },
     clipboard,
     git_workspace::{self, Workspace},
+    registry::ThreadRecord,
     settings::ExecutionMode,
 };
 
@@ -95,6 +96,15 @@ struct ChatRenderCache {
 
 enum UiAction {
     CopyEditorCommand { cwd: PathBuf, target: EditorTarget },
+    DeleteThread(ThreadRecord),
+}
+
+enum ThreadDeletionEvent {
+    Phase(ThreadDeletionPhase),
+    Finished {
+        thread_id: String,
+        result: std::result::Result<(), String>,
+    },
 }
 
 pub async fn run(mut app: App) -> Result<()> {
@@ -151,6 +161,7 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
     let mut server_events = server.subscribe();
     let preview_generation = Arc::new(AtomicU64::new(0));
     let (preview_sender, mut preview_receiver) = mpsc::unbounded_channel();
+    let (deletion_sender, mut deletion_receiver) = mpsc::unbounded_channel();
     let mut preview_task = None;
     let mut redraw_ticker = tokio::time::interval(REDRAW_INTERVAL);
     redraw_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -174,6 +185,9 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                 if app.visible_chat_has_active_turn() {
                     needs_draw = true;
                 }
+                if app.thread_deletion.is_some() {
+                    needs_draw = true;
+                }
             }
             input = inputs.next() => {
                 match input {
@@ -186,15 +200,25 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                             &preview_sender,
                             &mut preview_task,
                         ).await?;
-                        if let Some(UiAction::CopyEditorCommand { cwd, target }) = action {
-                            app.message = Some(match copy_editor_command(&cwd, &target).await {
-                                Ok(()) => format!(
-                                    "Copied editor command: {}:{}",
-                                    target.path.display(),
-                                    target.line
-                                ),
-                                Err(error) => format!("Could not copy editor command: {error}"),
-                            });
+                        match action {
+                            Some(UiAction::CopyEditorCommand { cwd, target }) => {
+                                app.message = Some(match copy_editor_command(&cwd, &target).await {
+                                    Ok(()) => format!(
+                                        "Copied editor command: {}:{}",
+                                        target.path.display(),
+                                        target.line
+                                    ),
+                                    Err(error) => format!("Could not copy editor command: {error}"),
+                                });
+                            }
+                            Some(UiAction::DeleteThread(record)) => {
+                                spawn_thread_deletion(
+                                    Arc::clone(&server),
+                                    record,
+                                    deletion_sender.clone(),
+                                );
+                            }
+                            None => {}
                         }
                         reconcile_thread_subscriptions(app, &server).await;
                         needs_draw = true;
@@ -232,6 +256,28 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                         Err(error) => app.message = Some(error),
                     }
                     preview_task = None;
+                    needs_draw = true;
+                }
+            }
+            deletion = deletion_receiver.recv() => {
+                if let Some(deletion) = deletion {
+                    match deletion {
+                        ThreadDeletionEvent::Phase(phase) => {
+                            app.set_thread_deletion_phase(phase);
+                        }
+                        ThreadDeletionEvent::Finished { thread_id, result } => {
+                            app.end_thread_deletion();
+                            app.message = Some(match result {
+                                Ok(()) => match app.complete_thread_deletion(&thread_id) {
+                                    Ok(()) => "thread permanently deleted".into(),
+                                    Err(error) => format!(
+                                        "Codex deletion completed, but local registry cleanup failed: {error}"
+                                    ),
+                                },
+                                Err(error) => format!("Could not delete thread: {error}"),
+                            });
+                        }
+                    }
                     needs_draw = true;
                 }
             }
@@ -280,6 +326,9 @@ async fn handle_key(
     preview_sender: &mpsc::UnboundedSender<ChatPreview>,
     preview_task: &mut Option<JoinHandle<()>>,
 ) -> Result<Option<UiAction>> {
+    if app.thread_deletion.is_some() {
+        return Ok(None);
+    }
     let mut action = None;
     match app.mode {
         Mode::Chat if app.chat().is_some_and(|chat| chat.palette.is_some()) => {
@@ -696,15 +745,12 @@ async fn handle_key(
         },
         Mode::ConfirmDeleteThread => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                app.mode = Mode::Normal;
-                app.message = Some(match delete_selected_thread(app, server).await {
-                    Ok(()) => "thread permanently deleted".into(),
-                    Err(error) => format!("Could not delete thread: {error}"),
-                });
+                action = Some(UiAction::DeleteThread(app.begin_thread_deletion()?));
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.mode = Mode::Normal,
             _ => {}
         },
+        Mode::DeletingThread => {}
         Mode::ConfirmRemoveRepository => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 app.mode = Mode::Normal;
@@ -775,7 +821,12 @@ async fn handle_key(
             KeyCode::Char('d') if app.selected_tree_is_repository() => {
                 app.mode = Mode::ConfirmRemoveRepository;
             }
-            KeyCode::Char('d') if app.selected_tree_is_thread() => {
+            KeyCode::Char('d')
+                if permanent_delete_shortcut_available(
+                    app.show_archived,
+                    app.selected_tree_is_thread(),
+                ) =>
+            {
                 match app.selected_thread_delete_target() {
                     Ok(_) => app.mode = Mode::ConfirmDeleteThread,
                     Err(error) => app.message = Some(error.to_string()),
@@ -1323,15 +1374,65 @@ async fn delete_temporary_thread(server: &Arc<AppServer>, thread_id: &str) -> Re
     }
 }
 
-async fn delete_selected_thread(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
-    let record = app.selected_thread_delete_target()?;
+fn spawn_thread_deletion(
+    server: Arc<AppServer>,
+    record: ThreadRecord,
+    sender: mpsc::UnboundedSender<ThreadDeletionEvent>,
+) {
+    tokio::spawn(async move {
+        let thread_id = record.id.clone();
+        let result = perform_thread_deletion(&server, &record, &sender)
+            .await
+            .map_err(|error| error.to_string());
+        let _ = sender.send(ThreadDeletionEvent::Finished { thread_id, result });
+    });
+}
+
+async fn perform_thread_deletion(
+    server: &Arc<AppServer>,
+    record: &ThreadRecord,
+    sender: &mpsc::UnboundedSender<ThreadDeletionEvent>,
+) -> Result<()> {
+    if record.managed_worktree && record.cwd.is_dir() {
+        let cwd = record.cwd.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            anyhow::ensure!(
+                git_workspace::workspace_is_clean(&cwd)?,
+                "worktree has changes; restore the thread and clean it before deleting"
+            );
+            Ok(())
+        })
+        .await
+        .context("check managed worktree task")??;
+    }
+
+    let _ = sender.send(ThreadDeletionEvent::Phase(
+        ThreadDeletionPhase::DeletingHistory,
+    ));
     match server.delete_thread(&record.id).await {
         Ok(()) => {}
         Err(error) if is_missing_thread_history_error(&error) => {}
         Err(error) => return Err(error),
     }
-    app.complete_thread_deletion(&record.id)
-        .context("Codex history was deleted, but local cleanup failed")
+
+    if record.managed_worktree && record.cwd.is_dir() {
+        let _ = sender.send(ThreadDeletionEvent::Phase(
+            ThreadDeletionPhase::RemovingWorktree,
+        ));
+        let repository_path = record.repository_path.clone();
+        let workspace_path = record.cwd.clone();
+        let branch = record.worktree_branch.clone();
+        tokio::task::spawn_blocking(move || {
+            git_workspace::remove_managed_workspace(
+                &repository_path,
+                &workspace_path,
+                branch.as_deref(),
+            )
+        })
+        .await
+        .context("remove managed worktree task")??;
+    }
+    Ok(())
 }
 
 async fn cleanup_unused_main_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
@@ -2084,6 +2185,7 @@ fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
         Mode::ChooseExistingWorktree => render_existing_worktrees(frame, area, app),
         Mode::ConfirmRemoveRepository => render_repository_remove_confirm(frame, area, app),
         Mode::ConfirmDeleteThread => render_thread_delete_confirm(frame, area, app),
+        Mode::DeletingThread => render_thread_deletion_progress(frame, area, app),
         Mode::ChooseModel => render_model_picker(frame, area, app),
         Mode::ChooseReasoningEffort => render_reasoning_effort_picker(frame, area, app),
         Mode::ChoosePermissions => render_permissions_picker(frame, area, app),
@@ -2097,6 +2199,9 @@ fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
     }
     if app.mode == Mode::Approval {
         render_approval(frame, area, app);
+    }
+    if app.thread_deletion.is_some() && app.mode != Mode::DeletingThread {
+        render_thread_deletion_progress(frame, area, app);
     }
 }
 
@@ -3338,7 +3443,7 @@ fn render_navigation_tree(frame: &mut Frame, app: &App, area: Rect) {
     if app.show_archived {
         block = block.title_bottom(Line::from(" x restore · d delete · A active threads "));
     } else {
-        block = block.title_bottom(Line::from(" x archive · d delete · A archived threads "));
+        block = block.title_bottom(Line::from(" x archive · A archived threads "));
     }
     let list = List::new(items)
         .block(block)
@@ -3552,6 +3657,46 @@ fn render_thread_delete_confirm(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+fn render_thread_deletion_progress(frame: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(68, 8, area);
+    let Some(deletion) = app.thread_deletion.as_ref() else {
+        return;
+    };
+    let elapsed = deletion.started_at.elapsed();
+    let spinner = deletion_spinner(elapsed);
+    let phase = match deletion.phase {
+        ThreadDeletionPhase::CheckingWorktree => "Checking managed worktree",
+        ThreadDeletionPhase::DeletingHistory => "Deleting Codex history",
+        ThreadDeletionPhase::RemovingWorktree => "Removing managed worktree",
+    };
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{spinner} {phase}…\n\n{} · {:.1}s elapsed",
+            deletion.title,
+            elapsed.as_secs_f64()
+        ))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title(" Permanently deleting thread ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        ),
+        popup,
+    );
+}
+
+fn deletion_spinner(elapsed: Duration) -> &'static str {
+    const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+    let index = (elapsed.as_millis() / 100) as usize % FRAMES.len();
+    FRAMES[index]
+}
+
+fn permanent_delete_shortcut_available(show_archived: bool, thread_selected: bool) -> bool {
+    show_archived && thread_selected
+}
+
 fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
     let height = u16::try_from(
         app.attention_items
@@ -3624,7 +3769,7 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
 fn render_help(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(72, 34, area);
     let help = format!(
-        "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n/permissions choose Auto or Dangerous execution\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / permanently delete thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {}\nPress any key to close",
+        "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n/permissions choose Auto or Dangerous execution\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / delete archived thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {}\nPress any key to close",
         execution_status(app.execution_mode)
     );
     frame.render_widget(Clear, popup);
@@ -3731,6 +3876,20 @@ mod tests {
         assert_eq!(navigation_width(120), 34);
         assert_eq!(navigation_width(80), 34);
         assert_eq!(navigation_width(30), 10);
+    }
+
+    #[test]
+    fn permanent_delete_shortcut_is_only_available_for_archived_threads() {
+        assert!(!permanent_delete_shortcut_available(false, true));
+        assert!(!permanent_delete_shortcut_available(true, false));
+        assert!(permanent_delete_shortcut_available(true, true));
+    }
+
+    #[test]
+    fn deletion_spinner_advances_every_hundred_milliseconds() {
+        assert_eq!(deletion_spinner(Duration::ZERO), "⠋");
+        assert_eq!(deletion_spinner(Duration::from_millis(100)), "⠙");
+        assert_eq!(deletion_spinner(Duration::from_millis(800)), "⠋");
     }
 
     #[test]
