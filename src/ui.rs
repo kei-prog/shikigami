@@ -32,14 +32,14 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
 use serde_json::{Value, json};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{App, AttentionKind, ChatPane, Focus, Mode, TreeRow},
-    app_server::{AppServer, AppServerEvent, AppServerRequest},
+    app_server::{AppServer, AppServerRequest},
     chat::{
         ChatMessage, ChatMode, ChatRole, ChatState, CommandPalette, EditorTarget, PaletteCommand,
         PaletteEntry,
@@ -60,12 +60,6 @@ struct ChatPreview {
 enum UiAction {
     OpenEditor { cwd: PathBuf, target: EditorTarget },
     OpenCodex { thread_id: String, cwd: PathBuf },
-}
-
-struct AppServerInput {
-    events: broadcast::Receiver<AppServerEvent>,
-    events_open: bool,
-    requests_open: bool,
 }
 
 pub async fn run(mut app: App) -> Result<()> {
@@ -133,11 +127,7 @@ fn resume_terminal(terminal: &mut Tui) -> Result<()> {
 
 async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> Result<()> {
     let mut inputs = EventStream::new();
-    let mut server_input = AppServerInput {
-        events: server.subscribe(),
-        events_open: true,
-        requests_open: true,
-    };
+    let mut server_events = server.subscribe();
     let preview_generation = Arc::new(AtomicU64::new(0));
     let (preview_sender, mut preview_receiver) = mpsc::unbounded_channel();
     let mut redraw_ticker = tokio::time::interval(REDRAW_INTERVAL);
@@ -183,7 +173,6 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                                     terminal,
                                     app,
                                     &server,
-                                    &mut server_input,
                                     &thread_id,
                                     &cwd,
                                 ).await {
@@ -224,26 +213,21 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                     needs_draw = true;
                 }
             }
-            event = server_input.events.recv(), if server_input.events_open => {
-                match handle_app_server_event(app, &server, event).await {
-                    AppServerEventOutcome::Updated => needs_draw = true,
-                    AppServerEventOutcome::Resynced => {
-                        // The fresh history already includes queued events from before the
-                        // resync, so resume from the current broadcast tail.
-                        server_input.events = server.subscribe();
-                        needs_draw = true;
-                    }
-                    AppServerEventOutcome::Closed => {
-                        server_input.events_open = false;
-                        needs_draw = true;
-                    }
+            event = server_events.recv() => {
+                if let Ok(event) = event {
+                    app.apply_chat_event(&event);
+                    needs_draw = true;
                 }
             }
-            request = server.next_server_request(), if server_input.requests_open => {
+            request = server.next_server_request() => {
                 if let Some(request) = request {
-                    needs_draw |= handle_app_server_request(app, &server, request).await?;
-                } else {
-                    server_input.requests_open = false;
+                    if is_approval(&request) {
+                        app.enqueue_approval(request);
+                        app.mode = Mode::Approval;
+                        needs_draw = true;
+                    } else {
+                        server.respond(request.id, Value::Null).await?;
+                    }
                 }
             }
         }
@@ -838,7 +822,6 @@ async fn open_in_codex(
     terminal: &mut Tui,
     app: &mut App,
     server: &Arc<AppServer>,
-    server_input: &mut AppServerInput,
     thread_id: &str,
     cwd: &Path,
 ) -> Result<()> {
@@ -856,44 +839,12 @@ async fn open_in_codex(
     let model = app.chats.get(thread_id).and_then(|chat| chat.model.clone());
 
     restore_terminal(terminal)?;
-    let codex = tokio::process::Command::new("codex")
+    let codex_result = tokio::process::Command::new("codex")
         .arg("resume")
         .arg(thread_id)
         .current_dir(&cwd)
-        .spawn();
-    let mut preserve_app_server_message = false;
-    let codex_result = match codex {
-        Ok(mut codex) => loop {
-            tokio::select! {
-                status = codex.wait() => break status,
-                event = server_input.events.recv(), if server_input.events_open => {
-                    match handle_app_server_event(app, server, event).await {
-                        AppServerEventOutcome::Updated => {}
-                        AppServerEventOutcome::Resynced => {
-                            // Avoid replaying deltas that are already present in the snapshot.
-                            server_input.events = server.subscribe();
-                            preserve_app_server_message = true;
-                        }
-                        AppServerEventOutcome::Closed => {
-                            server_input.events_open = false;
-                            preserve_app_server_message = true;
-                        }
-                    }
-                }
-                request = server.next_server_request(), if server_input.requests_open => {
-                    if let Some(request) = request {
-                        if let Err(error) = handle_app_server_request(app, server, request).await {
-                            app.message = Some(format!("Could not handle App Server request: {error}"));
-                            preserve_app_server_message = true;
-                        }
-                    } else {
-                        server_input.requests_open = false;
-                    }
-                }
-            }
-        },
-        Err(error) => Err(error),
-    };
+        .status()
+        .await;
     let resume_terminal_result = resume_terminal(terminal);
 
     let mut restore_subscription_error = None;
@@ -919,85 +870,15 @@ async fn open_in_codex(
     }
 
     resume_terminal_result?;
-    let status = codex_result.context("run codex")?;
+    let status = codex_result.context("could not start codex")?;
     if !status.success() {
         bail!("codex exited with {status}");
     }
     if let Some(error) = restore_subscription_error {
         bail!("Codex CLI closed, but the thread could not be reopened in shikigami: {error}");
     }
-    if !preserve_app_server_message {
-        app.message = Some(format!("Codex CLI closed for thread {thread_id}"));
-    }
+    app.message = Some(format!("Codex CLI closed for thread {thread_id}"));
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AppServerEventOutcome {
-    Updated,
-    Resynced,
-    Closed,
-}
-
-async fn handle_app_server_event(
-    app: &mut App,
-    server: &Arc<AppServer>,
-    event: std::result::Result<AppServerEvent, broadcast::error::RecvError>,
-) -> AppServerEventOutcome {
-    match event {
-        Ok(event) => {
-            app.apply_chat_event(&event);
-            AppServerEventOutcome::Updated
-        }
-        Err(broadcast::error::RecvError::Lagged(skipped)) => {
-            let failures = resync_resumed_threads(app, server).await;
-            app.message = Some(if failures.is_empty() {
-                format!("Resynced after missing {skipped} App Server event(s)")
-            } else {
-                format!(
-                    "Missed {skipped} App Server event(s); could not resync {} thread(s): {}",
-                    failures.len(),
-                    failures.join("; ")
-                )
-            });
-            AppServerEventOutcome::Resynced
-        }
-        Err(broadcast::error::RecvError::Closed) => {
-            app.message = Some("Codex App Server event stream closed".into());
-            AppServerEventOutcome::Closed
-        }
-    }
-}
-
-async fn resync_resumed_threads(app: &mut App, server: &Arc<AppServer>) -> Vec<String> {
-    let thread_ids = app.resumed_threads.iter().cloned().collect::<Vec<_>>();
-    let reads = thread_ids
-        .iter()
-        .map(|thread_id| async move { (thread_id.clone(), server.read_thread(thread_id).await) });
-    let mut failures = Vec::new();
-    for (thread_id, result) in futures::future::join_all(reads).await {
-        match result {
-            Ok(history) if app.resync_chat_history(&thread_id, &history) => {}
-            Ok(_) => failures.push(format!("{thread_id}: chat is not cached")),
-            Err(error) => failures.push(format!("{thread_id}: {error}")),
-        }
-    }
-    failures
-}
-
-async fn handle_app_server_request(
-    app: &mut App,
-    server: &Arc<AppServer>,
-    request: AppServerRequest,
-) -> Result<bool> {
-    if is_approval(&request) {
-        app.enqueue_approval(request);
-        app.mode = Mode::Approval;
-        Ok(true)
-    } else {
-        server.respond(request.id, Value::Null).await?;
-        Ok(false)
-    }
 }
 
 async fn open_command_palette(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
