@@ -769,13 +769,6 @@ impl App {
             .any(|chat| chat.active_turn_id.is_some())
     }
 
-    pub fn thread_has_active_turn(&self, thread_id: &str) -> bool {
-        self.chats
-            .get(thread_id)
-            .is_some_and(|chat| chat.active_turn_id.is_some())
-            || self.owned_turns.contains_key(thread_id)
-    }
-
     pub fn thread_is_registered(&self, thread_id: &str) -> bool {
         self.threads
             .iter()

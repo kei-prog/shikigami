@@ -59,7 +59,6 @@ struct ChatPreview {
 
 enum UiAction {
     OpenEditor { cwd: PathBuf, target: EditorTarget },
-    OpenCodex { thread_id: String, cwd: PathBuf },
 }
 
 pub async fn run(mut app: App) -> Result<()> {
@@ -162,24 +161,10 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                             &preview_generation,
                             &preview_sender,
                         ).await?;
-                        match action {
-                            Some(UiAction::OpenEditor { cwd, target }) => {
-                                if let Err(error) = open_in_neovim(terminal, &cwd, &target).await {
-                                    app.message = Some(format!("Could not open Neovim: {error}"));
-                                }
-                            }
-                            Some(UiAction::OpenCodex { thread_id, cwd }) => {
-                                if let Err(error) = open_in_codex(
-                                    terminal,
-                                    app,
-                                    &server,
-                                    &thread_id,
-                                    &cwd,
-                                ).await {
-                                    app.message = Some(format!("Could not open Codex CLI: {error}"));
-                                }
-                            }
-                            None => {}
+                        if let Some(UiAction::OpenEditor { cwd, target }) = action
+                            && let Err(error) = open_in_neovim(terminal, &cwd, &target).await
+                        {
+                            app.message = Some(format!("Could not open Neovim: {error}"));
                         }
                         needs_draw = true;
                     }
@@ -510,9 +495,6 @@ async fn handle_key(
                     app.message = Some(format!("Could not open thread: {error}"));
                 }
             }
-            KeyCode::Char('o') if app.thread_picker_query.is_empty() => {
-                action = open_selected_thread_in_codex(app);
-            }
             KeyCode::Char('y') if app.thread_picker_query.is_empty() => {
                 copy_selected_thread_value(app, ThreadCopy::Id);
             }
@@ -723,9 +705,6 @@ async fn handle_key(
                     app.message = Some(error.to_string());
                 }
             }
-            KeyCode::Char('o') if app.selected_tree_is_thread() => {
-                action = open_selected_thread_in_codex(app);
-            }
             KeyCode::Char('y') if app.selected_tree_is_thread() => {
                 copy_selected_thread_value(app, ThreadCopy::Id);
             }
@@ -818,69 +797,6 @@ async fn open_in_neovim(terminal: &mut Tui, cwd: &Path, target: &EditorTarget) -
     Ok(())
 }
 
-async fn open_in_codex(
-    terminal: &mut Tui,
-    app: &mut App,
-    server: &Arc<AppServer>,
-    thread_id: &str,
-    cwd: &Path,
-) -> Result<()> {
-    let cwd = cwd
-        .canonicalize()
-        .with_context(|| format!("workspace does not exist: {}", cwd.display()))?;
-    let was_resumed = app.resumed_threads.contains(thread_id);
-    if was_resumed {
-        server
-            .unsubscribe_thread(thread_id)
-            .await
-            .context("release thread before starting Codex CLI")?;
-        app.resumed_threads.remove(thread_id);
-    }
-    let model = app.chats.get(thread_id).and_then(|chat| chat.model.clone());
-
-    restore_terminal(terminal)?;
-    let codex_result = tokio::process::Command::new("codex")
-        .arg("resume")
-        .arg(thread_id)
-        .current_dir(&cwd)
-        .status()
-        .await;
-    let resume_terminal_result = resume_terminal(terminal);
-
-    let mut restore_subscription_error = None;
-    if was_resumed {
-        match server
-            .resume_thread(thread_id, &cwd, model.as_deref())
-            .await
-        {
-            Ok(()) => {
-                app.resumed_threads.insert(thread_id.to_owned());
-                app.set_thread_read_only(thread_id, false);
-            }
-            Err(error) => {
-                app.set_thread_read_only(thread_id, true);
-                restore_subscription_error = Some(error);
-            }
-        }
-    }
-    if let Ok(history) = server.read_thread(thread_id).await
-        && let Some(chat) = app.chats.get_mut(thread_id)
-    {
-        chat.load_history(&history);
-    }
-
-    resume_terminal_result?;
-    let status = codex_result.context("could not start codex")?;
-    if !status.success() {
-        bail!("codex exited with {status}");
-    }
-    if let Some(error) = restore_subscription_error {
-        bail!("Codex CLI closed, but the thread could not be reopened in shikigami: {error}");
-    }
-    app.message = Some(format!("Codex CLI closed for thread {thread_id}"));
-    Ok(())
-}
-
 async fn open_command_palette(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     let Some(chat) = app.chat() else {
         return Ok(());
@@ -941,30 +857,17 @@ enum ThreadCopy {
     ResumeCommand,
 }
 
-fn selected_thread_action_target(app: &App) -> Option<(String, PathBuf)> {
+fn selected_thread_action_id(app: &App) -> Option<String> {
     let thread = match app.mode {
         Mode::ChooseThread => app.selected_thread_picker(),
         Mode::Normal if app.selected_tree_is_thread() => app.selected_thread(),
         _ => None,
     }?;
-    Some((thread.record.id.clone(), thread.record.cwd.clone()))
-}
-
-fn open_selected_thread_in_codex(app: &mut App) -> Option<UiAction> {
-    let Some((thread_id, cwd)) = selected_thread_action_target(app) else {
-        app.message = Some("No thread selected".into());
-        return None;
-    };
-    if app.thread_has_active_turn(&thread_id) {
-        app.message =
-            Some("Stop the running response before opening this thread in Codex CLI".into());
-        return None;
-    }
-    Some(UiAction::OpenCodex { thread_id, cwd })
+    Some(thread.record.id.clone())
 }
 
 fn copy_selected_thread_value(app: &mut App, value: ThreadCopy) {
-    let Some((thread_id, _)) = selected_thread_action_target(app) else {
+    let Some(thread_id) = selected_thread_action_id(app) else {
         app.message = Some("No thread selected".into());
         return;
     };
@@ -2243,7 +2146,7 @@ fn render_thread_picker(frame: &mut Frame, area: Rect, app: &App) {
             Block::default()
                 .title(title)
                 .title_bottom(Line::from(
-                    " type filter · ↑/↓ · Enter open · o CLI · y ID · Y command · Esc ",
+                    " type filter · ↑/↓ · Enter open · y ID · Y command · Esc ",
                 ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
@@ -3179,8 +3082,8 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(72, 33, area);
-    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            open the visible diff hunk in Neovim\no            open selected thread in Codex CLI\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / remove thread / delete archived thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
+    let popup = centered_rect(72, 32, area);
+    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            open the visible diff hunk in Neovim\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / remove thread / delete archived thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(help).wrap(Wrap { trim: false }).block(
