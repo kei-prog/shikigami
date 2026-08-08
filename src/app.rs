@@ -152,6 +152,7 @@ pub struct App {
     pub thread_picker_original_focus: Focus,
     pub active_chat_pane: ChatPane,
     pub resumed_threads: HashSet<String>,
+    opened_threads: HashSet<String>,
     pub read_only_threads: HashSet<String>,
     owned_turns: HashMap<String, String>,
     pub pending_approvals: VecDeque<AppServerRequest>,
@@ -246,6 +247,7 @@ impl App {
             thread_picker_original_focus: Focus::Navigation,
             active_chat_pane: ChatPane::Main,
             resumed_threads: HashSet::new(),
+            opened_threads: HashSet::new(),
             read_only_threads: HashSet::new(),
             owned_turns: HashMap::new(),
             pending_approvals: VecDeque::new(),
@@ -360,6 +362,7 @@ impl App {
         self.attention_items
             .retain(|item| item.thread_id != thread_id);
         self.resumed_threads.remove(thread_id);
+        self.opened_threads.remove(thread_id);
         let mut remove_parent = false;
         if let Some(side_chats) = self.side_chats_by_parent.get_mut(&parent_thread_id) {
             let removed_index = side_chats.iter().position(|id| id == thread_id);
@@ -769,6 +772,32 @@ impl App {
             .any(|chat| chat.active_turn_id.is_some())
     }
 
+    pub fn mark_thread_opened(&mut self, thread_id: String) {
+        self.opened_threads.insert(thread_id.clone());
+        self.resumed_threads.insert(thread_id);
+    }
+
+    pub fn mark_thread_unsubscribed(&mut self, thread_id: &str) {
+        self.resumed_threads.remove(thread_id);
+        if !self.chats.contains_key(thread_id) {
+            self.opened_threads.remove(thread_id);
+        }
+    }
+
+    pub fn forget_thread_subscription(&mut self, thread_id: &str) {
+        self.resumed_threads.remove(thread_id);
+        self.opened_threads.remove(thread_id);
+    }
+
+    pub fn thread_subscription_targets(&self) -> HashSet<String> {
+        thread_subscription_targets(
+            self.visible_chat_id.as_deref(),
+            self.side_chat_id.as_deref(),
+            &self.opened_threads,
+            &self.chats,
+            &self.owned_turns,
+        )
+    }
     pub fn thread_is_registered(&self, thread_id: &str) -> bool {
         self.threads
             .iter()
@@ -1103,7 +1132,6 @@ impl App {
         self.attention_items
             .retain(|item| item.thread_id != thread_id);
         self.persist_attention();
-        self.resumed_threads.remove(thread_id);
         self.read_only_threads.remove(thread_id);
         if self.visible_chat_id.as_deref() == Some(thread_id) {
             self.visible_chat_id = None;
@@ -1237,7 +1265,6 @@ impl App {
                 .retain(|item| !side_chats.contains(&item.thread_id));
             for thread_id in side_chats {
                 self.chats.remove(&thread_id);
-                self.resumed_threads.remove(&thread_id);
             }
             self.clamp_attention_index();
         }
@@ -1881,6 +1908,7 @@ impl App {
             self.visible_chat_id = Some(new_thread_id.clone());
         }
         self.resumed_threads.remove(old_thread_id);
+        self.opened_threads.remove(old_thread_id);
         self.read_only_threads.remove(old_thread_id);
         Ok(())
     }
@@ -2102,6 +2130,27 @@ fn thread_picker_return_mode(focus: Focus) -> Mode {
     }
 }
 
+fn thread_subscription_targets(
+    visible_chat_id: Option<&str>,
+    side_chat_id: Option<&str>,
+    opened_threads: &HashSet<String>,
+    chats: &HashMap<String, ChatState>,
+    owned_turns: &HashMap<String, String>,
+) -> HashSet<String> {
+    opened_threads
+        .iter()
+        .filter(|thread_id| {
+            visible_chat_id == Some(thread_id.as_str())
+                || side_chat_id == Some(thread_id.as_str())
+                || chats
+                    .get(thread_id.as_str())
+                    .is_some_and(|chat| chat.active_turn_id.is_some())
+                || owned_turns.contains_key(thread_id.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
 fn preferred_reasoning_effort(model: &ModelMetadata) -> Option<&str> {
     model
         .supported_reasoning_efforts
@@ -2266,6 +2315,53 @@ mod tests {
         assert_eq!(cycle_index(2, 3, false), 1);
         assert_eq!(cycle_index(0, 3, false), 2);
         assert_eq!(cycle_index(0, 0, true), 0);
+    }
+
+    #[test]
+    fn subscriptions_keep_visible_and_running_opened_threads_only() {
+        let mut chats = HashMap::from([
+            (
+                "visible".into(),
+                ChatState::new("visible".into(), "/repo".into(), "visible".into()),
+            ),
+            (
+                "running".into(),
+                ChatState::new("running".into(), "/repo".into(), "running".into()),
+            ),
+            (
+                "idle".into(),
+                ChatState::new("idle".into(), "/repo".into(), "idle".into()),
+            ),
+            (
+                "preview".into(),
+                ChatState::new("preview".into(), "/repo".into(), "preview".into()),
+            ),
+        ]);
+        chats
+            .get_mut("running")
+            .expect("running chat")
+            .active_turn_id = Some("turn-1".into());
+        let opened = HashSet::from(["visible".into(), "running".into(), "idle".into()]);
+
+        assert_eq!(
+            thread_subscription_targets(Some("visible"), None, &opened, &chats, &HashMap::new()),
+            HashSet::from(["visible".into(), "running".into()])
+        );
+    }
+
+    #[test]
+    fn owned_background_turn_remains_a_subscription_target() {
+        let chats = HashMap::from([(
+            "background".into(),
+            ChatState::new("background".into(), "/repo".into(), "background".into()),
+        )]);
+        let opened = HashSet::from(["background".into()]);
+        let owned = HashMap::from([("background".into(), "turn-1".into())]);
+
+        assert_eq!(
+            thread_subscription_targets(None, None, &opened, &chats, &owned),
+            HashSet::from(["background".into()])
+        );
     }
 
     #[test]

@@ -166,6 +166,7 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                         {
                             app.message = Some(format!("Could not open Neovim: {error}"));
                         }
+                        reconcile_thread_subscriptions(app, &server).await;
                         needs_draw = true;
                     }
                     Some(Ok(Event::Resize(_, _))) => {
@@ -192,6 +193,7 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                             } else {
                                 app.chats.entry(thread_id).or_insert(chat);
                             }
+                            reconcile_thread_subscriptions(app, &server).await;
                         }
                         Err(error) => app.message = Some(error),
                     }
@@ -201,6 +203,7 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
             event = server_events.recv() => {
                 if let Ok(event) = event {
                     app.apply_chat_event(&event);
+                    reconcile_thread_subscriptions(app, &server).await;
                     needs_draw = true;
                 }
             }
@@ -1055,10 +1058,10 @@ async fn open_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     }
     side_chat.load_history(&history);
     side_chat.mark_as_side_chat();
-    app.resumed_threads.insert(side_thread_id.clone());
+    app.mark_thread_opened(side_thread_id.clone());
     if let Err(error) = app.show_side_chat(parent_thread_id, side_chat) {
         let cleanup = server.delete_thread(&side_thread_id).await;
-        app.resumed_threads.remove(&side_thread_id);
+        app.forget_thread_subscription(&side_thread_id);
         app.message = Some(match cleanup {
             Ok(()) => format!("Could not track side chat: {error}"),
             Err(cleanup_error) => format!(
@@ -1287,7 +1290,7 @@ async fn open_new_chat(app: &mut App, server: &Arc<AppServer>, workspace: Worksp
         )
         .await?;
     app.register_app_server_thread(thread_id.clone(), workspace.path.clone())?;
-    app.resumed_threads.insert(thread_id.clone());
+    app.mark_thread_opened(thread_id.clone());
     let mut chat = ChatState::new(thread_id, workspace.path, "Untitled thread".into());
     if let Some((model, display_name, effort)) = model_settings {
         chat.set_model(model, display_name, effort);
@@ -1382,7 +1385,7 @@ async fn focus_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result<(
             .await
         {
             Ok(()) => {
-                app.resumed_threads.insert(thread_id.clone());
+                app.mark_thread_opened(thread_id.clone());
                 app.set_thread_read_only(&thread_id, false);
             }
             Err(error) if is_active_writer_conflict(&error) => {
@@ -1399,7 +1402,7 @@ async fn focus_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result<(
                     let _ = server.unsubscribe_thread(&replacement_id).await;
                     return Err(error);
                 }
-                app.resumed_threads.insert(replacement_id.clone());
+                app.mark_thread_opened(replacement_id.clone());
                 app.set_thread_read_only(&replacement_id, false);
             }
             Err(error) => return Err(error),
@@ -1472,6 +1475,72 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
         app.update_thread_title(&thread_id, &prompt)?;
     }
     Ok(())
+}
+
+async fn reconcile_thread_subscriptions(app: &mut App, server: &Arc<AppServer>) {
+    let targets = app.thread_subscription_targets();
+    let mut releases = app
+        .resumed_threads
+        .difference(&targets)
+        .cloned()
+        .collect::<Vec<_>>();
+    releases.sort();
+    for thread_id in releases {
+        match server.unsubscribe_thread(&thread_id).await {
+            Ok(()) => app.mark_thread_unsubscribed(&thread_id),
+            Err(error) => {
+                app.message = Some(format!(
+                    "Could not release background thread {thread_id}: {error}"
+                ));
+            }
+        }
+    }
+
+    let mut acquisitions = targets
+        .difference(&app.resumed_threads)
+        .filter(|thread_id| !app.read_only_threads.contains(thread_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    acquisitions.sort();
+    for thread_id in acquisitions {
+        let Some((cwd, model)) = app
+            .chats
+            .get(&thread_id)
+            .map(|chat| (chat.cwd.clone(), chat.model.clone()))
+        else {
+            continue;
+        };
+        match server
+            .resume_thread(&thread_id, &cwd, model.as_deref())
+            .await
+        {
+            Ok(()) => {
+                app.mark_thread_opened(thread_id.clone());
+                app.set_thread_read_only(&thread_id, false);
+                match server.read_thread(&thread_id).await {
+                    Ok(history) => {
+                        if let Some(chat) = app.chats.get_mut(&thread_id) {
+                            chat.load_history(&history);
+                        }
+                    }
+                    Err(error) => {
+                        app.message = Some(format!(
+                            "Reopened thread {thread_id}, but could not refresh it: {error}"
+                        ));
+                    }
+                }
+            }
+            Err(error) if is_active_writer_conflict(&error) => {
+                app.set_thread_read_only(&thread_id, true);
+                app.message = Some(format!(
+                    "Thread {thread_id} is now read-only because another Codex session owns it"
+                ));
+            }
+            Err(error) => {
+                app.message = Some(format!("Could not reopen thread {thread_id}: {error}"));
+            }
+        }
+    }
 }
 
 async fn unsubscribe_all_threads(app: &mut App, server: &Arc<AppServer>) {
