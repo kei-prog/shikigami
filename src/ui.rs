@@ -30,6 +30,7 @@ use ratatui::{
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -45,6 +46,8 @@ use crate::{
 };
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
+
+const REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 
 struct ChatPreview {
     generation: u64,
@@ -120,14 +123,19 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
     let mut server_events = server.subscribe();
     let preview_generation = Arc::new(AtomicU64::new(0));
     let (preview_sender, mut preview_receiver) = mpsc::unbounded_channel();
+    let mut redraw_ticker = tokio::time::interval(REDRAW_INTERVAL);
+    redraw_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     let mut needs_draw = true;
     while !app.should_quit {
-        if needs_draw {
-            terminal.draw(|frame| render(frame, app))?;
-            needs_draw = false;
-        }
         tokio::select! {
+            _ = redraw_ticker.tick() => {
+                if needs_draw {
+                    terminal.draw(|frame| render(frame, app))?;
+                    needs_draw = false;
+                    redraw_ticker.reset();
+                }
+            }
             _ = ticker.tick() => {
                 if app.scanning {
                     app.poll_scan();
