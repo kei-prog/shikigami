@@ -1,10 +1,16 @@
-use std::{collections::VecDeque, path::PathBuf};
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use serde_json::Value;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app_server::{AppServerEvent, SkillMetadata};
+
+static NEXT_RENDER_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChatRole {
@@ -233,11 +239,20 @@ pub struct ChatMessage {
     pub content: String,
     item_id: Option<String>,
     diff_targets: Vec<DiffTarget>,
+    render_revision: u64,
 }
 
 impl ChatMessage {
     pub fn diff_targets(&self) -> &[DiffTarget] {
         &self.diff_targets
+    }
+
+    pub fn render_revision(&self) -> u64 {
+        self.render_revision
+    }
+
+    fn mark_render_changed(&mut self) {
+        self.render_revision = self.render_revision.wrapping_add(1);
     }
 }
 
@@ -276,6 +291,7 @@ pub struct ChatState {
     interrupt_requested: bool,
     message_selection_scroll_pending: bool,
     history_complete: bool,
+    render_generation: u64,
 }
 
 impl ChatState {
@@ -314,6 +330,7 @@ impl ChatState {
             interrupt_requested: false,
             message_selection_scroll_pending: false,
             history_complete: true,
+            render_generation: NEXT_RENDER_GENERATION.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -327,6 +344,10 @@ impl ChatState {
 
     pub fn history_is_complete(&self) -> bool {
         self.history_complete
+    }
+
+    pub fn render_generation(&self) -> u64 {
+        self.render_generation
     }
 
     pub fn set_model(
@@ -358,6 +379,7 @@ impl ChatState {
     }
 
     pub fn load_history(&mut self, response: &Value) {
+        self.render_generation = NEXT_RENDER_GENERATION.fetch_add(1, Ordering::Relaxed);
         self.messages.clear();
         self.active_turn_id = None;
         self.streaming_message = None;
@@ -437,6 +459,7 @@ impl ChatState {
             content: prompt.clone(),
             item_id: None,
             diff_targets: Vec::new(),
+            render_revision: 0,
         });
         self.pending_user_message = Some(prompt);
         self.selected_skills.clear();
@@ -605,6 +628,7 @@ impl ChatState {
             content,
             item_id: None,
             diff_targets: Vec::new(),
+            render_revision: 0,
         });
     }
 
@@ -773,10 +797,12 @@ impl ChatState {
                         content: String::new(),
                         item_id: None,
                         diff_targets: Vec::new(),
+                        render_revision: 0,
                     });
                     self.messages.len() - 1
                 });
                 self.messages[index].content.push_str(delta);
+                self.messages[index].mark_render_changed();
             }
             "item/commandExecution/outputDelta" => {
                 self.waiting_for_activity = false;
@@ -810,6 +836,7 @@ impl ChatState {
                             && let Some(text) = item.get("text").and_then(Value::as_str)
                         {
                             self.messages[index].content = text.to_owned();
+                            self.messages[index].mark_render_changed();
                         } else {
                             self.push_completed_item(item);
                         }
@@ -845,6 +872,7 @@ impl ChatState {
                     content: message.to_owned(),
                     item_id: None,
                     diff_targets: Vec::new(),
+                    render_revision: 0,
                 });
             }
             _ => {}
@@ -880,6 +908,7 @@ impl ChatState {
                         content,
                         item_id: None,
                         diff_targets: Vec::new(),
+                        render_revision: 0,
                     });
                 }
             }
@@ -890,6 +919,7 @@ impl ChatState {
                         content: text.to_owned(),
                         item_id: None,
                         diff_targets: Vec::new(),
+                        render_revision: 0,
                     });
                 }
             }
@@ -987,6 +1017,7 @@ impl ChatState {
             .unwrap_or("");
         self.messages[index].content =
             format!("{header}\n{}", output_tail(&format!("{previous}{delta}")));
+        self.messages[index].mark_render_changed();
     }
 
     fn append_reasoning_summary(&mut self, item_id: &str, delta: &str) {
@@ -1000,6 +1031,7 @@ impl ChatState {
             .unwrap_or_default();
         let summary = compact(&format!("{previous}{delta}"), 800);
         self.messages[index].content = format!("Thinking…\n{summary}");
+        self.messages[index].mark_render_changed();
     }
 
     fn update_plan(&mut self, params: &Value) {
@@ -1049,6 +1081,7 @@ impl ChatState {
             && let Some(index) = self.activity_index(item_id)
         {
             self.messages[index].content = content;
+            self.messages[index].mark_render_changed();
             return;
         }
         self.messages.push(ChatMessage {
@@ -1056,6 +1089,7 @@ impl ChatState {
             content,
             item_id: item_id.map(str::to_owned),
             diff_targets: Vec::new(),
+            render_revision: 0,
         });
     }
 
@@ -1069,6 +1103,7 @@ impl ChatState {
             self.messages[index].role = ChatRole::Diff;
             self.messages[index].content = display.content;
             self.messages[index].diff_targets = display.targets;
+            self.messages[index].mark_render_changed();
             return;
         }
         self.messages.push(ChatMessage {
@@ -1076,6 +1111,7 @@ impl ChatState {
             content: display.content,
             item_id: item_id.map(str::to_owned),
             diff_targets: display.targets,
+            render_revision: 0,
         });
     }
 }
@@ -1703,6 +1739,7 @@ mod tests {
             content: String::new(),
             item_id: None,
             diff_targets: Vec::new(),
+            render_revision: 0,
         });
         chat.push_notice("last".into());
 
@@ -1753,6 +1790,7 @@ mod tests {
             content: "answer\nsecond line".into(),
             item_id: None,
             diff_targets: Vec::new(),
+            render_revision: 0,
         });
 
         assert_eq!(

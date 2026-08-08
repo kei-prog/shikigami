@@ -60,6 +60,18 @@ struct ChatPreview {
     result: std::result::Result<ChatState, String>,
 }
 
+#[derive(Default)]
+struct RenderCache {
+    chats: HashMap<String, ChatRenderCache>,
+}
+
+#[derive(Default)]
+struct ChatRenderCache {
+    generation: u64,
+    width: usize,
+    messages: Vec<Option<CachedRenderedMessage>>,
+}
+
 enum UiAction {
     CopyEditorCommand { cwd: PathBuf, target: EditorTarget },
 }
@@ -122,12 +134,13 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
     let mut redraw_ticker = tokio::time::interval(REDRAW_INTERVAL);
     redraw_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
+    let mut render_cache = RenderCache::default();
     let mut needs_draw = true;
     while !app.should_quit {
         tokio::select! {
             _ = redraw_ticker.tick() => {
                 if needs_draw {
-                    terminal.draw(|frame| render(frame, app))?;
+                    terminal.draw(|frame| render(frame, app, &mut render_cache))?;
                     needs_draw = false;
                     redraw_ticker.reset();
                 }
@@ -1707,7 +1720,11 @@ async fn resolve_approval(app: &mut App, server: &Arc<AppServer>, accept: bool) 
     Ok(())
 }
 
-fn render(frame: &mut Frame, app: &mut App) {
+fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
+    render_cache.chats.retain(|thread_id, _| {
+        app.visible_chat_id.as_deref() == Some(thread_id)
+            || app.side_chat_id.as_deref() == Some(thread_id)
+    });
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1775,7 +1792,7 @@ fn render(frame: &mut Frame, app: &mut App) {
         .constraints([Constraint::Length(navigation_width), Constraint::Min(20)])
         .split(chunks[1]);
     render_navigation_tree(frame, app, panes[0]);
-    render_chat_area(frame, panes[1], app);
+    render_chat_area(frame, panes[1], app, render_cache);
 
     let default_status = if app.attention_count() > 0 {
         format!(
@@ -1813,20 +1830,26 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn render_chat_area(frame: &mut Frame, area: Rect, app: &mut App) {
+fn render_chat_area(frame: &mut Frame, area: Rect, app: &mut App, render_cache: &mut RenderCache) {
     if app.has_side_chat() {
         let panes = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(area);
-        render_chat_pane(frame, panes[0], app, ChatPane::Main);
-        render_chat_pane(frame, panes[1], app, ChatPane::Side);
+        render_chat_pane(frame, panes[0], app, ChatPane::Main, render_cache);
+        render_chat_pane(frame, panes[1], app, ChatPane::Side, render_cache);
     } else {
-        render_chat_pane(frame, area, app, ChatPane::Main);
+        render_chat_pane(frame, area, app, ChatPane::Main, render_cache);
     }
 }
 
-fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane) {
+fn render_chat_pane(
+    frame: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    pane: ChatPane,
+    render_cache: &mut RenderCache,
+) {
     let pane_active = app.active_chat_pane == pane;
     let chat_focused = app.focus == Focus::Chat && pane_active;
     let has_side_chat = app.has_side_chat();
@@ -1915,13 +1938,17 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane
     let text_width = chat_block.inner(chat_area).width.max(1);
     let RenderedChat {
         lines,
+        height,
         selected_range,
         editor_targets,
-    } = rendered_chat(chat, text_width as usize);
+    } = rendered_chat_cached(
+        chat,
+        text_width as usize,
+        render_cache.chats.entry(chat_id).or_default(),
+    );
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-    let total_lines = paragraph.line_count(text_width);
     let paragraph = paragraph.block(chat_block);
-    chat.update_scroll_metrics(total_lines, visible_height);
+    chat.update_scroll_metrics(height, visible_height);
     if chat.take_message_selection_scroll_request()
         && let Some((start, end)) = selected_range
     {
@@ -2372,9 +2399,17 @@ fn render_quit_confirm(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+#[derive(Clone)]
 struct RenderedMessage {
     lines: Vec<Line<'static>>,
     editor_targets: Vec<(usize, EditorTarget)>,
+}
+
+#[derive(Clone)]
+struct CachedRenderedMessage {
+    revision: u64,
+    message: RenderedMessage,
+    height: usize,
 }
 
 fn chat_message_lines(
@@ -2418,11 +2453,29 @@ fn chat_message_lines(
 
 struct RenderedChat {
     lines: Vec<Line<'static>>,
+    height: usize,
     selected_range: Option<(usize, usize)>,
     editor_targets: Vec<(usize, EditorTarget)>,
 }
 
+#[cfg(test)]
 fn rendered_chat(chat: &ChatState, available_width: usize) -> RenderedChat {
+    rendered_chat_cached(chat, available_width, &mut ChatRenderCache::default())
+}
+
+fn rendered_chat_cached(
+    chat: &ChatState,
+    available_width: usize,
+    cache: &mut ChatRenderCache,
+) -> RenderedChat {
+    if cache.generation != chat.render_generation() || cache.width != available_width {
+        cache.generation = chat.render_generation();
+        cache.width = available_width;
+        cache.messages.clear();
+    }
+    cache.messages.truncate(chat.messages.len());
+    cache.messages.resize_with(chat.messages.len(), || None);
+
     let mut lines = Vec::new();
     let mut selected_range = None;
     let mut editor_targets = Vec::new();
@@ -2437,17 +2490,35 @@ fn rendered_chat(chat: &ChatState, available_width: usize) -> RenderedChat {
             .then_some(chat.messages.len().saturating_sub(1))
     });
     for (index, message) in chat.messages.iter().enumerate() {
-        let RenderedMessage {
-            lines: mut message_lines,
-            editor_targets: message_targets,
-        } = chat_message_lines(
-            message,
-            available_width,
-            animated_activity_index == Some(index),
-        );
-        let message_height = Paragraph::new(Text::from(message_lines.clone()))
-            .wrap(Wrap { trim: false })
-            .line_count(line_count_width);
+        let animate_activity = animated_activity_index == Some(index);
+        let cached = (!animate_activity)
+            .then(|| cache.messages[index].as_ref())
+            .flatten()
+            .filter(|cached| cached.revision == message.render_revision())
+            .cloned();
+        let CachedRenderedMessage {
+            message:
+                RenderedMessage {
+                    lines: mut message_lines,
+                    editor_targets: message_targets,
+                },
+            height: message_height,
+            ..
+        } = cached.unwrap_or_else(|| {
+            let rendered = chat_message_lines(message, available_width, animate_activity);
+            let height = Paragraph::new(Text::from(rendered.lines.clone()))
+                .wrap(Wrap { trim: false })
+                .line_count(line_count_width);
+            let cached = CachedRenderedMessage {
+                revision: message.render_revision(),
+                message: rendered,
+                height,
+            };
+            if !animate_activity {
+                cache.messages[index] = Some(cached.clone());
+            }
+            cached
+        });
         if chat.mode == ChatMode::Scroll && chat.selected_message_index == Some(index) {
             highlight_message_lines(&mut message_lines, available_width);
             selected_range = Some((
@@ -2469,13 +2540,18 @@ fn rendered_chat(chat: &ChatState, available_width: usize) -> RenderedChat {
         } else {
             "Working…"
         };
-        lines.extend(activity_message_lines(
-            &format!("{} {status}", thinking_frame()),
-            available_width,
-        ));
+        let status_lines =
+            activity_message_lines(&format!("{} {status}", thinking_frame()), available_width);
+        rendered_height = rendered_height.saturating_add(
+            Paragraph::new(Text::from(status_lines.clone()))
+                .wrap(Wrap { trim: false })
+                .line_count(line_count_width),
+        );
+        lines.extend(status_lines);
     }
     RenderedChat {
         lines,
+        height: rendered_height,
         selected_range,
         editor_targets,
     }
@@ -3282,6 +3358,10 @@ fn focus_style(focused: bool) -> Style {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
+    use crate::app_server::AppServerEvent;
+
     use super::*;
 
     #[test]
@@ -3666,5 +3746,89 @@ mod tests {
                     .iter()
                     .all(|span| span.style.bg == Some(Color::Rgb(52, 63, 72)))
         }));
+    }
+
+    #[test]
+    #[ignore = "manual render performance measurement"]
+    fn measures_long_streaming_chat_render_time() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        for index in 0..1_000 {
+            chat.push_notice(format!(
+                "Completed activity {index}\n{}",
+                "output that needs wrapping across the terminal width ".repeat(4)
+            ));
+        }
+        chat.begin_user_turn("question".into(), "turn".into());
+        let iterations = 50;
+        let mut cache = ChatRenderCache::default();
+        let started = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(rendered_chat_cached(&chat, 80, &mut cache));
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "rendered {} messages {} times in {:?} ({:?}/render)",
+            chat.messages.len(),
+            iterations,
+            elapsed,
+            elapsed / iterations
+        );
+    }
+
+    #[test]
+    fn render_cache_refreshes_only_a_changed_message() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.begin_user_turn("question".into(), "turn".into());
+        chat.apply(&AppServerEvent {
+            method: "item/agentMessage/delta".into(),
+            params: json!({"threadId":"t", "turnId":"turn", "delta":"first"}),
+            thread_id: Some("t".into()),
+            turn_id: Some("turn".into()),
+        });
+        let mut cache = ChatRenderCache::default();
+        rendered_chat_cached(&chat, 40, &mut cache);
+        let user_revision = cache.messages[0].as_ref().unwrap().revision;
+        let assistant_revision = cache.messages[1].as_ref().unwrap().revision;
+
+        chat.apply(&AppServerEvent {
+            method: "item/agentMessage/delta".into(),
+            params: json!({"threadId":"t", "turnId":"turn", "delta":" second"}),
+            thread_id: Some("t".into()),
+            turn_id: Some("turn".into()),
+        });
+        rendered_chat_cached(&chat, 40, &mut cache);
+
+        assert_eq!(cache.messages[0].as_ref().unwrap().revision, user_revision);
+        assert_ne!(
+            cache.messages[1].as_ref().unwrap().revision,
+            assistant_revision
+        );
+        assert!(
+            cache.messages[1]
+                .as_ref()
+                .unwrap()
+                .message
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.content.contains("first second"))
+        );
+    }
+
+    #[test]
+    fn render_cache_resets_for_width_and_history_changes() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.push_notice("a message that wraps at narrow widths".into());
+        let mut cache = ChatRenderCache::default();
+        rendered_chat_cached(&chat, 20, &mut cache);
+        let first_generation = cache.generation;
+
+        rendered_chat_cached(&chat, 40, &mut cache);
+        assert_eq!(cache.width, 40);
+
+        chat.load_history(&json!({"thread":{"turns":[]}}));
+        rendered_chat_cached(&chat, 40, &mut cache);
+        assert_ne!(cache.generation, first_generation);
+        assert!(cache.messages.is_empty());
     }
 }
