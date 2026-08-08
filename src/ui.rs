@@ -511,25 +511,13 @@ async fn handle_key(
                 }
             }
             KeyCode::Char('o') if app.thread_picker_query.is_empty() => {
-                if let Some(thread) = app.selected_thread_picker() {
-                    if app.thread_has_active_turn(&thread.record.id) {
-                        app.message = Some(
-                            "Stop the running response before opening this thread in Codex CLI"
-                                .into(),
-                        );
-                    } else {
-                        action = Some(UiAction::OpenCodex {
-                            thread_id: thread.record.id.clone(),
-                            cwd: thread.record.cwd.clone(),
-                        });
-                    }
-                }
+                action = open_selected_thread_in_codex(app);
             }
             KeyCode::Char('y') if app.thread_picker_query.is_empty() => {
-                copy_thread_picker_value(app, ThreadCopy::Id);
+                copy_selected_thread_value(app, ThreadCopy::Id);
             }
             KeyCode::Char('Y') if app.thread_picker_query.is_empty() => {
-                copy_thread_picker_value(app, ThreadCopy::ResumeCommand);
+                copy_selected_thread_value(app, ThreadCopy::ResumeCommand);
             }
             KeyCode::Char(character)
                 if !key
@@ -734,6 +722,15 @@ async fn handle_key(
                 if let Err(error) = app.refresh_repositories() {
                     app.message = Some(error.to_string());
                 }
+            }
+            KeyCode::Char('o') if app.selected_tree_is_thread() => {
+                action = open_selected_thread_in_codex(app);
+            }
+            KeyCode::Char('y') if app.selected_tree_is_thread() => {
+                copy_selected_thread_value(app, ThreadCopy::Id);
+            }
+            KeyCode::Char('Y') if app.selected_tree_is_thread() => {
+                copy_selected_thread_value(app, ThreadCopy::ResumeCommand);
             }
             KeyCode::Char('d') if app.selected_tree_is_repository() => {
                 app.mode = Mode::ConfirmRemoveRepository;
@@ -944,11 +941,30 @@ enum ThreadCopy {
     ResumeCommand,
 }
 
-fn copy_thread_picker_value(app: &mut App, value: ThreadCopy) {
-    let Some(thread_id) = app
-        .selected_thread_picker()
-        .map(|thread| thread.record.id.clone())
-    else {
+fn selected_thread_action_target(app: &App) -> Option<(String, PathBuf)> {
+    let thread = match app.mode {
+        Mode::ChooseThread => app.selected_thread_picker(),
+        Mode::Normal if app.selected_tree_is_thread() => app.selected_thread(),
+        _ => None,
+    }?;
+    Some((thread.record.id.clone(), thread.record.cwd.clone()))
+}
+
+fn open_selected_thread_in_codex(app: &mut App) -> Option<UiAction> {
+    let Some((thread_id, cwd)) = selected_thread_action_target(app) else {
+        app.message = Some("No thread selected".into());
+        return None;
+    };
+    if app.thread_has_active_turn(&thread_id) {
+        app.message =
+            Some("Stop the running response before opening this thread in Codex CLI".into());
+        return None;
+    }
+    Some(UiAction::OpenCodex { thread_id, cwd })
+}
+
+fn copy_selected_thread_value(app: &mut App, value: ThreadCopy) {
+    let Some((thread_id, _)) = selected_thread_action_target(app) else {
         app.message = Some("No thread selected".into());
         return;
     };
@@ -3163,8 +3179,8 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(64, 31, area);
-    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            open the visible diff hunk in Neovim\ny / Y        copy selected message / full chat\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / remove thread / delete archived thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
+    let popup = centered_rect(72, 33, area);
+    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            open the visible diff hunk in Neovim\no            open selected thread in Codex CLI\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / remove thread / delete archived thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(help).wrap(Wrap { trim: false }).block(
