@@ -2163,9 +2163,14 @@ fn rendered_chat(chat: &ChatState, available_width: usize) -> RenderedChat {
         lines.extend(message_lines);
         rendered_height = rendered_height.saturating_add(message_height);
     }
-    if chat.is_waiting_for_activity() {
+    if chat.active_turn_id.is_some() && animated_activity_index.is_none() {
+        let status = if chat.is_waiting_for_activity() {
+            "Thinking…"
+        } else {
+            "Working…"
+        };
         lines.extend(activity_message_lines(
-            &format!("{} Thinking…", thinking_frame()),
+            &format!("{} {status}", thinking_frame()),
             available_width,
         ));
     }
@@ -3280,6 +3285,34 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(text.contains("Thinking…"));
+    }
+
+    #[test]
+    fn active_turn_renders_working_between_completed_items() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.load_history(&json!({"thread":{"turns":[{
+            "id":"turn",
+            "status":"inProgress",
+            "items":[{
+                "id":"edit-1",
+                "type":"fileChange",
+                "status":"completed",
+                "changes":[{
+                    "path":"src/main.rs",
+                    "kind":"update",
+                    "diff":"@@ -1 +1 @@\n-old\n+new"
+                }]
+            }]
+        }]}}));
+
+        let text = rendered_chat(&chat, 40)
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("✓ Edited: src/main.rs"));
+        assert!(text.contains("Working…"));
     }
 
     #[test]
