@@ -22,7 +22,7 @@ use crossterm::{
         disable_raw_mode, enable_raw_mode,
     },
 };
-use futures::StreamExt;
+use futures::{StreamExt, future::join_all};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -32,7 +32,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast::error::RecvError, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use unicode_segmentation::UnicodeSegmentation;
@@ -202,10 +202,18 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                 }
             }
             event = server_events.recv() => {
-                if let Ok(event) = event {
-                    app.apply_chat_event(&event);
-                    reconcile_thread_subscriptions(app, &server).await;
-                    needs_draw = true;
+                match event {
+                    Ok(event) => {
+                        app.apply_chat_event(&event);
+                        reconcile_thread_subscriptions(app, &server).await;
+                        needs_draw = true;
+                    }
+                    Err(RecvError::Lagged(skipped)) => {
+                        resync_subscribed_threads(app, &server, skipped).await;
+                        reconcile_thread_subscriptions(app, &server).await;
+                        needs_draw = true;
+                    }
+                    Err(RecvError::Closed) => bail!("Codex App Server event stream closed"),
                 }
             }
             request = server.next_server_request() => {
@@ -1612,6 +1620,43 @@ async fn reconcile_thread_subscriptions(app: &mut App, server: &Arc<AppServer>) 
             }
         }
     }
+}
+
+async fn resync_subscribed_threads(app: &mut App, server: &Arc<AppServer>, skipped: u64) {
+    let mut thread_ids = app.resumed_threads.iter().cloned().collect::<Vec<_>>();
+    thread_ids.sort();
+    let reads = thread_ids
+        .iter()
+        .map(|thread_id| server.read_thread(thread_id));
+    let results = join_all(reads).await;
+    let mut refreshed = 0usize;
+    let mut failures = Vec::new();
+
+    for (thread_id, result) in thread_ids.into_iter().zip(results) {
+        match result {
+            Ok(history) => {
+                let Some(chat) = app.chats.get_mut(&thread_id) else {
+                    failures.push(format!("{thread_id}: thread is not cached"));
+                    continue;
+                };
+                chat.load_history(&history);
+                app.reconcile_owned_turn_after_resync(&thread_id);
+                refreshed += 1;
+            }
+            Err(error) => failures.push(format!("{thread_id}: {error}")),
+        }
+    }
+
+    app.message = Some(if failures.is_empty() {
+        format!(
+            "Recovered after skipping {skipped} App Server events; refreshed {refreshed} threads"
+        )
+    } else {
+        format!(
+            "Skipped {skipped} App Server events; refreshed {refreshed} threads, but could not refresh {}",
+            failures.join("; ")
+        )
+    });
 }
 
 async fn unsubscribe_all_threads(app: &mut App, server: &Arc<AppServer>) {

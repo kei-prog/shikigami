@@ -783,6 +783,14 @@ impl App {
         }
     }
 
+    pub fn reconcile_owned_turn_after_resync(&mut self, thread_id: &str) {
+        let active_turn_id = self
+            .chats
+            .get(thread_id)
+            .and_then(|chat| chat.active_turn_id.as_deref());
+        reconcile_owned_turn(&mut self.owned_turns, thread_id, active_turn_id);
+    }
+
     pub fn toggle_chat_pane(&mut self) {
         if self.has_side_chat() {
             self.active_chat_pane = match self.active_chat_pane {
@@ -2153,6 +2161,16 @@ fn thread_subscription_targets(
         .collect()
 }
 
+fn reconcile_owned_turn(
+    owned_turns: &mut HashMap<String, String>,
+    thread_id: &str,
+    active_turn_id: Option<&str>,
+) {
+    if owned_turns.get(thread_id).map(String::as_str) != active_turn_id {
+        owned_turns.remove(thread_id);
+    }
+}
+
 fn preferred_reasoning_effort(model: &ModelMetadata) -> Option<&str> {
     model
         .supported_reasoning_efforts
@@ -2391,6 +2409,20 @@ mod tests {
             thread_subscription_targets(None, None, &opened, &chats, &owned),
             HashSet::from(["background".into()])
         );
+    }
+
+    #[test]
+    fn resync_forgets_an_owned_turn_that_is_no_longer_active() {
+        let mut owned = HashMap::from([
+            ("completed".into(), "turn-1".into()),
+            ("running".into(), "turn-2".into()),
+        ]);
+
+        reconcile_owned_turn(&mut owned, "completed", None);
+        reconcile_owned_turn(&mut owned, "running", Some("turn-2"));
+
+        assert!(!owned.contains_key("completed"));
+        assert_eq!(owned.get("running").map(String::as_str), Some("turn-2"));
     }
 
     #[test]
