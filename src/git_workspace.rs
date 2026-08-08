@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, Output},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -108,15 +108,24 @@ fn managed_worktrees_root() -> Result<PathBuf> {
 }
 
 fn path_is_within(path: &Path, root: &Path) -> bool {
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return false;
+    }
     let Ok(root) = root.canonicalize() else {
         return path.starts_with(root);
     };
-    if let Ok(path) = path.canonicalize() {
-        return path.starts_with(root);
+
+    let mut ancestor = Some(path);
+    while let Some(path) = ancestor {
+        if let Ok(path) = path.canonicalize() {
+            return path.starts_with(&root);
+        }
+        ancestor = path.parent();
     }
-    path.parent()
-        .and_then(|parent| parent.canonicalize().ok())
-        .is_some_and(|parent| parent.starts_with(root))
+    false
 }
 
 fn create_workspace_at(
@@ -271,6 +280,39 @@ mod tests {
             Path::new("/tmp/abc123"),
             Some("shi/abc123")
         ));
+    }
+
+    #[test]
+    fn recognizes_nonexistent_descendants_of_an_existing_root() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("worktrees");
+        fs::create_dir(&root).unwrap();
+
+        assert!(path_is_within(&root.join("owner-repo/abc123"), &root));
+    }
+
+    #[test]
+    fn rejects_parent_directory_traversal() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("worktrees");
+        fs::create_dir(&root).unwrap();
+
+        assert!(!path_is_within(&root.join("missing/../../outside"), &root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_nonexistent_descendants_reached_through_an_external_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("worktrees");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, root.join("owner-repo")).unwrap();
+
+        assert!(!path_is_within(&root.join("owner-repo/abc123"), &root));
     }
 
     fn run_git(repository: &Path, args: &[&str]) {
