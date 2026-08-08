@@ -1128,6 +1128,32 @@ impl App {
         self.persist_attention();
     }
 
+    pub fn pending_approval_for_thread(&self, thread_id: &str) -> Option<&AppServerRequest> {
+        self.pending_approvals
+            .iter()
+            .find(|request| request.thread_id.as_deref() == Some(thread_id))
+    }
+
+    pub fn active_chat_has_pending_approval(&self) -> bool {
+        self.active_chat_id()
+            .is_some_and(|thread_id| self.pending_approval_for_thread(thread_id).is_some())
+    }
+
+    pub fn take_active_chat_approval(&mut self) -> Option<AppServerRequest> {
+        let thread_id = self.active_chat_id()?.to_owned();
+        take_pending_approval(&mut self.pending_approvals, Some(&thread_id))
+    }
+
+    pub fn unscoped_pending_approval(&self) -> Option<&AppServerRequest> {
+        self.pending_approvals
+            .iter()
+            .find(|request| request.thread_id.is_none())
+    }
+
+    pub fn take_unscoped_pending_approval(&mut self) -> Option<AppServerRequest> {
+        take_pending_approval(&mut self.pending_approvals, None)
+    }
+
     pub fn approval_resolved(&mut self, thread_id: Option<&str>) {
         let Some(thread_id) = thread_id else {
             return;
@@ -1229,16 +1255,10 @@ impl App {
             return;
         };
         if item.kind == AttentionKind::Approval {
-            if let Some(index) = self
-                .pending_approvals
-                .iter()
-                .position(|request| request.thread_id.as_deref() == Some(item.thread_id.as_str()))
-                && let Some(request) = self.pending_approvals.remove(index)
-            {
-                self.pending_approvals.push_front(request);
+            if !self.reveal_chat(&item.thread_id) {
+                self.message = Some("The selected thread is no longer available".into());
+                self.close_attention();
             }
-            self.reveal_chat(&item.thread_id);
-            self.mode = Mode::Approval;
             return;
         }
         self.attention_items.remove(self.attention_index);
@@ -1640,10 +1660,12 @@ impl App {
 
     pub fn end_thread_deletion(&mut self) {
         self.thread_deletion = None;
-        self.mode = if self.pending_approvals.is_empty() {
-            Mode::Normal
-        } else {
+        self.mode = if self.unscoped_pending_approval().is_some() {
             Mode::Approval
+        } else if self.chat().is_some() && self.focus == Focus::Chat {
+            Mode::Chat
+        } else {
+            Mode::Normal
         };
     }
 
@@ -2327,6 +2349,16 @@ fn ensure_thread_deletion_context(show_archived: bool, record: &ThreadRecord) ->
     Ok(())
 }
 
+fn take_pending_approval(
+    approvals: &mut VecDeque<AppServerRequest>,
+    thread_id: Option<&str>,
+) -> Option<AppServerRequest> {
+    let index = approvals
+        .iter()
+        .position(|request| request.thread_id.as_deref() == thread_id)?;
+    approvals.remove(index)
+}
+
 fn thread_group_has_active_turn(
     thread_id: &str,
     chats: &HashMap<String, ChatState>,
@@ -2548,6 +2580,16 @@ mod tests {
         }
     }
 
+    fn approval(id: i64, thread_id: Option<&str>) -> AppServerRequest {
+        AppServerRequest {
+            id: json!(id),
+            method: "item/permissions/requestApproval".into(),
+            params: json!({"threadId": thread_id}),
+            thread_id: thread_id.map(str::to_owned),
+            turn_id: None,
+        }
+    }
+
     #[test]
     fn medium_is_the_preferred_reasoning_effort() {
         let model = model("low", &["low", "medium", "high"]);
@@ -2759,6 +2801,31 @@ mod tests {
         item.record.archived_at = Some(1);
         assert!(ensure_thread_deletion_context(false, &item.record).is_err());
         assert!(ensure_thread_deletion_context(true, &item.record).is_ok());
+    }
+
+    #[test]
+    fn pending_approval_is_taken_only_from_its_thread() {
+        let mut approvals = VecDeque::from([
+            approval(1, Some("one")),
+            approval(2, Some("two")),
+            approval(3, Some("one")),
+            approval(4, None),
+        ]);
+
+        assert_eq!(
+            take_pending_approval(&mut approvals, Some("two")).map(|request| request.id),
+            Some(json!(2))
+        );
+        assert_eq!(
+            take_pending_approval(&mut approvals, Some("one")).map(|request| request.id),
+            Some(json!(1))
+        );
+        assert_eq!(
+            take_pending_approval(&mut approvals, None).map(|request| request.id),
+            Some(json!(4))
+        );
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].id, json!(3));
     }
 
     #[test]

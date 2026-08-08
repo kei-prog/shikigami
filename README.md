@@ -70,8 +70,10 @@ Entries for threads no longer registered with Shikigami are removed on startup.
 The header and repository rows show pending counts; `!` opens the list, `j` / `k`
 selects an item, `Enter` opens it, and `d` dismisses a completed or failed item.
 Pending approvals must be accepted or declined and remain session-local because
-their App Server request cannot be answered after a restart. The list is updated
-directly from App Server events without polling.
+their App Server request cannot be answered after a restart. An approval is shown
+only inside its requesting chat; approvals from background threads add attention
+markers without interrupting the visible thread. The list is updated directly
+from App Server events without polling.
 
 In the repository picker, `/` filters candidates, `Space` selects multiple
 repositories, and `Enter` registers them. Repository discovery is read-only.

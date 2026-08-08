@@ -107,6 +107,12 @@ enum ThreadDeletionEvent {
     },
 }
 
+struct ApprovalPrompt {
+    thread_title: String,
+    method: String,
+    detail: String,
+}
+
 pub async fn run(mut app: App) -> Result<()> {
     let server = AppServer::spawn("codex", Duration::from_secs(30)).await?;
     cleanup_abandoned_side_chats(&mut app, &server).await;
@@ -299,8 +305,11 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
             request = server.next_server_request() => {
                 if let Some(request) = request {
                     if is_approval(&request) {
+                        let unscoped = request.thread_id.is_none();
                         app.enqueue_approval(request);
-                        app.mode = Mode::Approval;
+                        if unscoped {
+                            app.mode = Mode::Approval;
+                        }
                         needs_draw = true;
                     } else if request.method == "item/tool/call" {
                         handle_dynamic_tool_call(app, &server, request).await?;
@@ -328,6 +337,29 @@ async fn handle_key(
 ) -> Result<Option<UiAction>> {
     if app.thread_deletion.is_some() {
         return Ok(None);
+    }
+    if app.mode == Mode::Chat && app.focus == Focus::Chat && app.active_chat_has_pending_approval()
+    {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                resolve_active_chat_approval(app, server, true).await?;
+                return Ok(None);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                resolve_active_chat_approval(app, server, false).await?;
+                return Ok(None);
+            }
+            KeyCode::Esc => {
+                app.mode = Mode::Normal;
+                app.focus = Focus::Navigation;
+                return Ok(None);
+            }
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.toggle_chat_pane();
+                return Ok(None);
+            }
+            _ => return Ok(None),
+        }
     }
     let mut action = None;
     match app.mode {
@@ -653,9 +685,11 @@ async fn handle_key(
             _ => {}
         },
         Mode::Approval => match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => resolve_approval(app, server, true).await?,
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                resolve_unscoped_approval(app, server, true).await?
+            }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                resolve_approval(app, server, false).await?
+                resolve_unscoped_approval(app, server, false).await?
             }
             _ => {}
         },
@@ -2059,10 +2093,47 @@ fn is_approval(request: &AppServerRequest) -> bool {
     )
 }
 
-async fn resolve_approval(app: &mut App, server: &Arc<AppServer>, accept: bool) -> Result<()> {
-    let Some(request) = app.pending_approvals.pop_front() else {
+async fn resolve_active_chat_approval(
+    app: &mut App,
+    server: &Arc<AppServer>,
+    accept: bool,
+) -> Result<()> {
+    let Some(request) = app.take_active_chat_approval() else {
         return Ok(());
     };
+    respond_to_approval(app, server, request, accept).await
+}
+
+async fn resolve_unscoped_approval(
+    app: &mut App,
+    server: &Arc<AppServer>,
+    accept: bool,
+) -> Result<()> {
+    let Some(request) = app.take_unscoped_pending_approval() else {
+        app.mode = if app.chat().is_some() && app.focus == Focus::Chat {
+            Mode::Chat
+        } else {
+            Mode::Normal
+        };
+        return Ok(());
+    };
+    respond_to_approval(app, server, request, accept).await?;
+    app.mode = if app.unscoped_pending_approval().is_some() {
+        Mode::Approval
+    } else if app.chat().is_some() && app.focus == Focus::Chat {
+        Mode::Chat
+    } else {
+        Mode::Normal
+    };
+    Ok(())
+}
+
+async fn respond_to_approval(
+    app: &mut App,
+    server: &Arc<AppServer>,
+    request: AppServerRequest,
+    accept: bool,
+) -> Result<()> {
     let thread_id = request.thread_id.clone();
     let result = if request.method == "item/permissions/requestApproval" {
         if accept {
@@ -2075,13 +2146,6 @@ async fn resolve_approval(app: &mut App, server: &Arc<AppServer>, accept: bool) 
     };
     server.respond(request.id, result).await?;
     app.approval_resolved(thread_id.as_deref());
-    app.mode = if !app.pending_approvals.is_empty() {
-        Mode::Approval
-    } else if app.chat().is_some() && app.focus == Focus::Chat {
-        Mode::Chat
-    } else {
-        Mode::Normal
-    };
     Ok(())
 }
 
@@ -2197,8 +2261,11 @@ fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
         Mode::Help => render_help(frame, area, app),
         Mode::Normal | Mode::Chat | Mode::Approval => {}
     }
-    if app.mode == Mode::Approval {
-        render_approval(frame, area, app);
+    if app.mode == Mode::Approval
+        && let Some(request) = app.unscoped_pending_approval()
+    {
+        let prompt = approval_prompt("Codex", request);
+        render_approval(frame, area, &prompt, true);
     }
     if app.thread_deletion.is_some() && app.mode != Mode::DeletingThread {
         render_thread_deletion_progress(frame, area, app);
@@ -2272,6 +2339,14 @@ fn render_chat_pane(
         );
         return;
     };
+    let approval = app.pending_approval_for_thread(&chat_id).map(|request| {
+        let title = app
+            .chats
+            .get(&chat_id)
+            .map(|chat| chat.title.as_str())
+            .unwrap_or("thread");
+        approval_prompt(title, request)
+    });
     let Some(chat) = app.chats.get_mut(&chat_id) else {
         return;
     };
@@ -2428,6 +2503,14 @@ fn render_chat_pane(
     );
     if pane_active && let Some(palette) = &chat.palette {
         render_command_palette(frame, area, palette);
+    }
+    if let Some(approval) = approval {
+        render_approval(
+            frame,
+            area,
+            &approval,
+            app.mode == Mode::Chat && chat_focused,
+        );
     }
 }
 
@@ -3303,24 +3386,26 @@ fn wrap_composer(composer: &str, max_width: usize) -> Vec<String> {
     lines
 }
 
-fn render_approval(frame: &mut Frame, area: Rect, app: &App) {
-    let popup = centered_rect(76, 12, area);
-    let request = app.pending_approvals.front();
-    let thread_title = request
-        .and_then(|request| request.thread_id.as_deref())
-        .and_then(|thread_id| app.chats.get(thread_id))
-        .map(|chat| chat.title.as_str())
-        .unwrap_or("thread");
-    let method = request
-        .map(|value| value.method.as_str())
-        .unwrap_or("approval");
-    let detail = request
-        .map(|value| value.params.to_string())
-        .unwrap_or_default();
+fn approval_prompt(thread_title: &str, request: &AppServerRequest) -> ApprovalPrompt {
+    ApprovalPrompt {
+        thread_title: thread_title.to_owned(),
+        method: request.method.clone(),
+        detail: request.params.to_string(),
+    }
+}
+
+fn render_approval(frame: &mut Frame, area: Rect, prompt: &ApprovalPrompt, interactive: bool) {
+    let popup = centered_rect(90, 12, area);
+    let instruction = if interactive {
+        "Approve this request? [y/N] · Esc switch threads"
+    } else {
+        "Focus this chat to approve or decline"
+    };
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(format!(
-            "{thread_title}\n{method}\n\n{detail}\n\nApprove this request? [y/N]"
+            "{}\n{}\n\n{}\n\n{instruction}",
+            prompt.thread_title, prompt.method, prompt.detail,
         ))
         .wrap(Wrap { trim: false })
         .block(
