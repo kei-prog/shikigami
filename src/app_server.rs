@@ -23,7 +23,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::paths;
+use crate::{paths, settings::ExecutionMode};
 
 type PendingResponses = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 
@@ -74,6 +74,13 @@ pub struct ModelMetadata {
     pub default_reasoning_effort: String,
     pub supported_reasoning_efforts: Vec<ReasoningEffortMetadata>,
     pub is_default: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TurnSettings<'a> {
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+    pub execution_mode: ExecutionMode,
 }
 
 #[derive(Deserialize)]
@@ -305,15 +312,21 @@ impl AppServer {
         Ok(models)
     }
 
-    pub async fn start_thread(&self, cwd: &Path, model: Option<&str>) -> Result<String> {
+    pub async fn start_thread(
+        &self,
+        cwd: &Path,
+        model: Option<&str>,
+        execution_mode: ExecutionMode,
+    ) -> Result<String> {
+        let (approval_policy, sandbox) = execution_policy(execution_mode);
         let response = self
             .request(
                 "thread/start",
                 json!({
                     "cwd": cwd,
                     "model": model,
-                    "approvalPolicy": "never",
-                    "sandbox": "danger-full-access",
+                    "approvalPolicy": approval_policy,
+                    "sandbox": sandbox,
                     "ephemeral": false
                 }),
             )
@@ -326,15 +339,17 @@ impl AppServer {
         thread_id: &str,
         cwd: &Path,
         model: Option<&str>,
+        execution_mode: ExecutionMode,
     ) -> Result<()> {
+        let (approval_policy, sandbox) = execution_policy(execution_mode);
         self.request(
             "thread/resume",
             json!({
                 "threadId": thread_id,
                 "cwd": cwd,
                 "model": model,
-                "approvalPolicy": "never",
-                "sandbox": "danger-full-access"
+                "approvalPolicy": approval_policy,
+                "sandbox": sandbox
             }),
         )
         .await?;
@@ -346,15 +361,17 @@ impl AppServer {
         thread_id: &str,
         cwd: &Path,
         ephemeral: bool,
+        execution_mode: ExecutionMode,
     ) -> Result<(String, Value)> {
+        let (approval_policy, sandbox) = execution_policy(execution_mode);
         let response = self
             .request(
                 "thread/fork",
                 json!({
                     "threadId": thread_id,
                     "cwd": cwd,
-                    "approvalPolicy": "never",
-                    "sandbox": "danger-full-access",
+                    "approvalPolicy": approval_policy,
+                    "sandbox": sandbox,
                     "ephemeral": ephemeral
                 }),
             )
@@ -414,9 +431,9 @@ impl AppServer {
         cwd: &Path,
         prompt: &str,
         skills: &[SkillMetadata],
-        model: Option<&str>,
-        effort: Option<&str>,
+        settings: TurnSettings<'_>,
     ) -> Result<String> {
+        let (approval_policy, sandbox) = execution_policy(settings.execution_mode);
         let response = self
             .request(
                 "turn/start",
@@ -424,10 +441,10 @@ impl AppServer {
                     "threadId": thread_id,
                     "cwd": cwd,
                     "input": turn_input(prompt, skills),
-                    "model": model,
-                    "effort": effort,
-                    "approvalPolicy": "never",
-                    "sandboxPolicy": {"type": "dangerFullAccess"}
+                    "model": settings.model,
+                    "effort": settings.effort,
+                    "approvalPolicy": approval_policy,
+                    "sandboxPolicy": {"type": sandbox}
                 }),
             )
             .await?;
@@ -479,6 +496,13 @@ impl AppServer {
             .send(OutgoingMessage::Json(message.clone()))
             .await
             .context("write App Server message")
+    }
+}
+
+fn execution_policy(mode: ExecutionMode) -> (&'static str, &'static str) {
+    match mode {
+        ExecutionMode::Auto => ("on-request", "workspaceWrite"),
+        ExecutionMode::Dangerous => ("never", "dangerFullAccess"),
     }
 }
 
@@ -665,6 +689,73 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn execution_modes_map_to_app_server_policies() {
+        assert_eq!(
+            execution_policy(ExecutionMode::Auto),
+            ("on-request", "workspaceWrite")
+        );
+        assert_eq!(
+            execution_policy(ExecutionMode::Dangerous),
+            ("never", "dangerFullAccess")
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_turn_uses_workspace_sandbox_and_on_request_approvals() {
+        let (writer, mut messages) = mpsc::channel(1);
+        let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(1);
+        let (_request_tx, request_rx) = mpsc::channel(1);
+        let server = Arc::new(AppServer {
+            writer,
+            writer_task: Mutex::new(None),
+            reader_task: Mutex::new(None),
+            child: Mutex::new(None),
+            pending: pending.clone(),
+            next_id: AtomicU64::new(0),
+            events,
+            server_requests: Mutex::new(request_rx),
+            version: "test".into(),
+            request_timeout: Duration::from_secs(1),
+        });
+
+        let task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .start_turn(
+                        "thread-1",
+                        Path::new("/tmp/project"),
+                        "run tests",
+                        &[],
+                        TurnSettings {
+                            model: None,
+                            effort: None,
+                            execution_mode: ExecutionMode::Auto,
+                        },
+                    )
+                    .await
+            }
+        });
+        let OutgoingMessage::Json(message) = messages.recv().await.unwrap() else {
+            panic!("unexpected shutdown message");
+        };
+        assert_eq!(message["method"], "turn/start");
+        assert_eq!(message["params"]["approvalPolicy"], "on-request");
+        assert_eq!(
+            message["params"]["sandboxPolicy"],
+            json!({"type":"workspaceWrite"})
+        );
+        dispatch_response(
+            &pending,
+            &json!({"id":message["id"],"result":{"turn":{"id":"turn-1"}}}),
+        )
+        .await;
+
+        assert_eq!(task.await.unwrap().unwrap(), "turn-1");
+    }
 
     #[test]
     fn second_shikigami_instance_is_rejected_until_first_exits() {

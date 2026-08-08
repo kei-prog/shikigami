@@ -16,6 +16,7 @@ use crate::{
         AttentionRegistry, PersistentAttentionKind, Registry, SideChatRegistry, ThreadRecord,
     },
     repository::{self, Repository, RepositoryStore, ScanEvent, ScanScope, start_scan},
+    settings::{ExecutionMode, SettingsStore},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +44,8 @@ pub enum Mode {
     Chat,
     ChooseModel,
     ChooseReasoningEffort,
+    ChoosePermissions,
+    ConfirmDangerous,
     ChooseSideChat,
     ChooseThread,
     Attention,
@@ -161,10 +164,13 @@ pub struct App {
     pub model_index: usize,
     pub reasoning_effort_index: usize,
     pub reasoning_effort_returns_to_model: bool,
+    pub execution_mode: ExecutionMode,
+    pub permission_index: usize,
     thread_registry: Registry,
     side_chat_registry: SideChatRegistry,
     attention_registry: AttentionRegistry,
     repository_store: RepositoryStore,
+    settings_store: SettingsStore,
     workspaces_by_repository: HashMap<PathBuf, Vec<Workspace>>,
     scan_receiver: Option<Receiver<ScanEvent>>,
 }
@@ -172,6 +178,14 @@ pub struct App {
 impl App {
     pub fn load() -> Result<Self> {
         let repository_store = RepositoryStore::discover()?;
+        let settings_store = SettingsStore::discover()?;
+        let (execution_mode, settings_error) = match settings_store.load() {
+            Ok(mode) => (mode, None),
+            Err(error) => (
+                ExecutionMode::Auto,
+                Some(format!("Could not load settings; using Auto: {error}")),
+            ),
+        };
         let thread_registry = Registry::discover()?;
         let repositories = repository_store.load_registered()?;
         let candidates = repository_store.load_candidates().unwrap_or_default();
@@ -204,6 +218,11 @@ impl App {
                     Some(format!("Could not load repository view state: {error}")),
                 ),
             };
+        let startup_message = [ui_state_error, settings_error]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("; ");
         let mut app = Self {
             repositories,
             threads: Vec::new(),
@@ -229,7 +248,7 @@ impl App {
             },
             scanning: false,
             show_archived: false,
-            message: ui_state_error,
+            message: (!startup_message.is_empty()).then_some(startup_message),
             should_quit: false,
             chats: HashMap::new(),
             preview_cache_order: VecDeque::new(),
@@ -257,10 +276,13 @@ impl App {
             model_index: 0,
             reasoning_effort_index: 0,
             reasoning_effort_returns_to_model: false,
+            execution_mode,
+            permission_index: usize::from(execution_mode == ExecutionMode::Dangerous),
             thread_registry,
             side_chat_registry: SideChatRegistry::discover()?,
             attention_registry: AttentionRegistry::discover()?,
             repository_store,
+            settings_store,
             workspaces_by_repository: HashMap::new(),
             scan_receiver: None,
         };
@@ -893,6 +915,48 @@ impl App {
             .unwrap_or(0);
         self.sync_reasoning_effort_index();
         self.mode = Mode::ChooseModel;
+    }
+
+    pub fn open_permissions_picker(&mut self) {
+        self.permission_index = usize::from(self.execution_mode == ExecutionMode::Dangerous);
+        self.mode = Mode::ChoosePermissions;
+    }
+
+    pub fn move_permission_up(&mut self) {
+        self.permission_index = self.permission_index.saturating_sub(1);
+    }
+
+    pub fn move_permission_down(&mut self) {
+        self.permission_index = (self.permission_index + 1).min(1);
+    }
+
+    pub fn choose_permission(&mut self) -> Result<()> {
+        let selected = if self.permission_index == 0 {
+            ExecutionMode::Auto
+        } else {
+            ExecutionMode::Dangerous
+        };
+        if selected == ExecutionMode::Dangerous && self.execution_mode != selected {
+            self.mode = Mode::ConfirmDangerous;
+            return Ok(());
+        }
+        self.set_execution_mode(selected)
+    }
+
+    pub fn confirm_dangerous(&mut self) -> Result<()> {
+        self.set_execution_mode(ExecutionMode::Dangerous)
+    }
+
+    pub fn set_execution_mode(&mut self, mode: ExecutionMode) -> Result<()> {
+        self.settings_store.save(mode)?;
+        self.execution_mode = mode;
+        self.permission_index = usize::from(mode == ExecutionMode::Dangerous);
+        self.mode = Mode::Chat;
+        self.message = Some(format!(
+            "Execution mode set to {}; applies to subsequent turns",
+            mode.label()
+        ));
+        Ok(())
     }
 
     pub fn open_current_reasoning_effort_picker(&mut self) {

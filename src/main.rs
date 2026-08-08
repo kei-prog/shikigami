@@ -6,6 +6,7 @@ mod git_workspace;
 mod paths;
 mod registry;
 mod repository;
+mod settings;
 mod ui;
 
 use anyhow::Result;

@@ -105,9 +105,13 @@ If another Codex process already owns a thread, Shikigami keeps the
 history visible using `thread/read` and marks the chat `READ ONLY`. Close the
 other Codex session and select the thread again through `/threads` to retry
 `thread/resume`; a successful retry restores normal input.
-Every thread and turn runs with `danger-full-access` and approval prompts
-disabled. The red `DANGEROUS` label in the header keeps that execution policy
-visible.
+Execution defaults to `Auto`: Codex can write inside the thread workspace and
+asks for approval before elevated actions. Choose `/permissions` to switch
+between `Auto` and `Dangerous`; the selection is saved for future Shikigami
+sessions and applies to subsequent turns across all threads. `Dangerous` uses
+`danger-full-access` with approval prompts disabled and requires confirmation
+when enabled. The green `AUTO` or red `DANGEROUS` label in the header keeps the
+current policy visible.
 User messages are shown as full-width colored input bands, while Codex responses
 use the normal chat background. Commands, reasoning, file changes, and other
 activity use compact full-width gray bands separated by one line. Their heading
@@ -166,7 +170,8 @@ appears in the header and applies to subsequent turns in that thread. Press
 `j` / `k` changes the effort, `Enter` applies it, and `Esc` cancels.
 New chats default to `medium` reasoning when the selected model supports it.
 
-Choose `/sidechat` to create a temporary fork of the current thread. Each main
+Choose `/permissions` to select the global execution mode. Choose `/sidechat` to
+create a temporary fork of the current thread. Each main
 thread can keep multiple side chats for the current Shikigami session. The chat
 area splits into main and the selected side pane, and both can stream independently.
 Press `Ctrl-g` to switch focus. While the side pane is focused, `Ctrl-n` and

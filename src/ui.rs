@@ -40,13 +40,14 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{App, AttentionKind, ChatPane, Focus, Mode, TreeRow},
-    app_server::{AppServer, AppServerRequest},
+    app_server::{AppServer, AppServerRequest, TurnSettings},
     chat::{
         ChatMessage, ChatMode, ChatRole, ChatState, CommandPalette, EditorTarget, PaletteCommand,
         PaletteEntry,
     },
     clipboard,
     git_workspace::Workspace,
+    settings::ExecutionMode,
 };
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -491,6 +492,28 @@ async fn handle_key(
             KeyCode::Up | KeyCode::Char('k') => app.move_reasoning_effort_up(),
             KeyCode::Down | KeyCode::Char('j') => app.move_reasoning_effort_down(),
             KeyCode::Enter => app.apply_selected_model(),
+            _ => {}
+        },
+        Mode::ChoosePermissions => match key.code {
+            KeyCode::Esc => app.mode = Mode::Chat,
+            KeyCode::Up | KeyCode::Char('k') => app.move_permission_up(),
+            KeyCode::Down | KeyCode::Char('j') => app.move_permission_down(),
+            KeyCode::Enter => {
+                if let Err(error) = app.choose_permission() {
+                    app.message = Some(format!("Could not save execution mode: {error}"));
+                }
+            }
+            _ => {}
+        },
+        Mode::ConfirmDangerous => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Err(error) = app.confirm_dangerous() {
+                    app.message = Some(format!("Could not save execution mode: {error}"));
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.mode = Mode::ChoosePermissions;
+            }
             _ => {}
         },
         Mode::ChooseSideChat => match key.code {
@@ -1052,6 +1075,9 @@ async fn select_palette_entry(app: &mut App, server: &Arc<AppServer>) -> Result<
                 app.open_model_picker();
             }
         }
+        Some(PaletteEntry::Command(PaletteCommand::Permissions)) => {
+            app.open_permissions_picker();
+        }
         Some(PaletteEntry::Command(PaletteCommand::SideChat)) => {
             open_side_chat(app, server).await?;
         }
@@ -1074,9 +1100,10 @@ async fn select_palette_entry(app: &mut App, server: &Arc<AppServer>) -> Result<
             app.open_attention();
         }
         Some(PaletteEntry::Command(PaletteCommand::Status)) => {
+            let execution_status = execution_status(app.execution_mode);
             if let Some(chat) = app.chat_mut() {
                 chat.push_notice(format!(
-                    "Thread: {}\nWorkspace: {}\nModel: {} ({})\nSandbox: danger-full-access",
+                    "Thread: {}\nWorkspace: {}\nModel: {} ({})\nPermissions: {execution_status}",
                     chat.thread_id,
                     chat.cwd.display(),
                     chat.model.as_deref().unwrap_or("Codex default"),
@@ -1107,7 +1134,10 @@ async fn open_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     let model_display_name = main_chat.model_display_name.clone();
     let reasoning_effort = main_chat.reasoning_effort.clone();
     let side_chat_number = app.current_side_chats().len() + 1;
-    let (side_thread_id, history) = match server.fork_thread(&parent_thread_id, &cwd, false).await {
+    let (side_thread_id, history) = match server
+        .fork_thread(&parent_thread_id, &cwd, false, app.execution_mode)
+        .await
+    {
         Ok(result) => result,
         Err(error) => {
             app.message = Some(format!("Could not fork side chat: {error}"));
@@ -1353,6 +1383,7 @@ async fn open_new_chat(app: &mut App, server: &Arc<AppServer>, workspace: Worksp
         .start_thread(
             &workspace.path,
             model_settings.as_ref().map(|(model, _, _)| model.as_str()),
+            app.execution_mode,
         )
         .await?;
     app.register_app_server_thread(thread_id.clone(), workspace.path.clone())?;
@@ -1473,7 +1504,7 @@ async fn focus_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result<(
     let title = chat.title.clone();
     if !app.resumed_threads.contains(&thread_id) {
         match server
-            .resume_thread(&thread_id, &cwd, model.as_deref())
+            .resume_thread(&thread_id, &cwd, model.as_deref(), app.execution_mode)
             .await
         {
             Ok(()) => {
@@ -1488,7 +1519,9 @@ async fn focus_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result<(
                 );
             }
             Err(error) if is_recoverable_empty_thread(&title, &error) => {
-                let replacement_id = server.start_thread(&cwd, model.as_deref()).await?;
+                let replacement_id = server
+                    .start_thread(&cwd, model.as_deref(), app.execution_mode)
+                    .await?;
                 if let Err(error) = app.replace_empty_thread_id(&thread_id, replacement_id.clone())
                 {
                     let _ = server.unsubscribe_thread(&replacement_id).await;
@@ -1544,8 +1577,11 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
             &cwd,
             &prompt,
             &skills,
-            model.as_deref(),
-            effort.as_deref(),
+            TurnSettings {
+                model: model.as_deref(),
+                effort: effort.as_deref(),
+                execution_mode: app.execution_mode,
+            },
         )
         .await?;
     app.record_owned_turn(thread_id.clone(), turn_id.clone());
@@ -1603,7 +1639,7 @@ async fn reconcile_thread_subscriptions(app: &mut App, server: &Arc<AppServer>) 
             continue;
         };
         match server
-            .resume_thread(&thread_id, &cwd, model.as_deref())
+            .resume_thread(&thread_id, &cwd, model.as_deref(), app.execution_mode)
             .await
         {
             Ok(()) => {
@@ -1683,6 +1719,13 @@ async fn unsubscribe_all_threads(app: &mut App, server: &Arc<AppServer>) {
 fn is_active_writer_conflict(error: &anyhow::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("thread-store conflict") && message.contains("active writer")
+}
+
+fn execution_status(mode: ExecutionMode) -> &'static str {
+    match mode {
+        ExecutionMode::Auto => "AUTO · workspace-write · approvals on-request",
+        ExecutionMode::Dangerous => "DANGEROUS · danger-full-access · approvals never",
+    }
 }
 
 fn is_approval(request: &AppServerRequest) -> bool {
@@ -1765,9 +1808,13 @@ fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
         ));
         header.push(Span::raw(" "));
     } else if app.chat().is_some() {
+        let (label, color) = match app.execution_mode {
+            ExecutionMode::Auto => (" AUTO ", Color::Green),
+            ExecutionMode::Dangerous => (" DANGEROUS ", Color::Red),
+        };
         header.push(Span::styled(
-            " DANGEROUS ",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
         ));
         header.push(Span::raw(" "));
     }
@@ -1818,11 +1865,13 @@ fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
         Mode::ConfirmDeleteThread => render_thread_delete_confirm(frame, area, app),
         Mode::ChooseModel => render_model_picker(frame, area, app),
         Mode::ChooseReasoningEffort => render_reasoning_effort_picker(frame, area, app),
+        Mode::ChoosePermissions => render_permissions_picker(frame, area, app),
+        Mode::ConfirmDangerous => render_dangerous_confirm(frame, area),
         Mode::ChooseSideChat => render_side_chat_picker(frame, area, app),
         Mode::ChooseThread => render_thread_picker(frame, area, app),
         Mode::Attention => render_attention(frame, area, app),
         Mode::ConfirmQuit => render_quit_confirm(frame, area, app),
-        Mode::Help => render_help(frame, area),
+        Mode::Help => render_help(frame, area, app),
         Mode::Normal | Mode::Chat | Mode::Approval => {}
     }
     if app.mode == Mode::Approval {
@@ -2264,6 +2313,61 @@ fn render_reasoning_effort_picker(frame: &mut Frame, area: Rect, app: &App) {
                 .borders(Borders::ALL)
                 .padding(Padding::horizontal(2))
                 .border_style(Style::default().fg(Color::Green)),
+        ),
+        popup,
+    );
+}
+
+fn render_permissions_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let modes = [ExecutionMode::Auto, ExecutionMode::Dangerous];
+    let items = modes.into_iter().map(|mode| {
+        let current = if mode == app.execution_mode {
+            " · current"
+        } else {
+            ""
+        };
+        let color = if mode == ExecutionMode::Dangerous {
+            Color::Red
+        } else {
+            Color::Green
+        };
+        ListItem::new(Text::from(vec![
+            Line::styled(
+                format!("{}{}", mode.label(), current),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(mode.description(), Style::default().fg(Color::DarkGray)),
+        ]))
+    });
+    let popup = centered_rect(72, 8, area);
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(" Permissions ")
+                .title_bottom(Line::from(" j/k select · Enter apply · Esc close "))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_symbol("› ")
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    let mut state = ListState::default().with_selected(Some(app.permission_index.min(1)));
+    frame.render_widget(Clear, popup);
+    frame.render_stateful_widget(list, popup, &mut state);
+}
+
+fn render_dangerous_confirm(frame: &mut Frame, area: Rect) {
+    let popup = centered_rect(76, 10, area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(
+            "Dangerous mode grants Codex full system access and disables approval prompts.\n\nEnable Dangerous mode? [y/N]",
+        )
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title(" Enable Dangerous mode ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
         ),
         popup,
     );
@@ -3296,9 +3400,12 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(list, popup, &mut state);
 }
 
-fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(72, 32, area);
-    let help = "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / permanently delete thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nAll Codex turns use danger-full-access without approval prompts.\nPress any key to close";
+fn render_help(frame: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(72, 34, area);
+    let help = format!(
+        "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n/permissions choose Auto or Dangerous execution\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / permanently delete thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {}\nPress any key to close",
+        execution_status(app.execution_mode)
+    );
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(help).wrap(Wrap { trim: false }).block(
@@ -3490,6 +3597,18 @@ mod tests {
         assert!(!is_active_writer_conflict(&anyhow::anyhow!(
             "thread not found"
         )));
+    }
+
+    #[test]
+    fn execution_status_describes_both_permission_modes() {
+        assert_eq!(
+            execution_status(ExecutionMode::Auto),
+            "AUTO · workspace-write · approvals on-request"
+        );
+        assert_eq!(
+            execution_status(ExecutionMode::Dangerous),
+            "DANGEROUS · danger-full-access · approvals never"
+        );
     }
 
     #[test]
