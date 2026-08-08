@@ -268,6 +268,7 @@ pub struct ChatState {
     streaming_message: Option<usize>,
     pending_user_message: Option<String>,
     pending_steers: VecDeque<String>,
+    interrupt_requested: bool,
     message_selection_scroll_pending: bool,
 }
 
@@ -301,6 +302,7 @@ impl ChatState {
             streaming_message: None,
             pending_user_message: None,
             pending_steers: VecDeque::new(),
+            interrupt_requested: false,
             message_selection_scroll_pending: false,
         }
     }
@@ -339,6 +341,7 @@ impl ChatState {
         self.streaming_message = None;
         self.pending_user_message = None;
         self.pending_steers.clear();
+        self.interrupt_requested = false;
         self.visible_editor_target = None;
         self.selected_message_index = None;
         self.message_selection_scroll_pending = false;
@@ -352,19 +355,23 @@ impl ChatState {
                 self.active_turn_id = turn.get("id").and_then(Value::as_str).map(str::to_owned);
                 self.waiting_for_activity = true;
             }
-            let Some(items) = turn.get("items").and_then(Value::as_array) else {
-                continue;
-            };
-            for item in items {
-                let item_type = item.get("type").and_then(Value::as_str);
-                if in_progress && item_type != Some("userMessage") {
-                    self.waiting_for_activity = false;
+            if let Some(items) = turn.get("items").and_then(Value::as_array) {
+                for item in items {
+                    let item_type = item.get("type").and_then(Value::as_str);
+                    if in_progress && item_type != Some("userMessage") {
+                        self.waiting_for_activity = false;
+                    }
+                    if in_progress
+                        && item.get("status").and_then(Value::as_str) == Some("inProgress")
+                    {
+                        self.push_started_item(item);
+                    } else {
+                        self.push_completed_item(item);
+                    }
                 }
-                if in_progress && item.get("status").and_then(Value::as_str) == Some("inProgress") {
-                    self.push_started_item(item);
-                } else {
-                    self.push_completed_item(item);
-                }
+            }
+            if turn.get("status").and_then(Value::as_str) == Some("interrupted") {
+                self.push_notice("■ Response interrupted".into());
             }
         }
     }
@@ -373,6 +380,7 @@ impl ChatState {
         self.push_optimistic_user_message(prompt);
         self.active_turn_id = Some(turn_id);
         self.streaming_message = None;
+        self.interrupt_requested = false;
         self.waiting_for_activity = true;
         if self.is_side_chat {
             self.side_chat_has_activity = true;
@@ -386,6 +394,18 @@ impl ChatState {
 
     pub fn pending_steer_count(&self) -> usize {
         self.pending_steers.len()
+    }
+
+    pub fn pending_steer_prompts(&self) -> Vec<String> {
+        self.pending_steers.iter().cloned().collect()
+    }
+
+    pub fn mark_interrupt_requested(&mut self) {
+        self.interrupt_requested = true;
+    }
+
+    pub fn interrupt_is_requested(&self) -> bool {
+        self.interrupt_requested
     }
 
     fn push_optimistic_user_message(&mut self, prompt: String) {
@@ -643,14 +663,21 @@ impl ChatState {
                 }
             }
             "turn/completed" => {
+                let interrupted = event.params.pointer("/turn/status").and_then(Value::as_str)
+                    == Some("interrupted");
                 self.active_turn_id = None;
                 self.streaming_message = None;
                 self.pending_user_message = None;
                 self.pending_steers.clear();
+                self.interrupt_requested = false;
                 self.waiting_for_activity = false;
+                if interrupted {
+                    self.push_notice("■ Response interrupted".into());
+                }
             }
             "error" => {
                 self.pending_steers.clear();
+                self.interrupt_requested = false;
                 self.waiting_for_activity = false;
                 let message = event
                     .params
@@ -1091,6 +1118,19 @@ mod tests {
     }
 
     #[test]
+    fn restores_interrupted_turn_notice_from_history() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.load_history(&json!({"thread":{"turns":[{
+            "status":"interrupted",
+            "items":[{"type":"userMessage","content":[{"type":"text","text":"question"}]}]
+        }]}}));
+
+        assert_eq!(chat.messages.len(), 2);
+        assert_eq!(chat.messages[1].role, ChatRole::Activity);
+        assert_eq!(chat.messages[1].content, "■ Response interrupted");
+    }
+
+    #[test]
     fn restores_in_progress_history_and_accepts_new_streaming_events() {
         let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
         chat.load_history(&json!({"thread":{"turns":[{
@@ -1170,6 +1210,7 @@ mod tests {
         ));
         chat.steer_submitted("focus on tests".into());
         assert_eq!(chat.pending_steer_count(), 1);
+        assert_eq!(chat.pending_steer_prompts(), ["focus on tests"]);
         chat.apply(&event(
             "item/completed",
             json!({
@@ -1187,15 +1228,18 @@ mod tests {
         assert_eq!(chat.messages[2].content, "focus on tests");
         assert_eq!(chat.messages[3].content, "steered response");
         assert_eq!(chat.pending_steer_count(), 0);
+        assert!(chat.pending_steer_prompts().is_empty());
     }
 
     #[test]
-    fn pending_steers_clear_when_the_turn_finishes() {
+    fn interrupted_turn_clears_live_state_and_adds_notice() {
         let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
         chat.begin_user_turn("question".into(), "u".into());
         chat.steer_submitted("first".into());
         chat.steer_submitted("second".into());
+        chat.mark_interrupt_requested();
         assert_eq!(chat.pending_steer_count(), 2);
+        assert!(chat.interrupt_is_requested());
 
         chat.apply(&event(
             "turn/completed",
@@ -1203,6 +1247,26 @@ mod tests {
         ));
 
         assert_eq!(chat.pending_steer_count(), 0);
+        assert!(!chat.interrupt_is_requested());
+        assert_eq!(chat.messages.last().unwrap().role, ChatRole::Activity);
+        assert_eq!(
+            chat.messages.last().unwrap().content,
+            "■ Response interrupted"
+        );
+    }
+
+    #[test]
+    fn completed_turn_does_not_add_an_interruption_notice() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.begin_user_turn("question".into(), "u".into());
+        let message_count = chat.messages.len();
+
+        chat.apply(&event(
+            "turn/completed",
+            json!({"turn":{"id":"u","status":"completed"}}),
+        ));
+
+        assert_eq!(chat.messages.len(), message_count);
     }
 
     #[test]

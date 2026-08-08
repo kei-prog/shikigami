@@ -125,11 +125,15 @@ page, and `g` / `G` for the beginning or latest message. `i`, `Enter`, `Tab`, or
 `Esc` returns focus to the repository tree. Press `Ctrl-c` in either mode to
 stop the current response. While a response is streaming, type another message
 and press `Enter` to steer the active turn with the additional instruction. A
-`Follow-up sent` status remains visible until App Server reports the steer as a
-user message. A blinking cursor follows the composer input and is hidden outside
-input mode. New output follows the bottom only while the view is already at the
-latest message. Entering scroll mode always starts from the latest message at
-the bottom.
+yellow message-box status remains visible until App Server reports the steer as
+a user message. Pending follow-up contents are listed between the chat history
+and message box, then removed one by one as App Server reports them. After
+`Ctrl-c`, the message box shows `Stopping response…`; once App Server confirms
+the interruption, `Response interrupted` remains in the chat activity.
+A blinking cursor follows the composer input and is hidden outside input mode.
+New output follows the bottom only while the view is already at the latest
+message. Entering scroll mode always starts from the latest message at the
+bottom.
 
 In scroll mode, `J` / `K` selects the next or previous raw chat message and
 keeps it visible. Press `y` to copy that message without its rendered wrapping

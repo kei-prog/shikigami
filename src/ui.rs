@@ -1055,11 +1055,25 @@ fn is_unavailable_thread_read_error(error: &anyhow::Error) -> bool {
             .is_some_and(|message| message.starts_with("thread "))
 }
 
-async fn interrupt_chat(app: &App, server: &Arc<AppServer>) -> Result<()> {
-    if let Some(chat) = app.chat()
-        && let Some(turn_id) = &chat.active_turn_id
-    {
-        server.interrupt_turn(&chat.thread_id, turn_id).await?;
+async fn interrupt_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
+    let Some((thread_id, turn_id)) = app.chat().and_then(|chat| {
+        chat.active_turn_id
+            .as_ref()
+            .map(|turn_id| (chat.thread_id.clone(), turn_id.clone()))
+    }) else {
+        return Ok(());
+    };
+    match server.interrupt_turn(&thread_id, &turn_id).await {
+        Ok(()) => {
+            if let Some(chat) = app.chat_mut() {
+                chat.mark_interrupt_requested();
+            }
+        }
+        Err(error) => {
+            if let Some(chat) = app.chat_mut() {
+                chat.push_notice(format!("✗ Could not stop response: {error}"));
+            }
+        }
     }
     Ok(())
 }
@@ -1478,15 +1492,31 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane
     let Some(chat) = app.chats.get_mut(&chat_id) else {
         return;
     };
+    let pending_prompts = chat.pending_steer_prompts();
+    let pending_lines = pending_follow_up_lines(
+        &pending_prompts,
+        area.width.saturating_sub(3).max(1) as usize,
+    );
+    let pending_height_limit = area.height.saturating_sub(10);
+    let show_pending = !pending_lines.is_empty() && pending_height_limit >= 3;
+    let pending_height = u16::try_from(pending_lines.len().saturating_add(2))
+        .unwrap_or(u16::MAX)
+        .min(pending_height_limit);
+    let mut constraints = vec![Constraint::Min(5)];
+    if show_pending {
+        constraints.push(Constraint::Length(pending_height));
+    }
+    constraints.extend([Constraint::Length(4), Constraint::Length(1)]);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(5),
-            Constraint::Length(4),
-            Constraint::Length(1),
-        ])
+        .constraints(constraints)
         .split(area);
-    let visible_height = chunks[0].height.saturating_sub(2).max(1) as usize;
+    let chat_area = chunks[0];
+    let pending_area = show_pending.then_some(chunks[1]);
+    let message_index = usize::from(show_pending) + 1;
+    let message_area = chunks[message_index];
+    let help_area = chunks[message_index + 1];
+    let visible_height = chat_area.height.saturating_sub(2).max(1) as usize;
     let chat_border = if pane_active && chat.mode == ChatMode::Scroll {
         Color::Cyan
     } else {
@@ -1497,7 +1527,7 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane
         .borders(Borders::ALL)
         .padding(Padding::right(1))
         .border_style(Style::default().fg(chat_border));
-    let text_width = chat_block.inner(chunks[0]).width.max(1);
+    let text_width = chat_block.inner(chat_area).width.max(1);
     let RenderedChat {
         lines,
         selected_range,
@@ -1515,22 +1545,43 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane
     chat.visible_editor_target =
         visible_editor_target(editor_targets, chat.scroll_top, visible_height);
     let scroll = u16::try_from(chat.scroll_top).unwrap_or(u16::MAX);
-    frame.render_widget(paragraph.scroll((scroll, 0)), chunks[0]);
-    let message_border = if chat.mode == ChatMode::Input && chat_focused && !read_only {
+    frame.render_widget(paragraph.scroll((scroll, 0)), chat_area);
+    if let Some(pending_area) = pending_area {
+        let pending_block = Block::default()
+            .title(pending_follow_up_title(pending_prompts.len()))
+            .borders(Borders::ALL)
+            .padding(Padding::right(1))
+            .border_style(Style::default().fg(Color::Yellow));
+        let pending_visible_height = pending_block.inner(pending_area).height.max(1) as usize;
+        let pending_scroll = pending_lines.len().saturating_sub(pending_visible_height);
+        frame.render_widget(
+            Paragraph::new(Text::from(
+                pending_lines
+                    .iter()
+                    .map(|line| Line::from(line.clone()))
+                    .collect::<Vec<_>>(),
+            ))
+            .scroll((u16::try_from(pending_scroll).unwrap_or(u16::MAX), 0))
+            .block(pending_block),
+            pending_area,
+        );
+    }
+    let pending_steers = chat.pending_steer_count();
+    let stopping = chat.interrupt_is_requested();
+    let has_live_status = pending_steers > 0 || stopping;
+    let message_border = if has_live_status && !read_only {
+        Color::Yellow
+    } else if chat.mode == ChatMode::Input && chat_focused && !read_only {
         Color::Cyan
     } else {
         Color::DarkGray
     };
     let message_block = Block::default()
-        .title(if read_only {
-            " Read only "
-        } else {
-            " Message "
-        })
+        .title(composer_title(read_only, pending_steers, stopping))
         .borders(Borders::ALL)
         .padding(Padding::right(1))
         .border_style(Style::default().fg(message_border));
-    let message_inner = message_block.inner(chunks[1]);
+    let message_inner = message_block.inner(message_area);
     let composer_width = message_inner.width.max(1) as usize;
     let composer_lines = if read_only {
         wrap_composer(
@@ -1555,7 +1606,7 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane
         ))
         .scroll((u16::try_from(composer_scroll).unwrap_or(u16::MAX), 0))
         .block(message_block),
-        chunks[1],
+        message_area,
     );
     if show_composer_cursor
         && chat.mode == ChatMode::Input
@@ -1581,24 +1632,17 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &mut App, pane: ChatPane
         chat.mode,
         has_side_chat,
         chat.active_turn_id.is_some(),
-        chat.pending_steer_count(),
     );
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
-        chunks[2],
+        help_area,
     );
     if pane_active && let Some(palette) = &chat.palette {
         render_command_palette(frame, area, palette);
     }
 }
 
-fn chat_help(
-    read_only: bool,
-    mode: ChatMode,
-    has_side_chat: bool,
-    active_turn: bool,
-    pending_steers: usize,
-) -> String {
+fn chat_help(read_only: bool, mode: ChatMode, has_side_chat: bool, active_turn: bool) -> String {
     let controls = if read_only {
         "READ ONLY · / palette · /threads retry · Tab scroll · Esc threads".into()
     } else {
@@ -1619,16 +1663,52 @@ fn chat_help(
             }
         }
     };
-    let help = if active_turn {
+    if active_turn {
         format!("Ctrl-C stop · {controls}")
     } else {
         controls
-    };
-    match pending_steers {
-        0 => help,
-        1 => format!("Follow-up sent · waiting for Codex… · {help}"),
-        count => format!("{count} follow-ups sent · waiting for Codex… · {help}"),
     }
+}
+
+fn composer_title(read_only: bool, pending_steers: usize, stopping: bool) -> String {
+    if read_only {
+        return " Read only ".into();
+    }
+    if stopping {
+        return " Message · Stopping response… ".into();
+    }
+    match pending_steers {
+        0 => " Message ".into(),
+        1 => " Message · Follow-up sent · waiting for Codex… ".into(),
+        count => format!(" Message · {count} follow-ups sent · waiting for Codex… "),
+    }
+}
+
+fn pending_follow_up_title(count: usize) -> String {
+    match count {
+        1 => " Follow-up waiting ".into(),
+        count => format!(" {count} follow-ups waiting "),
+    }
+}
+
+fn pending_follow_up_lines(prompts: &[String], max_width: usize) -> Vec<String> {
+    let content_width = max_width.saturating_sub(2).max(1);
+    let mut lines = Vec::new();
+    for prompt in prompts {
+        let mut first_line = true;
+        for logical_line in prompt.split('\n') {
+            let mut wrapped_lines = wrap_composer(logical_line, content_width);
+            if wrapped_lines.len() > 1 && wrapped_lines.last().is_some_and(String::is_empty) {
+                wrapped_lines.pop();
+            }
+            for wrapped_line in wrapped_lines {
+                let prefix = if first_line { "› " } else { "  " };
+                lines.push(format!("{prefix}{wrapped_line}"));
+                first_line = false;
+            }
+        }
+    }
+    lines
 }
 
 fn thinking_frame() -> &'static str {
@@ -2828,8 +2908,8 @@ mod tests {
 
     #[test]
     fn active_chat_help_shows_steer_and_interrupt_shortcuts() {
-        let active = chat_help(false, ChatMode::Input, false, true, 0);
-        let idle = chat_help(false, ChatMode::Input, false, false, 0);
+        let active = chat_help(false, ChatMode::Input, false, true);
+        let idle = chat_help(false, ChatMode::Input, false, false);
 
         assert!(active.starts_with("Ctrl-C stop · "));
         assert!(active.contains("Enter steer"));
@@ -2838,12 +2918,33 @@ mod tests {
     }
 
     #[test]
-    fn chat_help_shows_pending_steer_feedback() {
-        let one = chat_help(false, ChatMode::Input, false, true, 1);
-        let multiple = chat_help(false, ChatMode::Input, false, true, 2);
+    fn composer_title_shows_live_chat_status() {
+        let one = composer_title(false, 1, false);
+        let multiple = composer_title(false, 2, false);
+        let stopping = composer_title(false, 2, true);
 
-        assert!(one.starts_with("Follow-up sent · waiting for Codex…"));
-        assert!(multiple.starts_with("2 follow-ups sent · waiting for Codex…"));
+        assert!(one.contains("Follow-up sent · waiting for Codex…"));
+        assert!(multiple.contains("2 follow-ups sent · waiting for Codex…"));
+        assert!(stopping.contains("Stopping response…"));
+        assert!(!stopping.contains("follow-ups"));
+    }
+
+    #[test]
+    fn pending_follow_ups_show_their_contents_in_submission_order() {
+        let prompts = vec!["first follow-up".into(), "second\nfollow-up".into()];
+
+        assert_eq!(
+            pending_follow_up_lines(&prompts, 40),
+            ["› first follow-up", "› second", "  follow-up"]
+        );
+        assert_eq!(pending_follow_up_title(2), " 2 follow-ups waiting ");
+    }
+
+    #[test]
+    fn pending_follow_up_contents_wrap_with_an_indented_continuation() {
+        let prompts = vec!["abcdefgh".into()];
+
+        assert_eq!(pending_follow_up_lines(&prompts, 6), ["› abcd", "  efgh"]);
     }
 
     #[test]
