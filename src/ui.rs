@@ -671,6 +671,9 @@ async fn handle_key(
             KeyCode::Tab if app.chat().is_some() => {
                 app.focus = Focus::Chat;
                 app.mode = Mode::Chat;
+                if let Some(chat) = app.chat_mut() {
+                    chat.enter_scroll_mode();
+                }
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 app.move_up();
