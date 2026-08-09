@@ -37,7 +37,7 @@ results are cached, while the main screen only shows repositories you register.
 - `Tab`: focus the open chat
 - `Esc`: select the parent repository or return from chat to the tree
 - `/`: fuzzy-search active threads from the repository tree
-- `R`: rename the selected thread from the repository tree or thread picker
+- `R`: rename the selected thread, or suggest names for selected threads in a repository
 - `y` / `Y`: copy the selected thread ID or its `codex resume` command
 - `a`: add repositories
 - `n`: create a thread in the primary repository, a new worktree, or an existing worktree
@@ -117,6 +117,15 @@ trims outer whitespace, rejects empty names, and limits input to 100 displayed
 characters to keep the TUI compact. A failed App Server request leaves the old
 name and the rename input intact. Archived threads must be restored before they
 can be renamed.
+
+Pressing `R` on a repository row opens a multi-select list of its active threads.
+After choosing the target threads, Shikigami reads only their recent conversation
+content and asks a temporary read-only Codex thread to propose concise names. Each
+proposal follows the natural language used by the user in that conversation while
+preserving conventional technical names. The review screen keeps every existing
+name unchanged until the user includes, edits, and confirms its proposal. Failed
+updates remain in the review screen and can be retried without reapplying successful
+renames.
 
 Codex does not persist a new thread until its first turn. When an untitled chat
 has no messages, leaving it removes the temporary thread from Shikigami. A clean

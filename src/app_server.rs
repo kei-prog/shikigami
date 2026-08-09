@@ -349,6 +349,27 @@ impl AppServer {
         extract_thread_id(&response, "thread/start")
     }
 
+    pub async fn start_ephemeral_read_only_thread(
+        &self,
+        cwd: &Path,
+        model: Option<&str>,
+    ) -> Result<String> {
+        let response = self
+            .request(
+                "thread/start",
+                json!({
+                    "cwd": cwd,
+                    "model": model,
+                    "approvalPolicy": "never",
+                    "sandbox": "read-only",
+                    "ephemeral": true,
+                    "dynamicTools": []
+                }),
+            )
+            .await?;
+        extract_thread_id(&response, "thread/start")
+    }
+
     pub async fn resume_thread(
         &self,
         thread_id: &str,
@@ -547,6 +568,35 @@ impl AppServer {
                     "effort": settings.effort,
                     "approvalPolicy": approval_policy,
                     "sandboxPolicy": {"type": sandbox_policy}
+                }),
+            )
+            .await?;
+        response
+            .pointer("/turn/id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .context("turn/start response missing turn.id")
+    }
+
+    pub async fn start_read_only_turn(
+        &self,
+        thread_id: &str,
+        cwd: &Path,
+        prompt: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<String> {
+        let response = self
+            .request(
+                "turn/start",
+                json!({
+                    "threadId": thread_id,
+                    "cwd": cwd,
+                    "input": turn_input(prompt, &[], &[]),
+                    "model": model,
+                    "effort": effort,
+                    "approvalPolicy": "never",
+                    "sandboxPolicy": {"type": "readOnly"}
                 }),
             )
             .await?;
@@ -907,6 +957,102 @@ mod tests {
         .await;
 
         assert_eq!(task.await.unwrap().unwrap(), "thread-1");
+    }
+
+    #[tokio::test]
+    async fn naming_threads_are_ephemeral_read_only_and_tool_free() {
+        let (writer, mut messages) = mpsc::channel(1);
+        let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(1);
+        let (_request_tx, request_rx) = mpsc::channel(1);
+        let server = Arc::new(AppServer {
+            writer,
+            writer_task: Mutex::new(None),
+            reader_task: Mutex::new(None),
+            child: Mutex::new(None),
+            pending: pending.clone(),
+            next_id: AtomicU64::new(0),
+            events,
+            server_requests: Mutex::new(request_rx),
+            version: "test".into(),
+            request_timeout: Duration::from_secs(1),
+        });
+
+        let task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .start_ephemeral_read_only_thread(Path::new("/tmp/project"), Some("model"))
+                    .await
+            }
+        });
+        let OutgoingMessage::Json(message) = messages.recv().await.unwrap() else {
+            panic!("unexpected shutdown message");
+        };
+        assert_eq!(message["method"], "thread/start");
+        assert_eq!(message["params"]["approvalPolicy"], "never");
+        assert_eq!(message["params"]["sandbox"], "read-only");
+        assert_eq!(message["params"]["ephemeral"], true);
+        assert_eq!(message["params"]["dynamicTools"], json!([]));
+        dispatch_response(
+            &pending,
+            &json!({"id":message["id"],"result":{"thread":{"id":"naming"}}}),
+        )
+        .await;
+
+        assert_eq!(task.await.unwrap().unwrap(), "naming");
+    }
+
+    #[tokio::test]
+    async fn naming_turns_use_the_read_only_turn_policy() {
+        let (writer, mut messages) = mpsc::channel(1);
+        let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(1);
+        let (_request_tx, request_rx) = mpsc::channel(1);
+        let server = Arc::new(AppServer {
+            writer,
+            writer_task: Mutex::new(None),
+            reader_task: Mutex::new(None),
+            child: Mutex::new(None),
+            pending: pending.clone(),
+            next_id: AtomicU64::new(0),
+            events,
+            server_requests: Mutex::new(request_rx),
+            version: "test".into(),
+            request_timeout: Duration::from_secs(1),
+        });
+
+        let task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .start_read_only_turn(
+                        "naming",
+                        Path::new("/tmp/project"),
+                        "Suggest names",
+                        Some("model"),
+                        Some("low"),
+                    )
+                    .await
+            }
+        });
+        let OutgoingMessage::Json(message) = messages.recv().await.unwrap() else {
+            panic!("unexpected shutdown message");
+        };
+        assert_eq!(message["method"], "turn/start");
+        assert_eq!(message["params"]["approvalPolicy"], "never");
+        assert_eq!(
+            message["params"]["sandboxPolicy"],
+            json!({"type":"readOnly"})
+        );
+        assert_eq!(message["params"]["input"][0]["text"], "Suggest names");
+        dispatch_response(
+            &pending,
+            &json!({"id":message["id"],"result":{"turn":{"id":"turn-1"}}}),
+        )
+        .await;
+
+        assert_eq!(task.await.unwrap().unwrap(), "turn-1");
     }
 
     #[tokio::test]

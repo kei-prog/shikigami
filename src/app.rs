@@ -51,6 +51,7 @@ pub enum Mode {
     ChooseSideChat,
     ChooseThread,
     RenameThread,
+    BulkRenameThreads,
     Attention,
     ConfirmQuit,
     Approval,
@@ -117,6 +118,49 @@ pub struct AttentionItem {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BulkRenamePhase {
+    Select,
+    Generating { return_to_review: bool },
+    Review,
+    Editing,
+    ConfirmApply,
+    Applying,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BulkRenameCandidate {
+    pub thread_id: String,
+    pub current_name: String,
+    pub proposed_name: String,
+    pub selected: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BulkRenameState {
+    pub repository_name: String,
+    pub repository_path: PathBuf,
+    pub candidates: Vec<BulkRenameCandidate>,
+    pub index: usize,
+    pub phase: BulkRenamePhase,
+    pub edit_input: String,
+    generating_ids: HashSet<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ThreadNameGenerationRequest {
+    pub repository_path: PathBuf,
+    pub threads: Vec<(String, String)>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ThreadNameApplyRequest {
+    pub names: Vec<(String, String)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TreeRow {
     Repository {
         repository_index: usize,
@@ -173,6 +217,7 @@ pub struct App {
     pub rename_thread_id: Option<String>,
     pub rename_input: String,
     pub rename_return_mode: Mode,
+    pub bulk_rename: Option<BulkRenameState>,
     pub active_chat_pane: ChatPane,
     pub resumed_threads: HashSet<String>,
     opened_threads: HashSet<String>,
@@ -290,6 +335,7 @@ impl App {
             rename_thread_id: None,
             rename_input: String::new(),
             rename_return_mode: Mode::Normal,
+            bulk_rename: None,
             active_chat_pane: ChatPane::Main,
             resumed_threads: HashSet::new(),
             opened_threads: HashSet::new(),
@@ -2282,6 +2328,276 @@ impl App {
         if self.mode == Mode::ChooseThread {
             self.refresh_thread_picker_matches();
         }
+    }
+
+    pub fn open_bulk_thread_rename(&mut self) {
+        if self.show_archived {
+            self.message = Some("Restore archived threads before renaming them".into());
+            return;
+        }
+        let Some(repository) = self.selected_repository().cloned() else {
+            self.message = Some("No repository selected".into());
+            return;
+        };
+        let candidates = self
+            .threads
+            .iter()
+            .filter(|thread| thread.record.repository_path == repository.path)
+            .map(|thread| BulkRenameCandidate {
+                thread_id: thread.record.id.clone(),
+                current_name: thread.record.title.clone(),
+                proposed_name: thread.record.title.clone(),
+                selected: true,
+                error: None,
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            self.message = Some("The selected repository has no active threads".into());
+            return;
+        }
+        self.bulk_rename = Some(BulkRenameState {
+            repository_name: repository.name,
+            repository_path: repository.path,
+            candidates,
+            index: 0,
+            phase: BulkRenamePhase::Select,
+            edit_input: String::new(),
+            generating_ids: HashSet::new(),
+        });
+        self.mode = Mode::BulkRenameThreads;
+        self.message = None;
+    }
+
+    pub fn close_bulk_thread_rename(&mut self) {
+        self.bulk_rename = None;
+        self.mode = Mode::Normal;
+    }
+
+    pub fn move_bulk_rename_up(&mut self) {
+        if let Some(state) = self.bulk_rename.as_mut() {
+            state.index = state.index.saturating_sub(1);
+        }
+    }
+
+    pub fn move_bulk_rename_down(&mut self) {
+        if let Some(state) = self.bulk_rename.as_mut() {
+            state.index = state
+                .index
+                .saturating_add(1)
+                .min(state.candidates.len().saturating_sub(1));
+        }
+    }
+
+    pub fn toggle_bulk_rename_candidate(&mut self) {
+        let Some(state) = self.bulk_rename.as_mut() else {
+            return;
+        };
+        if let Some(candidate) = state.candidates.get_mut(state.index) {
+            candidate.selected = !candidate.selected;
+            candidate.error = None;
+        }
+    }
+
+    pub fn toggle_all_bulk_rename_candidates(&mut self) {
+        let Some(state) = self.bulk_rename.as_mut() else {
+            return;
+        };
+        let select = state.candidates.iter().any(|candidate| !candidate.selected);
+        for candidate in &mut state.candidates {
+            candidate.selected = select;
+            candidate.error = None;
+        }
+    }
+
+    pub fn begin_bulk_name_generation(
+        &mut self,
+        selected_only: bool,
+    ) -> Result<ThreadNameGenerationRequest> {
+        let model_settings = self.default_model_settings();
+        let state = self
+            .bulk_rename
+            .as_mut()
+            .context("bulk rename is not open")?;
+        let return_to_review = state.phase != BulkRenamePhase::Select;
+        let threads = if selected_only {
+            state
+                .candidates
+                .get(state.index)
+                .map(|candidate| {
+                    vec![(candidate.thread_id.clone(), candidate.current_name.clone())]
+                })
+                .unwrap_or_default()
+        } else {
+            state
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.selected)
+                .map(|candidate| (candidate.thread_id.clone(), candidate.current_name.clone()))
+                .collect()
+        };
+        anyhow::ensure!(!threads.is_empty(), "Select at least one thread");
+        state.generating_ids = threads.iter().map(|(id, _)| id.clone()).collect();
+        state.phase = BulkRenamePhase::Generating { return_to_review };
+        let (model, effort) = model_settings
+            .map(|(model, _, effort)| (Some(model), effort))
+            .unwrap_or_default();
+        Ok(ThreadNameGenerationRequest {
+            repository_path: state.repository_path.clone(),
+            threads,
+            model,
+            effort,
+        })
+    }
+
+    pub fn complete_bulk_name_generation(
+        &mut self,
+        result: std::result::Result<Vec<(String, String)>, String>,
+    ) {
+        let Some(state) = self.bulk_rename.as_mut() else {
+            return;
+        };
+        let return_to_review = matches!(
+            state.phase,
+            BulkRenamePhase::Generating {
+                return_to_review: true
+            }
+        );
+        match result {
+            Ok(suggestions) => {
+                let suggestions = suggestions.into_iter().collect::<HashMap<_, _>>();
+                for candidate in &mut state.candidates {
+                    if !state.generating_ids.contains(&candidate.thread_id) {
+                        continue;
+                    }
+                    candidate.error = None;
+                    if let Some(name) = suggestions.get(&candidate.thread_id) {
+                        candidate.proposed_name.clone_from(name);
+                        candidate.selected = name.trim() != candidate.current_name.trim();
+                    } else {
+                        candidate.error = Some("Codex did not return a suggestion".into());
+                        candidate.selected = false;
+                    }
+                }
+                state.phase = BulkRenamePhase::Review;
+                self.message = None;
+            }
+            Err(error) => {
+                state.phase = if return_to_review {
+                    BulkRenamePhase::Review
+                } else {
+                    BulkRenamePhase::Select
+                };
+                self.message = Some(format!("Could not suggest thread names: {error}"));
+            }
+        }
+        state.generating_ids.clear();
+    }
+
+    pub fn begin_bulk_rename_edit(&mut self) {
+        let Some(state) = self.bulk_rename.as_mut() else {
+            return;
+        };
+        let Some(candidate) = state.candidates.get(state.index) else {
+            return;
+        };
+        state.edit_input.clone_from(&candidate.proposed_name);
+        state.phase = BulkRenamePhase::Editing;
+        self.message = None;
+    }
+
+    pub fn cancel_bulk_rename_edit(&mut self) {
+        if let Some(state) = self.bulk_rename.as_mut() {
+            state.edit_input.clear();
+            state.phase = BulkRenamePhase::Review;
+        }
+        self.message = None;
+    }
+
+    pub fn save_bulk_rename_edit(&mut self, name: String) {
+        let Some(state) = self.bulk_rename.as_mut() else {
+            return;
+        };
+        if let Some(candidate) = state.candidates.get_mut(state.index) {
+            candidate.proposed_name = name;
+            candidate.selected = candidate.proposed_name.trim() != candidate.current_name.trim();
+            candidate.error = None;
+        }
+        state.edit_input.clear();
+        state.phase = BulkRenamePhase::Review;
+        self.message = None;
+    }
+
+    pub fn confirm_bulk_thread_rename(&mut self) -> Result<()> {
+        let state = self
+            .bulk_rename
+            .as_mut()
+            .context("bulk rename is not open")?;
+        anyhow::ensure!(
+            state.candidates.iter().any(|candidate| {
+                candidate.selected
+                    && candidate.proposed_name.trim() != candidate.current_name.trim()
+            }),
+            "Select at least one changed name"
+        );
+        state.phase = BulkRenamePhase::ConfirmApply;
+        Ok(())
+    }
+
+    pub fn begin_bulk_thread_rename_apply(&mut self) -> Result<ThreadNameApplyRequest> {
+        let state = self
+            .bulk_rename
+            .as_mut()
+            .context("bulk rename is not open")?;
+        let names = state
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.selected
+                    && candidate.proposed_name.trim() != candidate.current_name.trim()
+            })
+            .map(|candidate| (candidate.thread_id.clone(), candidate.proposed_name.clone()))
+            .collect::<Vec<_>>();
+        anyhow::ensure!(!names.is_empty(), "Select at least one changed name");
+        state.phase = BulkRenamePhase::Applying;
+        Ok(ThreadNameApplyRequest { names })
+    }
+
+    pub fn complete_bulk_thread_rename_apply(
+        &mut self,
+        successes: Vec<(String, String)>,
+        failures: Vec<(String, String)>,
+    ) {
+        for (thread_id, name) in &successes {
+            self.apply_thread_name(thread_id, Some(name.clone()));
+        }
+        if failures.is_empty() {
+            let count = successes.len();
+            self.close_bulk_thread_rename();
+            self.message = Some(format!(
+                "Renamed {count} thread{}",
+                if count == 1 { "" } else { "s" }
+            ));
+            return;
+        }
+        let failures = failures.into_iter().collect::<HashMap<_, _>>();
+        if let Some(state) = self.bulk_rename.as_mut() {
+            for candidate in &mut state.candidates {
+                if let Some(error) = failures.get(&candidate.thread_id) {
+                    candidate.error = Some(error.clone());
+                    candidate.selected = true;
+                } else if successes.iter().any(|(id, _)| id == &candidate.thread_id) {
+                    candidate.current_name.clone_from(&candidate.proposed_name);
+                    candidate.selected = false;
+                    candidate.error = None;
+                }
+            }
+            state.phase = BulkRenamePhase::Review;
+        }
+        self.message = Some(format!(
+            "{} thread rename{} failed; review the highlighted rows",
+            failures.len(),
+            if failures.len() == 1 { "" } else { "s" }
+        ));
     }
 
     fn start_scan(&mut self, scope: ScanScope) {
