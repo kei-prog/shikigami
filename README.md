@@ -164,6 +164,19 @@ New output follows the bottom only while the view is already at the latest
 message. Entering scroll mode always starts from the latest message at the
 bottom.
 
+Press `Ctrl-v` (or `Ctrl-Alt-v` in terminals that reserve `Ctrl-v`) to attach
+an image from the system clipboard. Pasting a single PNG, JPEG, GIF, or WebP
+file path also attaches that file; other pasted content remains composer text.
+Attachments appear as numbered image rows in the message box. `Backspace` in an
+empty composer or `Ctrl-x` removes the last attachment before sending, while
+`Ctrl-u` clears the full draft.
+Image-only messages are supported. Shikigami sends attachments as App Server
+`localImage` inputs for both `turn/start` and active-turn `turn/steer`, and keeps
+their labels aligned in history, pending follow-ups, main chats, and side chats.
+The live App Server model catalog controls image availability: a model whose
+`inputModalities` excludes `image` cannot accept or send image attachments, and
+the draft remains available so it can be removed or sent after switching models.
+
 In scroll mode, `J` / `K` selects the next or previous raw chat message and
 keeps it visible. Press `y` to copy that message without its rendered wrapping
 or borders, or `Y` to copy the full current chat with role labels. Main and side
