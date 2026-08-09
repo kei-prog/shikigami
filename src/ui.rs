@@ -1163,35 +1163,22 @@ fn validate_thread_name(input: &str) -> std::result::Result<String, String> {
 }
 
 async fn refresh_thread_names(app: &mut App, server: &Arc<AppServer>) {
-    let thread_ids = match app.registered_thread_ids() {
-        Ok(thread_ids) => thread_ids,
+    let (thread_ids, cwds) = match app.registered_threads_for_name_refresh() {
+        Ok(scope) => scope,
         Err(error) => {
             app.message = Some(format!("Could not list threads for name refresh: {error}"));
             return;
         }
     };
-    let results = futures::stream::iter(thread_ids.into_iter().map(|thread_id| {
-        let server = Arc::clone(server);
-        async move {
-            let result = server.read_thread_name(&thread_id).await;
-            (thread_id, result)
-        }
-    }))
-    .buffer_unordered(16)
-    .collect::<Vec<_>>()
-    .await;
-    let mut first_error = None;
-    for (thread_id, result) in results {
-        match result {
-            Ok(name) => app.apply_thread_name(&thread_id, name),
-            Err(error) if is_missing_thread_error(&error) => {}
-            Err(error) => {
-                first_error.get_or_insert_with(|| error.to_string());
+    match server.list_thread_names(&cwds).await {
+        Ok(mut names) => {
+            for thread_id in thread_ids {
+                app.apply_thread_name(&thread_id, names.remove(&thread_id).unwrap_or(None));
             }
-        };
-    }
-    if let Some(error) = first_error {
-        app.message = Some(format!("Could not refresh some thread names: {error}"));
+        }
+        Err(error) => {
+            app.message = Some(format!("Could not refresh thread names: {error}"));
+        }
     }
 }
 
@@ -2997,13 +2984,16 @@ fn render_thread_picker(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         format!(" Threads · {} · {thread_count} ", app.thread_picker_query)
     };
+    let controls = if app.show_archived {
+        " type filter · ↑/↓ · y ID · Esc "
+    } else {
+        " type filter · ↑/↓ · Enter open · R rename · y ID · Esc "
+    };
     let list = List::new(items)
         .block(
             Block::default()
                 .title(title)
-                .title_bottom(Line::from(
-                    " type filter · ↑/↓ · Enter open · R rename · y ID · Esc ",
-                ))
+                .title_bottom(Line::from(controls))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -3679,9 +3669,7 @@ fn render_navigation_tree(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(focus_style(app.focus == Focus::Navigation));
     if app.show_archived {
-        block = block.title_bottom(Line::from(
-            " R rename · x restore · d delete · A active threads ",
-        ));
+        block = block.title_bottom(Line::from(" x restore · d delete · A active threads "));
     } else {
         block = block.title_bottom(Line::from(" R rename · x archive · A archived threads "));
     }

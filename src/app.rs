@@ -2203,16 +2203,23 @@ impl App {
         }
     }
 
-    pub fn registered_thread_ids(&self) -> Result<Vec<String>> {
-        Ok(self
-            .thread_registry
-            .load()?
+    pub fn registered_threads_for_name_refresh(&self) -> Result<(HashSet<String>, Vec<PathBuf>)> {
+        let records = self.thread_registry.load()?;
+        let ids = records.iter().map(|thread| thread.id.clone()).collect();
+        let mut cwds = records
             .into_iter()
-            .map(|thread| thread.id)
-            .collect())
+            .map(|thread| thread.cwd)
+            .collect::<Vec<_>>();
+        cwds.sort();
+        cwds.dedup();
+        Ok((ids, cwds))
     }
 
     pub fn open_thread_rename(&mut self, from_picker: bool) {
+        if let Err(error) = ensure_thread_rename_context(self.show_archived) {
+            self.message = Some(error.to_string());
+            return;
+        }
         let thread = if from_picker {
             self.selected_thread_picker()
         } else if self.selected_tree_is_thread() {
@@ -2433,6 +2440,11 @@ fn ensure_thread_deletion_context(show_archived: bool, record: &ThreadRecord) ->
         show_archived && record.archived_at.is_some(),
         "permanent deletion is only available for archived threads"
     );
+    Ok(())
+}
+
+fn ensure_thread_rename_context(show_archived: bool) -> Result<()> {
+    anyhow::ensure!(!show_archived, "restore the thread before renaming it");
     Ok(())
 }
 
@@ -2927,6 +2939,15 @@ mod tests {
         item.record.archived_at = Some(1);
         assert!(ensure_thread_deletion_context(false, &item.record).is_err());
         assert!(ensure_thread_deletion_context(true, &item.record).is_ok());
+    }
+
+    #[test]
+    fn archived_threads_must_be_restored_before_rename() {
+        assert!(ensure_thread_rename_context(false).is_ok());
+        assert_eq!(
+            ensure_thread_rename_context(true).unwrap_err().to_string(),
+            "restore the thread before renaming it"
+        );
     }
 
     #[test]

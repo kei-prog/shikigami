@@ -390,17 +390,64 @@ impl AppServer {
         .await
     }
 
-    pub async fn read_thread_name(&self, thread_id: &str) -> Result<Option<String>> {
-        let response = self
-            .request(
-                "thread/read",
-                json!({"threadId": thread_id, "includeTurns": false}),
-            )
-            .await?;
-        Ok(response
-            .pointer("/thread/name")
-            .and_then(Value::as_str)
-            .map(str::to_owned))
+    pub async fn list_thread_names(
+        &self,
+        cwds: &[PathBuf],
+    ) -> Result<HashMap<String, Option<String>>> {
+        if cwds.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut names = HashMap::new();
+        let mut cursor = None;
+        loop {
+            let response = self
+                .request(
+                    "thread/list",
+                    json!({
+                        "cursor": cursor,
+                        "limit": 100,
+                        "cwd": cwds,
+                        "sourceKinds": [
+                            "cli",
+                            "vscode",
+                            "exec",
+                            "appServer",
+                            "subAgent",
+                            "subAgentReview",
+                            "subAgentCompact",
+                            "subAgentThreadSpawn",
+                            "subAgentOther",
+                            "unknown"
+                        ],
+                        "useStateDbOnly": true
+                    }),
+                )
+                .await?;
+            let data = response
+                .get("data")
+                .and_then(Value::as_array)
+                .context("thread/list response missing data")?;
+            for thread in data {
+                if let Some(id) = thread.get("id").and_then(Value::as_str) {
+                    names.insert(
+                        id.to_owned(),
+                        thread
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    );
+                }
+            }
+            let Some(next_cursor) = response
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(names)
     }
 
     pub async fn set_thread_name(&self, thread_id: &str, name: &str) -> Result<()> {
@@ -856,6 +903,60 @@ mod tests {
         dispatch_response(&pending, &json!({"id":message["id"],"result":{}})).await;
 
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn thread_names_are_listed_by_workspace_in_pages() {
+        let (writer, mut messages) = mpsc::channel(1);
+        let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(1);
+        let (_request_tx, request_rx) = mpsc::channel(1);
+        let server = Arc::new(AppServer {
+            writer,
+            writer_task: Mutex::new(None),
+            reader_task: Mutex::new(None),
+            child: Mutex::new(None),
+            pending: pending.clone(),
+            next_id: AtomicU64::new(0),
+            events,
+            server_requests: Mutex::new(request_rx),
+            version: "test".into(),
+            request_timeout: Duration::from_secs(1),
+        });
+
+        let task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .list_thread_names(&[PathBuf::from("/tmp/project")])
+                    .await
+            }
+        });
+        let OutgoingMessage::Json(first) = messages.recv().await.unwrap() else {
+            panic!("unexpected shutdown message");
+        };
+        assert_eq!(first["method"], "thread/list");
+        assert_eq!(first["params"]["cwd"], json!(["/tmp/project"]));
+        assert_eq!(first["params"]["useStateDbOnly"], true);
+        dispatch_response(
+            &pending,
+            &json!({"id":first["id"],"result":{"data":[{"id":"one","name":"First"}],"nextCursor":"page-2"}}),
+        )
+        .await;
+        let OutgoingMessage::Json(second) = messages.recv().await.unwrap() else {
+            panic!("unexpected shutdown message");
+        };
+        assert_eq!(second["params"]["cursor"], "page-2");
+        dispatch_response(
+            &pending,
+            &json!({"id":second["id"],"result":{"data":[{"id":"two","name":null}],"nextCursor":null}}),
+        )
+        .await;
+
+        assert_eq!(
+            task.await.unwrap().unwrap(),
+            HashMap::from([("one".into(), Some("First".into())), ("two".into(), None)])
+        );
     }
 
     #[tokio::test]
