@@ -453,13 +453,18 @@ impl AppServer {
                 .context("thread/list response missing data")?;
             for thread in data {
                 if let Some(id) = thread.get("id").and_then(Value::as_str) {
-                    names.insert(
-                        id.to_owned(),
-                        thread
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                    );
+                    let name = thread
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.trim().is_empty())
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            let preview = thread.get("preview").and_then(Value::as_str)?;
+                            let title =
+                                preview.lines().next()?.chars().take(80).collect::<String>();
+                            (!title.trim().is_empty()).then_some(title)
+                        });
+                    names.insert(id.to_owned(), name);
                 }
             }
             let Some(next_cursor) = response
@@ -986,7 +991,7 @@ mod tests {
         assert_eq!(second["params"]["archived"], false);
         dispatch_response(
             &pending,
-            &json!({"id":second["id"],"result":{"data":[{"id":"two","name":null}],"nextCursor":null}}),
+            &json!({"id":second["id"],"result":{"data":[{"id":"two","name":null,"preview":"Second thread\nMore details"}],"nextCursor":null}}),
         )
         .await;
         let OutgoingMessage::Json(third) = messages.recv().await.unwrap() else {
@@ -1014,7 +1019,7 @@ mod tests {
             task.await.unwrap().unwrap(),
             HashMap::from([
                 ("one".into(), Some("First".into())),
-                ("two".into(), None),
+                ("two".into(), Some("Second thread".into())),
                 ("three".into(), Some("Archived".into())),
                 ("four".into(), Some("Older archived".into())),
             ])
