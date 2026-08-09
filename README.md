@@ -32,6 +32,7 @@ results are cached, while the main screen only shows repositories you register.
 
 - `j` / `k`: move through the repository tree and preview the selected thread
 - `h` / `l`: collapse or expand the selected repository
+- `H` / `L`: collapse or expand all repositories
 - `Enter`: expand a repository or focus the selected thread's chat input
 - `Tab`: focus the open chat
 - `Esc`: select the parent repository or return from chat to the tree

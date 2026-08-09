@@ -874,6 +874,8 @@ async fn handle_key(
             KeyCode::Esc if app.selected_tree_is_thread() => app.select_parent_repository(),
             KeyCode::Char('h') | KeyCode::Left => app.collapse_selected_repository(),
             KeyCode::Char('l') | KeyCode::Right => app.expand_selected_repository(),
+            KeyCode::Char('H') => app.collapse_all_repositories(),
+            KeyCode::Char('L') => app.expand_all_repositories(),
             KeyCode::Tab if app.chat().is_some() => {
                 app.focus = Focus::Chat;
                 app.mode = Mode::Chat;
@@ -2442,7 +2444,7 @@ fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
             app.attention_count()
         )
     } else {
-        "? help · j/k move/preview · h/l collapse/expand · Enter focus · / search · n new · q quit"
+        "? help · j/k move/preview · h/l one · H/L all · Enter focus · / search · n new · q quit"
             .into()
     };
     let status = app.message.as_deref().unwrap_or(&default_status);
@@ -4107,7 +4109,7 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
 fn render_help(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(72, 34, area);
     let help = format!(
-        "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n/permissions choose Auto or Dangerous execution\nR            rename selected thread (tree / thread picker)\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / delete archived thread\nr            reload repositories and names\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {}\nPress any key to close",
+        "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nH / L        collapse / expand all repositories\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n/permissions choose Auto or Dangerous execution\nR            rename selected thread (tree / thread picker)\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / delete archived thread\nr            reload repositories and names\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {}\nPress any key to close",
         execution_status(app.execution_mode)
     );
     frame.render_widget(Clear, popup);

@@ -1490,6 +1490,21 @@ impl App {
         self.persist_expanded_repositories();
     }
 
+    pub fn expand_all_repositories(&mut self) {
+        self.expanded_repositories = self
+            .repositories
+            .iter()
+            .map(|repository| repository.path.clone())
+            .collect();
+        self.persist_expanded_repositories();
+    }
+
+    pub fn collapse_all_repositories(&mut self) {
+        self.expanded_repositories.clear();
+        self.select_repository_row(self.repository_index);
+        self.persist_expanded_repositories();
+    }
+
     pub fn toggle_selected_repository(&mut self) {
         if self.repository_is_expanded(self.repository_index) {
             self.collapse_selected_repository();
