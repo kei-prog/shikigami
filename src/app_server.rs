@@ -443,8 +443,7 @@ impl AppServer {
                             "subAgentThreadSpawn",
                             "subAgentOther",
                             "unknown"
-                        ],
-                        "useStateDbOnly": true
+                        ]
                     }),
                 )
                 .await?;
@@ -973,7 +972,7 @@ mod tests {
         };
         assert_eq!(first["method"], "thread/list");
         assert_eq!(first["params"]["cwd"], json!(["/tmp/project"]));
-        assert_eq!(first["params"]["useStateDbOnly"], true);
+        assert!(first["params"].get("useStateDbOnly").is_none());
         assert_eq!(first["params"]["archived"], false);
         dispatch_response(
             &pending,
