@@ -397,6 +397,16 @@ impl AppServer {
         if cwds.is_empty() {
             return Ok(HashMap::new());
         }
+        let mut names = self.list_thread_names_by_archive(cwds, false).await?;
+        names.extend(self.list_thread_names_by_archive(cwds, true).await?);
+        Ok(names)
+    }
+
+    async fn list_thread_names_by_archive(
+        &self,
+        cwds: &[PathBuf],
+        archived: bool,
+    ) -> Result<HashMap<String, Option<String>>> {
         let mut names = HashMap::new();
         let mut cursor = None;
         loop {
@@ -407,6 +417,7 @@ impl AppServer {
                         "cursor": cursor,
                         "limit": 100,
                         "cwd": cwds,
+                        "archived": archived,
                         "sourceKinds": [
                             "cli",
                             "vscode",
@@ -906,7 +917,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_names_are_listed_by_workspace_in_pages() {
+    async fn active_and_archived_thread_names_are_listed_in_independent_pages() {
         let (writer, mut messages) = mpsc::channel(1);
         let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
         let (events, _) = broadcast::channel(1);
@@ -938,6 +949,7 @@ mod tests {
         assert_eq!(first["method"], "thread/list");
         assert_eq!(first["params"]["cwd"], json!(["/tmp/project"]));
         assert_eq!(first["params"]["useStateDbOnly"], true);
+        assert_eq!(first["params"]["archived"], false);
         dispatch_response(
             &pending,
             &json!({"id":first["id"],"result":{"data":[{"id":"one","name":"First"}],"nextCursor":"page-2"}}),
@@ -947,15 +959,41 @@ mod tests {
             panic!("unexpected shutdown message");
         };
         assert_eq!(second["params"]["cursor"], "page-2");
+        assert_eq!(second["params"]["archived"], false);
         dispatch_response(
             &pending,
             &json!({"id":second["id"],"result":{"data":[{"id":"two","name":null}],"nextCursor":null}}),
         )
         .await;
+        let OutgoingMessage::Json(third) = messages.recv().await.unwrap() else {
+            panic!("unexpected shutdown message");
+        };
+        assert_eq!(third["params"]["cursor"], Value::Null);
+        assert_eq!(third["params"]["archived"], true);
+        dispatch_response(
+            &pending,
+            &json!({"id":third["id"],"result":{"data":[{"id":"three","name":"Archived"}],"nextCursor":"archived-2"}}),
+        )
+        .await;
+        let OutgoingMessage::Json(fourth) = messages.recv().await.unwrap() else {
+            panic!("unexpected shutdown message");
+        };
+        assert_eq!(fourth["params"]["cursor"], "archived-2");
+        assert_eq!(fourth["params"]["archived"], true);
+        dispatch_response(
+            &pending,
+            &json!({"id":fourth["id"],"result":{"data":[{"id":"four","name":"Older archived"}],"nextCursor":null}}),
+        )
+        .await;
 
         assert_eq!(
             task.await.unwrap().unwrap(),
-            HashMap::from([("one".into(), Some("First".into())), ("two".into(), None)])
+            HashMap::from([
+                ("one".into(), Some("First".into())),
+                ("two".into(), None),
+                ("three".into(), Some("Archived".into())),
+                ("four".into(), Some("Older archived".into())),
+            ])
         );
     }
 
