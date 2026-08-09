@@ -140,6 +140,9 @@ User messages are shown as full-width colored input bands, while Codex responses
 use the normal chat background. Commands, reasoning, file changes, and other
 activity use compact full-width gray bands separated by one line. Their heading
 is yellow while running, green when completed, and red when failed.
+Codex responses render common Markdown formatting, including headings, emphasis,
+lists, quotes, inline code, horizontal rules, and fenced code blocks. Copying a
+message or conversation preserves the original Markdown source.
 File-change activity automatically includes the unified diff supplied by App
 Server. Added lines are green, removed lines are red, and hunk headers are cyan;
 Shikigami does not run Git or an external diff formatter for this display.

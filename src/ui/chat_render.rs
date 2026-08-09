@@ -1,7 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::{
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Paragraph, Wrap},
 };
@@ -55,18 +56,291 @@ pub(super) fn chat_message_lines(
             editor_targets: Vec::new(),
         };
     }
-    let mut lines = Vec::new();
-    lines.extend(
-        message
-            .content
-            .lines()
-            .map(|line| Line::from(line.to_owned())),
-    );
-    lines.push(Line::from(""));
     RenderedMessage {
-        lines,
+        lines: markdown_message_lines(&message.content, available_width),
         editor_targets: Vec::new(),
     }
+}
+
+enum MarkdownList {
+    Bullet,
+    Ordered(u64),
+}
+
+struct MarkdownRenderer {
+    available_width: usize,
+    lines: Vec<Line<'static>>,
+    spans: Vec<Span<'static>>,
+    styles: Vec<Style>,
+    lists: Vec<MarkdownList>,
+    pending_item_prefix: Option<String>,
+    quote_depth: usize,
+    code_block: bool,
+    code_line: String,
+}
+
+impl MarkdownRenderer {
+    fn new(available_width: usize) -> Self {
+        Self {
+            available_width: available_width.max(1),
+            lines: Vec::new(),
+            spans: Vec::new(),
+            styles: Vec::new(),
+            lists: Vec::new(),
+            pending_item_prefix: None,
+            quote_depth: 0,
+            code_block: false,
+            code_line: String::new(),
+        }
+    }
+
+    fn render(mut self, content: &str) -> Vec<Line<'static>> {
+        let parser = Parser::new_ext(content, Options::ENABLE_STRIKETHROUGH);
+        for event in parser {
+            self.event(event);
+        }
+        if self.code_block {
+            self.finish_code_line(false);
+        } else {
+            self.finish_line(false);
+        }
+        while self.lines.last().is_some_and(|line| line.width() == 0) {
+            self.lines.pop();
+        }
+        self.lines.push(Line::from(""));
+        self.lines
+    }
+
+    fn event(&mut self, event: Event<'_>) {
+        match event {
+            Event::Start(tag) => self.start_tag(tag),
+            Event::End(tag) => self.end_tag(tag),
+            Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
+                if self.code_block {
+                    self.push_code_text(&text);
+                } else {
+                    self.push_text(&text);
+                }
+            }
+            Event::Code(code) => self.push_styled(
+                &code,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .bg(Color::Rgb(32, 34, 36)),
+            ),
+            Event::SoftBreak => self.push_text(" "),
+            Event::HardBreak => self.finish_line(true),
+            Event::Rule => {
+                self.finish_line(false);
+                self.lines.push(Line::styled(
+                    "─".repeat(self.available_width),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                self.blank_line();
+            }
+            Event::TaskListMarker(checked) => {
+                self.push_text(if checked { "[x] " } else { "[ ] " });
+            }
+            Event::FootnoteReference(reference) => {
+                self.push_styled(&format!("[^{reference}]"), Style::default().fg(Color::Cyan))
+            }
+            _ => {}
+        }
+    }
+
+    fn start_tag(&mut self, tag: Tag<'_>) {
+        match tag {
+            Tag::Heading { .. } => self.styles.push(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Tag::Strong => self
+                .styles
+                .push(Style::default().add_modifier(Modifier::BOLD)),
+            Tag::Emphasis => self
+                .styles
+                .push(Style::default().add_modifier(Modifier::ITALIC)),
+            Tag::Strikethrough => self
+                .styles
+                .push(Style::default().add_modifier(Modifier::CROSSED_OUT)),
+            Tag::Link { .. } => self.styles.push(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+            Tag::Image { .. } => self.styles.push(
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+            Tag::BlockQuote(_) => self.quote_depth += 1,
+            Tag::List(start) => self.lists.push(match start {
+                Some(start) => MarkdownList::Ordered(start),
+                None => MarkdownList::Bullet,
+            }),
+            Tag::Item => {
+                let indentation = "  ".repeat(self.lists.len().saturating_sub(1));
+                let marker = match self.lists.last_mut() {
+                    Some(MarkdownList::Ordered(next)) => {
+                        let marker = format!("{next}. ");
+                        *next = next.saturating_add(1);
+                        marker
+                    }
+                    _ => "• ".into(),
+                };
+                self.pending_item_prefix = Some(format!("{indentation}{marker}"));
+            }
+            Tag::CodeBlock(kind) => {
+                self.finish_line(false);
+                self.code_block = true;
+                if let CodeBlockKind::Fenced(language) = kind
+                    && !language.is_empty()
+                {
+                    self.lines.push(Line::styled(
+                        format!(" {language} "),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .bg(Color::Rgb(32, 34, 36)),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn end_tag(&mut self, tag: TagEnd) {
+        match tag {
+            TagEnd::Paragraph => {
+                self.finish_line(false);
+                if self.lists.is_empty() {
+                    self.blank_line();
+                }
+            }
+            TagEnd::Heading(_) => {
+                self.finish_line(false);
+                self.styles.pop();
+                self.blank_line();
+            }
+            TagEnd::Strong
+            | TagEnd::Emphasis
+            | TagEnd::Strikethrough
+            | TagEnd::Link
+            | TagEnd::Image => {
+                self.styles.pop();
+            }
+            TagEnd::BlockQuote(_) => {
+                self.finish_line(false);
+                self.quote_depth = self.quote_depth.saturating_sub(1);
+                self.blank_line();
+            }
+            TagEnd::Item => {
+                self.finish_line(false);
+                self.pending_item_prefix = None;
+            }
+            TagEnd::List(_) => {
+                self.finish_line(false);
+                self.lists.pop();
+                if self.lists.is_empty() {
+                    self.blank_line();
+                }
+            }
+            TagEnd::CodeBlock => {
+                self.finish_code_line(false);
+                self.code_block = false;
+                self.blank_line();
+            }
+            _ => {}
+        }
+    }
+
+    fn push_text(&mut self, text: &str) {
+        let style = self.current_style();
+        for (index, part) in text.split('\n').enumerate() {
+            if index > 0 {
+                self.finish_line(true);
+            }
+            if !part.is_empty() {
+                self.ensure_prefix();
+                self.spans.push(Span::styled(part.to_owned(), style));
+            }
+        }
+    }
+
+    fn push_styled(&mut self, text: &str, style: Style) {
+        self.ensure_prefix();
+        self.spans.push(Span::styled(
+            text.to_owned(),
+            self.current_style().patch(style),
+        ));
+    }
+
+    fn push_code_text(&mut self, text: &str) {
+        for part in text.split_inclusive('\n') {
+            let (content, ended) = part
+                .strip_suffix('\n')
+                .map_or((part, false), |content| (content, true));
+            self.code_line.push_str(content);
+            if ended {
+                self.finish_code_line(true);
+            }
+        }
+    }
+
+    fn ensure_prefix(&mut self) {
+        if !self.spans.is_empty() {
+            return;
+        }
+        if self.quote_depth > 0 {
+            self.spans.push(Span::styled(
+                "│ ".repeat(self.quote_depth),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        if let Some(prefix) = self.pending_item_prefix.take() {
+            self.spans
+                .push(Span::styled(prefix, Style::default().fg(Color::Cyan)));
+        }
+    }
+
+    fn finish_line(&mut self, force: bool) {
+        if !self.spans.is_empty() || force {
+            self.lines.push(Line::from(std::mem::take(&mut self.spans)));
+        }
+    }
+
+    fn finish_code_line(&mut self, force: bool) {
+        if self.code_line.is_empty() && !force {
+            return;
+        }
+        let width = UnicodeWidthStr::width(self.code_line.as_str());
+        let padding = self.available_width.saturating_sub(width);
+        let content = format!(
+            "{}{}",
+            std::mem::take(&mut self.code_line),
+            " ".repeat(padding)
+        );
+        self.lines.push(Line::styled(
+            content,
+            Style::default().fg(Color::Gray).bg(Color::Rgb(32, 34, 36)),
+        ));
+    }
+
+    fn blank_line(&mut self) {
+        if !self.lines.last().is_some_and(|line| line.width() == 0) {
+            self.lines.push(Line::from(""));
+        }
+    }
+
+    fn current_style(&self) -> Style {
+        self.styles
+            .iter()
+            .fold(Style::default(), |style, addition| style.patch(*addition))
+    }
+}
+
+fn markdown_message_lines(content: &str, available_width: usize) -> Vec<Line<'static>> {
+    MarkdownRenderer::new(available_width).render(content)
 }
 
 pub(super) struct RenderedChat {
@@ -476,4 +750,72 @@ fn wrap_message_line(line: &str, max_width: usize) -> Vec<String> {
         wrapped.push(current.trim_end().to_owned());
     }
     wrapped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn markdown_styles_headings_and_inline_content() {
+        let lines =
+            markdown_message_lines("# Heading\n\nText with **bold**, *italic*, and `code`.", 80);
+
+        assert_eq!(line_text(&lines[0]), "Heading");
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Cyan));
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        let spans = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .collect::<Vec<_>>();
+        let bold = spans.iter().find(|span| span.content == "bold").unwrap();
+        let italic = spans.iter().find(|span| span.content == "italic").unwrap();
+        let code = spans.iter().find(|span| span.content == "code").unwrap();
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+        assert!(italic.style.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(code.style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn markdown_renders_lists_quotes_rules_and_code_blocks() {
+        let lines = markdown_message_lines(
+            "> quoted\n\n1. first\n2. second\n\n---\n\n```rust\nfn main() {}\n```",
+            40,
+        );
+        let text = lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert!(text.iter().any(|line| line == "│ quoted"));
+        assert!(text.iter().any(|line| line == "1. first"));
+        assert!(text.iter().any(|line| line == "2. second"));
+        assert!(text.iter().any(|line| line == &"─".repeat(40)));
+        assert!(text.iter().any(|line| line == " rust "));
+        let code = lines
+            .iter()
+            .find(|line| line_text(line).starts_with("fn main() {}"))
+            .unwrap();
+        assert_eq!(code.style.bg, Some(Color::Rgb(32, 34, 36)));
+        assert_eq!(code.width(), 40);
+    }
+
+    #[test]
+    fn incomplete_streaming_markdown_remains_visible() {
+        let lines =
+            markdown_message_lines("Working on **unfinished\n\n```rust\nlet value = 1;", 40);
+        let text = lines.iter().map(line_text).collect::<String>();
+
+        assert!(text.contains("Working on **unfinished"));
+        assert!(text.contains("let value = 1;"));
+    }
 }
