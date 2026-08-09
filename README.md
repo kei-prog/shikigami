@@ -38,6 +38,7 @@ results are cached, while the main screen only shows repositories you register.
 - `Esc`: select the parent repository or return from chat to the tree
 - `/`: fuzzy-search active threads from the repository tree
 - `R`: rename the selected thread from the repository tree or thread picker
+- `y` / `Y`: copy the selected thread ID or its `codex resume` command
 - `a`: add repositories
 - `n`: create a thread in the primary repository, a new worktree, or an existing worktree
 - `x`: archive the selected thread, or restore it from the archived view
@@ -152,14 +153,17 @@ Chat starts in input mode. Press `Tab` for scroll mode, then use `j` / `k` for
 one line, `u` / `d` for half a page, `PageUp` / `PageDown` for a full
 page, and `g` / `G` for the beginning or latest message. `i`, `Enter`, `Tab`, or
 `Esc` returns to input mode. In input mode, `Ctrl-u` clears the composer and
-`Esc` returns focus to the repository tree. Press `Ctrl-c` in either mode to
-stop the current response. While a response is streaming, type another message
-and press `Enter` to steer the active turn with the additional instruction. A
-yellow message-box status remains visible until App Server reports the steer as
-a user message. Pending follow-up contents are listed between the chat history
-and message box, then removed one by one as App Server reports them. After
-`Ctrl-c`, the message box shows `Stopping response…`; once App Server confirms
-the interruption, `Response interrupted` remains in the chat activity.
+`Esc` returns focus to the repository tree. `Shift-Enter` inserts a newline;
+the arrow keys move the input cursor, while `Home` / `End` and `Ctrl-a` /
+`Ctrl-e` move to the start or end of the current input line. Press `Ctrl-c` in
+either mode to stop the current response. While a response is streaming, type
+another message and press `Enter` to steer the active turn with the additional
+instruction. A yellow message-box status remains visible until App Server
+reports the steer as a user message. Pending follow-up contents are listed
+between the chat history and message box, then removed one by one as App Server
+reports them. After `Ctrl-c`, the message box shows `Stopping response…`; once
+App Server confirms the interruption, `Response interrupted` remains in the
+chat activity.
 A blinking cursor follows the composer input and is hidden outside input mode.
 New output follows the bottom only while the view is already at the latest
 message. Entering scroll mode always starts from the latest message at the
@@ -199,8 +203,9 @@ skill input with the next message. Choose `/threads` to fuzzy-search active
 threads across registered repositories by title, repository, location, or path;
 the picker also shows current, working, and attention state. `Enter` opens the
 selected thread and `Esc` returns to the current chat without changing it.
-Press `R` in the picker to rename its selected thread. Choose `/attention` to open
-the attention list or `/model` to select a model and its
+Press `R` in the picker to rename its selected thread, `y` to copy its thread ID,
+or `Y` to copy its `codex resume` command. Choose `/attention` to open the
+attention list or `/model` to select a model and its
 reasoning effort from the live App Server model catalog. The current selection
 appears in the header and applies to subsequent turns in that thread. Press
 `Ctrl-r` in chat input to open the current model's reasoning-effort slider;
@@ -227,6 +232,8 @@ an unrelated thread.
 Existing Codex threads are not imported.
 
 Archiving hides a thread while preserving its Codex history, worktree, and branch.
+An active response in the main thread or one of its side chats must be stopped
+before the thread can be archived.
 Restoring an archived thread only returns it to the active view.
 Press `d` in the archived view and confirm to delete the Codex history and local
 Shikigami record. Shikigami shows the deletion progress while it waits for Codex.
