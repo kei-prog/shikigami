@@ -13,8 +13,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use crossterm::{
     cursor::{MoveTo, SetCursorStyle},
     event::{
-        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+        KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{
@@ -143,6 +144,7 @@ fn init_terminal() -> Result<Tui> {
         stdout,
         EnterAlternateScreen,
         ClearTerminal(ClearType::All),
+        EnableBracketedPaste,
         SetCursorStyle::BlinkingBar,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
         MoveTo(0, 0)
@@ -155,6 +157,7 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     execute!(
         terminal.backend_mut(),
         SetCursorStyle::DefaultUserShape,
+        DisableBracketedPaste,
         PopKeyboardEnhancementFlags,
         LeaveAlternateScreen
     )?;
@@ -227,6 +230,10 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                             None => {}
                         }
                         reconcile_thread_subscriptions(app, &server).await;
+                        needs_draw = true;
+                    }
+                    Some(Ok(Event::Paste(pasted))) => {
+                        handle_paste(app, pasted);
                         needs_draw = true;
                     }
                     Some(Ok(Event::Resize(_, _))) => {
@@ -487,6 +494,39 @@ async fn handle_key(
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.cycle_side_chat(false);
             }
+            KeyCode::Char(character)
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && character.eq_ignore_ascii_case(&'v') =>
+            {
+                if app.active_chat_is_read_only() {
+                    app.message = Some("Read-only: cannot attach an image".into());
+                } else if !app.active_model_supports_images() {
+                    app.message = Some(image_not_supported_message(app));
+                } else {
+                    match tokio::task::spawn_blocking(clipboard::paste_image_to_temp_png).await {
+                        Ok(Ok(path)) => {
+                            if let Some(chat) = app.chat_mut() {
+                                chat.attach_local_image(path);
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            app.message = Some(format!("Could not paste clipboard image: {error}"));
+                        }
+                        Err(error) => {
+                            app.message = Some(format!("Could not paste clipboard image: {error}"));
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(chat) = app.chat_mut()
+                    && chat.remove_last_local_image().is_none()
+                {
+                    app.message = Some("No image attachment to remove".into());
+                }
+            }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(chat) = app.chat_mut() {
                     chat.clear_composer();
@@ -512,7 +552,11 @@ async fn handle_key(
             }
             KeyCode::Backspace => {
                 if let Some(chat) = app.chat_mut() {
-                    chat.backspace_composer();
+                    if chat.composer.is_empty() && !chat.composer_local_images().is_empty() {
+                        chat.remove_last_local_image();
+                    } else {
+                        chat.backspace_composer();
+                    }
                 }
             }
             KeyCode::Delete => {
@@ -901,6 +945,35 @@ async fn handle_key(
         },
     }
     Ok(action)
+}
+
+fn handle_paste(app: &mut App, pasted: String) {
+    if app.mode != Mode::Chat || app.focus != Focus::Chat || app.active_chat_is_read_only() {
+        return;
+    }
+    if app
+        .chat()
+        .is_none_or(|chat| chat.mode != ChatMode::Input || chat.palette.is_some())
+    {
+        return;
+    }
+    if app.active_model_supports_images()
+        && let Some(path) = clipboard::pasted_image_path(&pasted)
+    {
+        if let Some(chat) = app.chat_mut() {
+            chat.attach_local_image(path);
+        }
+    } else if let Some(chat) = app.chat_mut() {
+        chat.insert_composer_str(&pasted.replace("\r\n", "\n").replace('\r', "\n"));
+    }
+}
+
+fn image_not_supported_message(app: &App) -> String {
+    let model = app
+        .chat()
+        .and_then(|chat| chat.model_display_name.as_deref().or(chat.model.as_deref()))
+        .unwrap_or("The selected model");
+    format!("{model} does not support image inputs; remove images or switch models")
 }
 
 async fn copy_editor_command(cwd: &Path, target: &EditorTarget) -> Result<()> {
@@ -1665,6 +1738,7 @@ async fn start_thread_from_tool(
             &workspace.path,
             prompt,
             &[],
+            &[],
             TurnSettings {
                 model: model.as_deref(),
                 effort: effort.as_deref(),
@@ -1903,19 +1977,24 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
             Some("Read-only: close the other Codex session, then use /threads to retry".into());
         return Ok(());
     }
-    if chat.composer.trim().is_empty() {
+    if chat.composer.trim().is_empty() && chat.composer_local_images().is_empty() {
         return Ok(());
     }
     let prompt = chat.composer.clone();
+    let local_images = chat.composer_local_images().to_vec();
     let thread_id = chat.thread_id.clone();
     let active_turn_id = chat.active_turn_id.clone();
     let cwd = chat.cwd.clone();
     let model = chat.model.clone();
     let effort = chat.reasoning_effort.clone();
     let skills = chat.skills_for_prompt(&prompt);
+    if !local_images.is_empty() && !app.active_model_supports_images() {
+        app.message = Some(image_not_supported_message(app));
+        return Ok(());
+    }
     if let Some(turn_id) = active_turn_id {
         if let Err(error) = server
-            .steer_turn(&thread_id, &turn_id, &prompt, &skills)
+            .steer_turn(&thread_id, &turn_id, &prompt, &skills, &local_images)
             .await
         {
             app.message = Some(format!("Could not send follow-up: {error}"));
@@ -1923,7 +2002,7 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
         }
         if let Some(chat) = app.chat_mut() {
             chat.clear_composer();
-            chat.steer_submitted(prompt);
+            chat.steer_submitted_with_images(prompt, local_images);
         }
         return Ok(());
     }
@@ -1933,6 +2012,7 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
             &cwd,
             &prompt,
             &skills,
+            &local_images,
             TurnSettings {
                 model: model.as_deref(),
                 effort: effort.as_deref(),
@@ -1944,19 +2024,28 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     if let Some(chat) = app.chat_mut() {
         let first_side_message = chat.is_side_chat && !chat.side_chat_has_activity;
         chat.clear_composer();
-        chat.begin_user_turn(prompt.clone(), turn_id);
+        chat.begin_user_turn_with_images(prompt.clone(), local_images, turn_id);
         if first_side_message {
-            chat.title = prompt
-                .lines()
-                .next()
-                .unwrap_or(&prompt)
-                .chars()
-                .take(40)
-                .collect();
+            chat.title = if prompt.trim().is_empty() {
+                "Image attachment".into()
+            } else {
+                prompt
+                    .lines()
+                    .next()
+                    .unwrap_or(&prompt)
+                    .chars()
+                    .take(40)
+                    .collect()
+            };
         }
     }
     if app.thread_is_registered(&thread_id) {
-        app.update_thread_title(&thread_id, &prompt)?;
+        let title = if prompt.trim().is_empty() {
+            "Image attachment"
+        } else {
+            &prompt
+        };
+        app.update_thread_title(&thread_id, title)?;
     }
     Ok(())
 }
@@ -2429,6 +2518,8 @@ fn render_chat_pane(
         );
     }
     let pending_steers = chat.pending_steer_count();
+    let attachment_labels = chat.composer_attachment_labels();
+    let attachment_count = attachment_labels.len();
     let stopping = chat.interrupt_is_requested();
     let has_live_status = pending_steers > 0 || stopping;
     let message_border = if has_live_status && !read_only {
@@ -2439,7 +2530,12 @@ fn render_chat_pane(
         Color::DarkGray
     };
     let message_block = Block::default()
-        .title(composer_title(read_only, pending_steers, stopping))
+        .title(composer_title(
+            read_only,
+            pending_steers,
+            stopping,
+            attachment_count,
+        ))
         .borders(Borders::ALL)
         .padding(Padding::right(1))
         .border_style(Style::default().fg(message_border));
@@ -2457,7 +2553,10 @@ fn render_chat_pane(
         )
     } else {
         let layout = chat.composer_layout();
-        (layout.lines, layout.cursor_line, layout.cursor_column)
+        let mut lines = attachment_labels;
+        let cursor_line = lines.len() + layout.cursor_line;
+        lines.extend(layout.lines);
+        (lines, cursor_line, layout.cursor_column)
     };
     let composer_height = message_inner.height.max(1) as usize;
     let composer_scroll = cursor_line
@@ -2520,11 +2619,11 @@ fn chat_help(read_only: bool, mode: ChatMode, has_side_chat: bool, active_turn: 
     } else {
         match (mode, has_side_chat) {
             (ChatMode::Input, true) => format!(
-                "INPUT · Shift-Enter newline · Ctrl-G pane · Ctrl-N/P side · Enter {}",
+                "INPUT · Ctrl-V image · Shift-Enter newline · Ctrl-G pane · Ctrl-N/P side · Enter {}",
                 if active_turn { "steer" } else { "send" }
             ),
             (ChatMode::Input, false) => format!(
-                "INPUT · Shift-Enter newline · Enter {} · / palette · Ctrl-R effort · Ctrl-U clear · Tab scroll · Esc threads",
+                "INPUT · Ctrl-V image · Shift-Enter newline · Enter {} · / palette · Ctrl-R effort · Ctrl-U clear · Tab scroll · Esc threads",
                 if active_turn { "steer" } else { "send" }
             ),
             (ChatMode::Scroll, true) => {
@@ -2542,17 +2641,29 @@ fn chat_help(read_only: bool, mode: ChatMode, has_side_chat: bool, active_turn: 
     }
 }
 
-fn composer_title(read_only: bool, pending_steers: usize, stopping: bool) -> String {
+fn composer_title(
+    read_only: bool,
+    pending_steers: usize,
+    stopping: bool,
+    attachments: usize,
+) -> String {
     if read_only {
         return " Read only ".into();
     }
     if stopping {
         return " Message · Stopping response… ".into();
     }
+    let attachment_status = match attachments {
+        0 => String::new(),
+        1 => " · 1 image · Ctrl-x remove".into(),
+        count => format!(" · {count} images · Ctrl-x remove last"),
+    };
     match pending_steers {
-        0 => " Message ".into(),
-        1 => " Message · Follow-up sent · waiting for Codex… ".into(),
-        count => format!(" Message · {count} follow-ups sent · waiting for Codex… "),
+        0 => format!(" Message{attachment_status} "),
+        1 => format!(" Message{attachment_status} · Follow-up sent · waiting for Codex… "),
+        count => {
+            format!(" Message{attachment_status} · {count} follow-ups sent · waiting for Codex… ")
+        }
     }
 }
 
@@ -3998,13 +4109,15 @@ mod tests {
 
     #[test]
     fn composer_title_shows_live_chat_status() {
-        let one = composer_title(false, 1, false);
-        let multiple = composer_title(false, 2, false);
-        let stopping = composer_title(false, 2, true);
+        let one = composer_title(false, 1, false, 0);
+        let multiple = composer_title(false, 2, false, 0);
+        let stopping = composer_title(false, 2, true, 0);
+        let attachments = composer_title(false, 0, false, 2);
 
         assert!(one.contains("Follow-up sent · waiting for Codex…"));
         assert!(multiple.contains("2 follow-ups sent · waiting for Codex…"));
         assert!(stopping.contains("Stopping response…"));
+        assert!(attachments.contains("2 images · Ctrl-x remove last"));
         assert!(!stopping.contains("follow-ups"));
     }
 

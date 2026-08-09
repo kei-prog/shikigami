@@ -73,7 +73,21 @@ pub struct ModelMetadata {
     pub description: String,
     pub default_reasoning_effort: String,
     pub supported_reasoning_efforts: Vec<ReasoningEffortMetadata>,
+    #[serde(default = "default_input_modalities")]
+    pub input_modalities: Vec<String>,
     pub is_default: bool,
+}
+
+impl ModelMetadata {
+    pub fn supports_images(&self) -> bool {
+        self.input_modalities
+            .iter()
+            .any(|modality| modality == "image")
+    }
+}
+
+fn default_input_modalities() -> Vec<String> {
+    vec!["text".into(), "image".into()]
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -433,6 +447,7 @@ impl AppServer {
         cwd: &Path,
         prompt: &str,
         skills: &[SkillMetadata],
+        local_images: &[PathBuf],
         settings: TurnSettings<'_>,
     ) -> Result<String> {
         let (approval_policy, _) = execution_policy(settings.execution_mode);
@@ -443,7 +458,7 @@ impl AppServer {
                 json!({
                     "threadId": thread_id,
                     "cwd": cwd,
-                    "input": turn_input(prompt, skills),
+                    "input": turn_input(prompt, skills, local_images),
                     "model": settings.model,
                     "effort": settings.effort,
                     "approvalPolicy": approval_policy,
@@ -464,13 +479,14 @@ impl AppServer {
         turn_id: &str,
         prompt: &str,
         skills: &[SkillMetadata],
+        local_images: &[PathBuf],
     ) -> Result<()> {
         let response = self
             .request(
                 "turn/steer",
                 json!({
                     "threadId": thread_id,
-                    "input": turn_input(prompt, skills),
+                    "input": turn_input(prompt, skills, local_images),
                     "expectedTurnId": turn_id,
                 }),
             )
@@ -516,12 +532,21 @@ fn turn_sandbox_policy(mode: ExecutionMode) -> &'static str {
     }
 }
 
-fn turn_input(prompt: &str, skills: &[SkillMetadata]) -> Vec<Value> {
-    let mut input = vec![json!({"type": "text", "text": prompt})];
+fn turn_input(prompt: &str, skills: &[SkillMetadata], local_images: &[PathBuf]) -> Vec<Value> {
+    let mut input =
+        Vec::with_capacity(usize::from(!prompt.is_empty()) + skills.len() + local_images.len());
+    if !prompt.is_empty() {
+        input.push(json!({"type": "text", "text": prompt}));
+    }
     input.extend(
         skills
             .iter()
             .map(|skill| json!({"type": "skill", "name": skill.name, "path": skill.path})),
+    );
+    input.extend(
+        local_images
+            .iter()
+            .map(|path| json!({"type": "localImage", "path": path})),
     );
     input
 }
@@ -828,6 +853,7 @@ mod tests {
                         Path::new("/tmp/project"),
                         "run tests",
                         &[],
+                        &[PathBuf::from("/tmp/start.png")],
                         TurnSettings {
                             model: None,
                             effort: None,
@@ -841,6 +867,13 @@ mod tests {
             panic!("unexpected shutdown message");
         };
         assert_eq!(message["method"], "turn/start");
+        assert_eq!(
+            message["params"]["input"],
+            json!([
+                {"type":"text","text":"run tests"},
+                {"type":"localImage","path":"/tmp/start.png"}
+            ])
+        );
         assert_eq!(message["params"]["approvalPolicy"], "on-request");
         assert_eq!(
             message["params"]["sandboxPolicy"],
@@ -885,11 +918,20 @@ mod tests {
         };
 
         assert_eq!(
-            turn_input("$review inspect this", &[skill]),
+            turn_input(
+                "$review inspect this",
+                &[skill],
+                &[PathBuf::from("/tmp/screenshot.png")],
+            ),
             vec![
                 json!({"type":"text","text":"$review inspect this"}),
                 json!({"type":"skill","name":"review","path":"/tmp/review/SKILL.md"}),
+                json!({"type":"localImage","path":"/tmp/screenshot.png"}),
             ]
+        );
+        assert_eq!(
+            turn_input("", &[], &[PathBuf::from("/tmp/image-only.png")]),
+            vec![json!({"type":"localImage","path":"/tmp/image-only.png"})]
         );
     }
 
@@ -946,6 +988,27 @@ mod tests {
             "medium"
         );
         assert!(page.data[0].is_default);
+        assert!(page.data[0].supports_images());
+    }
+
+    #[test]
+    fn model_image_support_uses_live_input_modalities() {
+        let response = json!({
+            "data": [{
+                "id": "text-only",
+                "model": "text-only",
+                "displayName": "Text only",
+                "description": "Test model",
+                "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [],
+                "inputModalities": ["text"],
+                "isDefault": true
+            }],
+            "nextCursor": null
+        });
+
+        let page = decode_model_list_response(response).unwrap();
+        assert!(!page.data[0].supports_images());
     }
 
     #[tokio::test]
@@ -984,7 +1047,13 @@ mod tests {
             let server = server.clone();
             async move {
                 server
-                    .steer_turn("thread-1", "turn-1", "focus on tests", &[])
+                    .steer_turn(
+                        "thread-1",
+                        "turn-1",
+                        "focus on tests",
+                        &[],
+                        &[PathBuf::from("/tmp/follow-up.png")],
+                    )
                     .await
             }
         });
@@ -996,7 +1065,10 @@ mod tests {
         assert_eq!(message["params"]["expectedTurnId"], "turn-1");
         assert_eq!(
             message["params"]["input"],
-            json!([{"type":"text","text":"focus on tests"}])
+            json!([
+                {"type":"text","text":"focus on tests"},
+                {"type":"localImage","path":"/tmp/follow-up.png"}
+            ])
         );
         dispatch_response(
             &pending,

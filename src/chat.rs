@@ -260,6 +260,12 @@ impl ChatMessage {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingInput {
+    text: String,
+    local_images: Vec<PathBuf>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ChatState {
     pub thread_id: String,
@@ -270,6 +276,7 @@ pub struct ChatState {
     pub reasoning_effort: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub composer: String,
+    composer_local_images: Vec<PathBuf>,
     composer_cursor: usize,
     composer_width: usize,
     composer_preferred_column: Option<usize>,
@@ -290,8 +297,8 @@ pub struct ChatState {
     pub visible_editor_target: Option<EditorTarget>,
     waiting_for_activity: bool,
     streaming_message: Option<usize>,
-    pending_user_message: Option<String>,
-    pending_steers: VecDeque<String>,
+    pending_user_message: Option<PendingInput>,
+    pending_steers: VecDeque<PendingInput>,
     interrupt_requested: bool,
     message_selection_scroll_pending: bool,
     history_complete: bool,
@@ -309,6 +316,7 @@ impl ChatState {
             reasoning_effort: None,
             messages: Vec::new(),
             composer: String::new(),
+            composer_local_images: Vec::new(),
             composer_cursor: 0,
             composer_width: 1,
             composer_preferred_column: None,
@@ -425,7 +433,16 @@ impl ChatState {
     }
 
     pub fn begin_user_turn(&mut self, prompt: String, turn_id: String) {
-        self.push_optimistic_user_message(prompt);
+        self.begin_user_turn_with_images(prompt, Vec::new(), turn_id);
+    }
+
+    pub fn begin_user_turn_with_images(
+        &mut self,
+        prompt: String,
+        local_images: Vec<PathBuf>,
+        turn_id: String,
+    ) {
+        self.push_optimistic_user_message(prompt, local_images);
         self.active_turn_id = Some(turn_id);
         self.streaming_message = None;
         self.interrupt_requested = false;
@@ -435,8 +452,16 @@ impl ChatState {
         }
     }
 
+    #[cfg(test)]
     pub fn steer_submitted(&mut self, prompt: String) {
-        self.pending_steers.push_back(prompt);
+        self.steer_submitted_with_images(prompt, Vec::new());
+    }
+
+    pub fn steer_submitted_with_images(&mut self, prompt: String, local_images: Vec<PathBuf>) {
+        self.pending_steers.push_back(PendingInput {
+            text: prompt,
+            local_images,
+        });
         self.selected_skills.clear();
     }
 
@@ -445,7 +470,10 @@ impl ChatState {
     }
 
     pub fn pending_steer_prompts(&self) -> Vec<String> {
-        self.pending_steers.iter().cloned().collect()
+        self.pending_steers
+            .iter()
+            .map(|pending| display_user_input(&pending.text, pending.local_images.len()))
+            .collect()
     }
 
     pub fn mark_interrupt_requested(&mut self) {
@@ -456,16 +484,19 @@ impl ChatState {
         self.interrupt_requested
     }
 
-    fn push_optimistic_user_message(&mut self, prompt: String) {
+    fn push_optimistic_user_message(&mut self, prompt: String, local_images: Vec<PathBuf>) {
         self.scroll_to_bottom();
         self.messages.push(ChatMessage {
             role: ChatRole::User,
-            content: prompt.clone(),
+            content: display_user_input(&prompt, local_images.len()),
             item_id: None,
             diff_targets: Vec::new(),
             render_revision: 0,
         });
-        self.pending_user_message = Some(prompt);
+        self.pending_user_message = Some(PendingInput {
+            text: prompt,
+            local_images,
+        });
         self.selected_skills.clear();
     }
 
@@ -505,6 +536,7 @@ impl ChatState {
 
     pub fn clear_composer(&mut self) {
         self.composer.clear();
+        self.composer_local_images.clear();
         self.composer_cursor = 0;
         self.composer_preferred_column = None;
     }
@@ -514,6 +546,39 @@ impl ChatState {
         self.composer.insert(self.composer_cursor, character);
         self.composer_cursor += character.len_utf8();
         self.composer_preferred_column = None;
+    }
+
+    pub fn insert_composer_str(&mut self, text: &str) {
+        self.normalize_composer_cursor();
+        self.composer.insert_str(self.composer_cursor, text);
+        self.composer_cursor += text.len();
+        self.composer_preferred_column = None;
+    }
+
+    pub fn attach_local_image(&mut self, path: PathBuf) {
+        self.composer_local_images.push(path);
+    }
+
+    pub fn remove_last_local_image(&mut self) -> Option<PathBuf> {
+        self.composer_local_images.pop()
+    }
+
+    pub fn composer_local_images(&self) -> &[PathBuf] {
+        &self.composer_local_images
+    }
+
+    pub fn composer_attachment_labels(&self) -> Vec<String> {
+        self.composer_local_images
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("image");
+                format!("[Image #{}] {name}", index + 1)
+            })
+            .collect()
     }
 
     pub fn insert_composer_newline(&mut self) {
@@ -886,35 +951,28 @@ impl ChatState {
     fn push_completed_item(&mut self, item: &Value) {
         match item.get("type").and_then(Value::as_str) {
             Some("userMessage") => {
-                let content = item
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter(|input| input.get("type").and_then(Value::as_str) == Some("text"))
-                    .filter_map(|input| input.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if !content.is_empty() {
-                    if self.pending_user_message.as_deref() == Some(content.as_str()) {
-                        self.pending_user_message = None;
-                        return;
-                    }
-                    if let Some(index) = self
-                        .pending_steers
-                        .iter()
-                        .position(|pending| pending == &content)
-                    {
-                        self.pending_steers.remove(index);
-                    }
-                    self.messages.push(ChatMessage {
-                        role: ChatRole::User,
-                        content,
-                        item_id: None,
-                        diff_targets: Vec::new(),
-                        render_revision: 0,
-                    });
+                let input = user_input(item);
+                if input.text.is_empty() && input.local_images.is_empty() {
+                    return;
                 }
+                if self.pending_user_message.as_ref() == Some(&input) {
+                    self.pending_user_message = None;
+                    return;
+                }
+                if let Some(index) = self
+                    .pending_steers
+                    .iter()
+                    .position(|pending| pending == &input)
+                {
+                    self.pending_steers.remove(index);
+                }
+                self.messages.push(ChatMessage {
+                    role: ChatRole::User,
+                    content: display_user_input(&input.text, input.local_images.len()),
+                    item_id: None,
+                    diff_targets: Vec::new(),
+                    render_revision: 0,
+                });
             }
             Some("agentMessage") => {
                 if let Some(text) = item.get("text").and_then(Value::as_str) {
@@ -1118,6 +1176,44 @@ impl ChatState {
             render_revision: 0,
         });
     }
+}
+
+fn user_input(item: &Value) -> PendingInput {
+    let mut text = Vec::new();
+    let mut local_images = Vec::new();
+    for input in item
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match input.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(value) = input.get("text").and_then(Value::as_str) {
+                    text.push(value);
+                }
+            }
+            Some("localImage") => {
+                if let Some(path) = input.get("path").and_then(Value::as_str) {
+                    local_images.push(PathBuf::from(path));
+                }
+            }
+            _ => {}
+        }
+    }
+    PendingInput {
+        text: text.join("\n"),
+        local_images,
+    }
+}
+
+fn display_user_input(text: &str, image_count: usize) -> String {
+    let mut parts = Vec::with_capacity(usize::from(!text.is_empty()) + image_count);
+    if !text.is_empty() {
+        parts.push(text.to_owned());
+    }
+    parts.extend((1..=image_count).map(|index| format!("[Image #{index}]")));
+    parts.join("\n")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1378,6 +1474,63 @@ mod tests {
         assert_eq!(chat.messages.len(), 2);
         assert_eq!(chat.messages[0].role, ChatRole::User);
         assert_eq!(chat.messages[1].role, ChatRole::Assistant);
+    }
+
+    #[test]
+    fn loads_image_only_and_mixed_user_history() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.load_history(&json!({"thread":{"turns":[{"items":[
+            {"type":"userMessage","content":[
+                {"type":"localImage","path":"/tmp/first.png"}
+            ]},
+            {"type":"userMessage","content":[
+                {"type":"text","text":"compare"},
+                {"type":"localImage","path":"/tmp/second.png"}
+            ]}
+        ]}]}}));
+
+        assert_eq!(chat.messages.len(), 2);
+        assert_eq!(chat.messages[0].content, "[Image #1]");
+        assert_eq!(chat.messages[1].content, "compare\n[Image #1]");
+    }
+
+    #[test]
+    fn composer_tracks_and_removes_image_attachments() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.attach_local_image("/tmp/first.png".into());
+        chat.attach_local_image("/tmp/second.png".into());
+
+        assert_eq!(
+            chat.composer_attachment_labels(),
+            ["[Image #1] first.png", "[Image #2] second.png"]
+        );
+        assert_eq!(
+            chat.remove_last_local_image(),
+            Some(PathBuf::from("/tmp/second.png"))
+        );
+        chat.clear_composer();
+        assert!(chat.composer_local_images().is_empty());
+    }
+
+    #[test]
+    fn pending_image_follow_up_matches_app_server_user_message() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.steer_submitted_with_images(
+            "focus here".into(),
+            vec![PathBuf::from("/tmp/follow-up.png")],
+        );
+        assert_eq!(chat.pending_steer_prompts(), ["focus here\n[Image #1]"]);
+
+        chat.apply(&event(
+            "item/completed",
+            json!({"item":{"type":"userMessage","content":[
+                {"type":"text","text":"focus here"},
+                {"type":"localImage","path":"/tmp/follow-up.png"}
+            ]}}),
+        ));
+
+        assert!(chat.pending_steer_prompts().is_empty());
+        assert_eq!(chat.messages[0].content, "focus here\n[Image #1]");
     }
 
     #[test]

@@ -1015,6 +1015,20 @@ impl App {
         self.models.get(self.model_index)
     }
 
+    /// Match the Codex TUI behavior: use live catalog metadata when present and avoid blocking
+    /// input if a transient catalog failure left the selected model unknown.
+    pub fn active_model_supports_images(&self) -> bool {
+        let model = self.chat().and_then(|chat| chat.model.as_deref());
+        model
+            .and_then(|model| {
+                self.models
+                    .iter()
+                    .find(|candidate| candidate.model == model)
+            })
+            .map(ModelMetadata::supports_images)
+            .unwrap_or(true)
+    }
+
     pub fn move_model_up(&mut self) {
         self.model_index = self.model_index.saturating_sub(1);
         self.sync_reasoning_effort_index();
@@ -2576,6 +2590,7 @@ mod tests {
                     description: String::new(),
                 })
                 .collect(),
+            input_modalities: vec!["text".into(), "image".into()],
             is_default: true,
         }
     }
