@@ -390,6 +390,28 @@ impl AppServer {
         .await
     }
 
+    pub async fn read_thread_name(&self, thread_id: &str) -> Result<Option<String>> {
+        let response = self
+            .request(
+                "thread/read",
+                json!({"threadId": thread_id, "includeTurns": false}),
+            )
+            .await?;
+        Ok(response
+            .pointer("/thread/name")
+            .and_then(Value::as_str)
+            .map(str::to_owned))
+    }
+
+    pub async fn set_thread_name(&self, thread_id: &str, name: &str) -> Result<()> {
+        self.request(
+            "thread/name/set",
+            json!({"threadId": thread_id, "name": name}),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn read_thread_preview(&self, thread_id: &str, limit: u32) -> Result<Value> {
         let response = self
             .request(
@@ -798,6 +820,42 @@ mod tests {
         .await;
 
         assert_eq!(task.await.unwrap().unwrap(), "thread-1");
+    }
+
+    #[tokio::test]
+    async fn thread_names_use_the_app_server_name_method() {
+        let (writer, mut messages) = mpsc::channel(1);
+        let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(1);
+        let (_request_tx, request_rx) = mpsc::channel(1);
+        let server = Arc::new(AppServer {
+            writer,
+            writer_task: Mutex::new(None),
+            reader_task: Mutex::new(None),
+            child: Mutex::new(None),
+            pending: pending.clone(),
+            next_id: AtomicU64::new(0),
+            events,
+            server_requests: Mutex::new(request_rx),
+            version: "test".into(),
+            request_timeout: Duration::from_secs(1),
+        });
+
+        let task = tokio::spawn({
+            let server = server.clone();
+            async move { server.set_thread_name("thread-1", "New name").await }
+        });
+        let OutgoingMessage::Json(message) = messages.recv().await.unwrap() else {
+            panic!("unexpected shutdown message");
+        };
+        assert_eq!(message["method"], "thread/name/set");
+        assert_eq!(
+            message["params"],
+            json!({"threadId":"thread-1", "name":"New name"})
+        );
+        dispatch_response(&pending, &json!({"id":message["id"],"result":{}})).await;
+
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

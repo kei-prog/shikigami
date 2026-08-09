@@ -15,6 +15,7 @@ pub struct ThreadRecord {
     pub id: String,
     pub repository_path: PathBuf,
     pub cwd: PathBuf,
+    #[serde(skip, default = "untitled_thread")]
     pub title: String,
     pub created_at: u64,
     pub updated_at: u64,
@@ -280,42 +281,19 @@ impl Registry {
         repository_path: &Path,
         cwd: &Path,
     ) -> Result<()> {
-        self.register_thread_named(thread_id, repository_path, cwd, "Untitled thread")
-    }
-
-    pub fn register_thread_named(
-        &self,
-        thread_id: String,
-        repository_path: &Path,
-        cwd: &Path,
-        title: &str,
-    ) -> Result<()> {
         let now = now_seconds()?;
         let worktree_branch = git_workspace::current_branch(cwd).ok().flatten();
         self.upsert(ThreadRecord {
             id: thread_id,
             repository_path: repository_path.to_path_buf(),
             cwd: cwd.to_path_buf(),
-            title: normalized_title(title),
+            title: untitled_thread(),
             created_at: now,
             updated_at: now,
             archived_at: None,
             managed_worktree: git_workspace::is_managed_workspace(cwd, worktree_branch.as_deref()),
             worktree_branch,
         })
-    }
-
-    pub fn set_title(&self, thread_id: &str, title: &str) -> Result<()> {
-        let mut threads = self.load()?;
-        let thread = threads
-            .iter_mut()
-            .find(|thread| thread.id == thread_id)
-            .context("thread not found")?;
-        if thread.title == "Untitled thread" {
-            thread.title = normalized_title(title);
-        }
-        thread.updated_at = now_seconds()?;
-        self.save(&threads)
     }
 
     pub fn set_archived(&self, thread_id: &str, archived: bool) -> Result<()> {
@@ -332,9 +310,6 @@ impl Registry {
         let mut threads = self.load()?;
         if let Some(existing) = threads.iter_mut().find(|thread| thread.id == record.id) {
             record.created_at = existing.created_at;
-            if existing.title != "Untitled thread" {
-                record.title.clone_from(&existing.title);
-            }
             record.archived_at = existing.archived_at;
             *existing = record;
         } else {
@@ -369,14 +344,8 @@ fn now_seconds() -> Result<u64> {
         .as_secs())
 }
 
-fn normalized_title(title: &str) -> String {
-    title
-        .lines()
-        .next()
-        .unwrap_or(title)
-        .chars()
-        .take(80)
-        .collect()
+fn untitled_thread() -> String {
+    "Untitled thread".into()
 }
 
 #[cfg(test)]
@@ -386,7 +355,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registers_and_titles_a_thread() {
+    fn registry_does_not_persist_thread_names() {
         let temp = tempdir().unwrap();
         let registry = Registry::at(temp.path().join("threads.json"));
         let repository = temp.path().join("repo");
@@ -394,33 +363,12 @@ mod tests {
         registry
             .register_thread("thread-1".into(), &repository, &repository)
             .unwrap();
-        registry
-            .set_title("thread-1", "Build the feature\nwith tests")
-            .unwrap();
-
         let threads = registry.load().unwrap();
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].id, "thread-1");
-        assert_eq!(threads[0].title, "Build the feature");
-    }
-
-    #[test]
-    fn registers_a_named_thread_in_one_write() {
-        let temp = tempdir().unwrap();
-        let registry = Registry::at(temp.path().join("threads.json"));
-        let repository = temp.path().join("repo");
-        fs::create_dir(&repository).unwrap();
-
-        registry
-            .register_thread_named(
-                "thread-1".into(),
-                &repository,
-                &repository,
-                "Promoted side chat\nextra",
-            )
-            .unwrap();
-
-        assert_eq!(registry.load().unwrap()[0].title, "Promoted side chat");
+        assert_eq!(threads[0].title, "Untitled thread");
+        let saved = fs::read_to_string(temp.path().join("threads.json")).unwrap();
+        assert!(!saved.contains("title"));
     }
 
     #[test]
@@ -563,6 +511,7 @@ mod tests {
         )
         .unwrap();
         let thread = Registry::at(path).load().unwrap().remove(0);
+        assert_eq!(thread.title, "Untitled thread");
         assert_eq!(thread.archived_at, None);
         assert!(!thread.managed_worktree);
         assert_eq!(thread.worktree_branch, None);

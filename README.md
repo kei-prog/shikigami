@@ -36,6 +36,7 @@ results are cached, while the main screen only shows repositories you register.
 - `Tab`: focus the open chat
 - `Esc`: select the parent repository or return from chat to the tree
 - `/`: fuzzy-search active threads from the repository tree
+- `R`: rename the selected thread from the repository tree or thread picker
 - `a`: add repositories
 - `n`: create a thread in the primary repository, a new worktree, or an existing worktree
 - `x`: archive the selected thread, or restore it from the archived view
@@ -100,6 +101,16 @@ streamed reasoning summaries, plans, command output
 tails, tool activity, and approvals stay inside the Shikigami TUI instead of
 opening the Codex terminal UI. App Server stderr is captured instead of being
 written over the terminal interface.
+
+Thread names are owned by Codex App Server, not Shikigami's local registry.
+Renaming uses `thread/name/set`; `thread/name/updated` refreshes the repository
+tree, thread picker and search, visible or side chat titles, attention entries,
+and archived/restored views from one in-memory value. Names are also read from
+Codex on startup, reload, and full thread open so changes made by another client
+cannot leave the local registry as a competing source. The rename dialog trims
+outer whitespace, rejects empty names, and limits input to 100 displayed
+characters to keep the TUI compact. A failed App Server request leaves the old
+name and the rename input intact.
 
 Codex does not persist a new thread until its first turn. When an untitled chat
 has no messages, leaving it removes the temporary thread from Shikigami. A clean
@@ -170,7 +181,8 @@ skill input with the next message. Choose `/threads` to fuzzy-search active
 threads across registered repositories by title, repository, location, or path;
 the picker also shows current, working, and attention state. `Enter` opens the
 selected thread and `Esc` returns to the current chat without changing it.
-Choose `/attention` to open the attention list or `/model` to select a model and its
+Press `R` in the picker to rename its selected thread. Choose `/attention` to open
+the attention list or `/model` to select a model and its
 reasoning effort from the live App Server model catalog. The current selection
 appears in the header and applies to subsequent turns in that thread. Press
 `Ctrl-r` in chat input to open the current model's reasoning-effort slider;

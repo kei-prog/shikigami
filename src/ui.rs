@@ -57,6 +57,7 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 const REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 const PREVIEW_TURN_LIMIT: u32 = 5;
 const PREVIEW_CACHE_CAPACITY: usize = 20;
+const MAX_THREAD_NAME_CHARS: usize = 100;
 
 struct ChatPreview {
     generation: u64,
@@ -116,6 +117,7 @@ struct ApprovalPrompt {
 pub async fn run(mut app: App) -> Result<()> {
     let server = AppServer::spawn("codex", Duration::from_secs(30)).await?;
     cleanup_abandoned_side_chats(&mut app, &server).await;
+    refresh_thread_names(&mut app, &server).await;
     match server.list_models().await {
         Ok(models) => app.set_models(models),
         Err(error) => app.message = Some(format!("Could not load models: {error}")),
@@ -656,12 +658,36 @@ async fn handle_key(
             KeyCode::Char('Y') if app.thread_picker_query.is_empty() => {
                 copy_selected_thread_value(app, ThreadCopy::ResumeCommand);
             }
+            KeyCode::Char('R') => app.open_thread_rename(true),
             KeyCode::Char(character)
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 app.push_thread_picker_query(character);
+            }
+            _ => {}
+        },
+        Mode::RenameThread => match key.code {
+            KeyCode::Esc => app.close_thread_rename(),
+            KeyCode::Backspace => {
+                app.rename_input.pop();
+                app.message = None;
+            }
+            KeyCode::Enter => submit_thread_rename(app, server).await,
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if app.rename_input.graphemes(true).count() < MAX_THREAD_NAME_CHARS {
+                    app.rename_input.push(character);
+                    app.message = None;
+                } else {
+                    app.message = Some(format!(
+                        "Thread names can be at most {MAX_THREAD_NAME_CHARS} characters"
+                    ));
+                }
             }
             _ => {}
         },
@@ -844,7 +870,12 @@ async fn handle_key(
             KeyCode::Char('r') => {
                 if let Err(error) = app.refresh_repositories() {
                     app.message = Some(error.to_string());
+                } else {
+                    refresh_thread_names(app, server).await;
                 }
+            }
+            KeyCode::Char('R') if app.selected_tree_is_thread() => {
+                app.open_thread_rename(false);
             }
             KeyCode::Char('y') if app.selected_tree_is_thread() => {
                 copy_selected_thread_value(app, ThreadCopy::Id);
@@ -1093,6 +1124,77 @@ fn codex_resume_command(thread_id: &str) -> String {
     format!("codex resume {thread_id}")
 }
 
+async fn submit_thread_rename(app: &mut App, server: &Arc<AppServer>) {
+    let name = match validate_thread_name(&app.rename_input) {
+        Ok(name) => name,
+        Err(error) => {
+            app.message = Some(error);
+            return;
+        }
+    };
+    let Some(thread_id) = app.rename_thread_id.clone() else {
+        app.message = Some("No thread selected".into());
+        app.close_thread_rename();
+        return;
+    };
+    match server.set_thread_name(&thread_id, &name).await {
+        Ok(()) => {
+            app.apply_thread_name(&thread_id, Some(name));
+            app.close_thread_rename();
+            app.message = Some("Thread renamed".into());
+        }
+        Err(error) => {
+            app.message = Some(format!("Could not rename thread: {error}"));
+        }
+    }
+}
+
+fn validate_thread_name(input: &str) -> std::result::Result<String, String> {
+    let name = input.trim();
+    if name.is_empty() {
+        return Err("Thread name cannot be empty".into());
+    }
+    if name.graphemes(true).count() > MAX_THREAD_NAME_CHARS {
+        return Err(format!(
+            "Thread names can be at most {MAX_THREAD_NAME_CHARS} characters"
+        ));
+    }
+    Ok(name.to_owned())
+}
+
+async fn refresh_thread_names(app: &mut App, server: &Arc<AppServer>) {
+    let thread_ids = match app.registered_thread_ids() {
+        Ok(thread_ids) => thread_ids,
+        Err(error) => {
+            app.message = Some(format!("Could not list threads for name refresh: {error}"));
+            return;
+        }
+    };
+    let results = futures::stream::iter(thread_ids.into_iter().map(|thread_id| {
+        let server = Arc::clone(server);
+        async move {
+            let result = server.read_thread_name(&thread_id).await;
+            (thread_id, result)
+        }
+    }))
+    .buffer_unordered(16)
+    .collect::<Vec<_>>()
+    .await;
+    let mut first_error = None;
+    for (thread_id, result) in results {
+        match result {
+            Ok(name) => app.apply_thread_name(&thread_id, name),
+            Err(error) if is_missing_thread_error(&error) => {}
+            Err(error) => {
+                first_error.get_or_insert_with(|| error.to_string());
+            }
+        };
+    }
+    if let Some(error) = first_error {
+        app.message = Some(format!("Could not refresh some thread names: {error}"));
+    }
+}
+
 async fn handle_palette_key(app: &mut App, key: KeyEvent, server: &Arc<AppServer>) -> Result<()> {
     let Some(chat) = app.chat_mut() else {
         return Ok(());
@@ -1196,12 +1298,28 @@ async fn select_palette_entry(app: &mut App, server: &Arc<AppServer>) -> Result<
             close_side_chat(app, server).await?;
         }
         Some(PaletteEntry::Command(PaletteCommand::SidePromote)) => {
-            app.message = Some(match app.promote_side_chat() {
-                Ok((title, None)) => format!("Promoted '{title}' to a persistent thread"),
-                Ok((title, Some(warning))) => {
-                    format!("Promoted '{title}', but temporary state cleanup failed: {warning}")
+            let target = app
+                .chat()
+                .map(|chat| (chat.thread_id.clone(), chat.title.clone()));
+            app.message = Some(match target {
+                Some((thread_id, title)) => {
+                    match server.set_thread_name(&thread_id, &title).await {
+                        Ok(()) => {
+                            app.apply_thread_name(&thread_id, Some(title));
+                            match app.promote_side_chat() {
+                                Ok((title, None)) => {
+                                    format!("Promoted '{title}' to a persistent thread")
+                                }
+                                Ok((title, Some(warning))) => format!(
+                                    "Promoted '{title}', but temporary state cleanup failed: {warning}"
+                                ),
+                                Err(error) => format!("Could not promote side chat: {error}"),
+                            }
+                        }
+                        Err(error) => format!("Could not name side chat before promotion: {error}"),
+                    }
                 }
-                Err(error) => format!("Could not promote side chat: {error}"),
+                None => "Could not promote side chat: no side chat selected".into(),
             });
         }
         Some(PaletteEntry::Command(PaletteCommand::Attention)) => {
@@ -1684,14 +1802,17 @@ async fn start_thread_from_tool(
     if let Some(chat) = app.chats.get_mut(&thread_id) {
         chat.begin_user_turn(prompt.to_owned(), turn_id);
     }
-    if let Err(error) = app.update_thread_title(&thread_id, prompt) {
+    let title = prompt_title(prompt);
+    if let Err(error) = server.set_thread_name(&thread_id, &title).await {
         app.message = Some(format!(
-            "Thread started, but its title could not be saved: {error}"
+            "Thread started, but it could not be named: {error}"
         ));
+    } else {
+        app.apply_thread_name(&thread_id, Some(title.clone()));
     }
     Ok(StartedThread {
         id: thread_id,
-        title: prompt_title(prompt),
+        title,
         workspace: workspace.path,
     })
 }
@@ -1831,6 +1952,15 @@ async fn load_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()
         Err(error) if is_recoverable_empty_thread(&thread.record.title, &error) => None,
         Err(error) => return Err(error),
     };
+    if let Some(history) = history.as_ref() {
+        app.apply_thread_name(
+            &thread_id,
+            history
+                .pointer("/thread/name")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        );
+    }
     if let Some(chat) = app.chats.get_mut(&thread_id) {
         if let Some(history) = history {
             chat.load_history(&history);
@@ -1955,8 +2085,12 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
                 .collect();
         }
     }
-    if app.thread_is_registered(&thread_id) {
-        app.update_thread_title(&thread_id, &prompt)?;
+    if app.thread_is_registered(&thread_id) && !app.thread_has_name(&thread_id) {
+        let name = prompt_title(&prompt);
+        match server.set_thread_name(&thread_id, &name).await {
+            Ok(()) => app.apply_thread_name(&thread_id, Some(name)),
+            Err(error) => app.message = Some(format!("Message sent, but naming failed: {error}")),
+        }
     }
     Ok(())
 }
@@ -2256,6 +2390,7 @@ fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
         Mode::ConfirmDangerous => render_dangerous_confirm(frame, area),
         Mode::ChooseSideChat => render_side_chat_picker(frame, area, app),
         Mode::ChooseThread => render_thread_picker(frame, area, app),
+        Mode::RenameThread => render_thread_rename(frame, area, app),
         Mode::Attention => render_attention(frame, area, app),
         Mode::ConfirmQuit => render_quit_confirm(frame, area, app),
         Mode::Help => render_help(frame, area, app),
@@ -2867,7 +3002,7 @@ fn render_thread_picker(frame: &mut Frame, area: Rect, app: &App) {
             Block::default()
                 .title(title)
                 .title_bottom(Line::from(
-                    " type filter · ↑/↓ · Enter open · y ID · Y command · Esc ",
+                    " type filter · ↑/↓ · Enter open · R rename · y ID · Esc ",
                 ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
@@ -2879,6 +3014,24 @@ fn render_thread_picker(frame: &mut Frame, area: Rect, app: &App) {
     );
     frame.render_widget(Clear, popup);
     frame.render_stateful_widget(list, popup, &mut state);
+}
+
+fn render_thread_rename(frame: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(64, 5, area);
+    let count = app.rename_input.graphemes(true).count();
+    let input = Paragraph::new(app.rename_input.as_str())
+        .block(
+            Block::default()
+                .title(" Rename thread ")
+                .title_bottom(Line::from(format!(
+                    " {count}/{MAX_THREAD_NAME_CHARS} · Enter save · Esc cancel "
+                )))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(Clear, popup);
+    frame.render_widget(input, popup);
 }
 
 fn render_quit_confirm(frame: &mut Frame, area: Rect, app: &App) {
@@ -3526,9 +3679,11 @@ fn render_navigation_tree(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(focus_style(app.focus == Focus::Navigation));
     if app.show_archived {
-        block = block.title_bottom(Line::from(" x restore · d delete · A active threads "));
+        block = block.title_bottom(Line::from(
+            " R rename · x restore · d delete · A active threads ",
+        ));
     } else {
-        block = block.title_bottom(Line::from(" x archive · A archived threads "));
+        block = block.title_bottom(Line::from(" R rename · x archive · A archived threads "));
     }
     let list = List::new(items)
         .block(block)
@@ -3854,7 +4009,7 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
 fn render_help(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(72, 34, area);
     let help = format!(
-        "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n/permissions choose Auto or Dangerous execution\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / delete archived thread\nr            reload registered repositories\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {}\nPress any key to close",
+        "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n/permissions choose Auto or Dangerous execution\nR            rename selected thread (tree / thread picker)\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / delete archived thread\nr            reload repositories and names\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {}\nPress any key to close",
         execution_status(app.execution_mode)
     );
     frame.render_widget(Clear, popup);
@@ -4447,5 +4602,14 @@ mod tests {
         rendered_chat_cached(&chat, 40, &mut cache);
         assert_ne!(cache.generation, first_generation);
         assert!(cache.messages.is_empty());
+    }
+
+    #[test]
+    fn thread_name_validation_trims_and_rejects_empty_or_overlong_input() {
+        assert_eq!(validate_thread_name("  New name  ").unwrap(), "New name");
+        assert!(validate_thread_name(" \n\t ").is_err());
+        assert!(validate_thread_name(&"a".repeat(MAX_THREAD_NAME_CHARS)).is_ok());
+        assert!(validate_thread_name(&"a".repeat(MAX_THREAD_NAME_CHARS + 1)).is_err());
+        assert!(validate_thread_name(&"👨‍👩‍👧‍👦".repeat(MAX_THREAD_NAME_CHARS)).is_ok());
     }
 }

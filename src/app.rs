@@ -50,6 +50,7 @@ pub enum Mode {
     ConfirmDangerous,
     ChooseSideChat,
     ChooseThread,
+    RenameThread,
     Attention,
     ConfirmQuit,
     Approval,
@@ -169,6 +170,9 @@ pub struct App {
     pub thread_picker_index: usize,
     pub thread_picker_matches: Vec<usize>,
     pub thread_picker_original_focus: Focus,
+    pub rename_thread_id: Option<String>,
+    pub rename_input: String,
+    pub rename_return_mode: Mode,
     pub active_chat_pane: ChatPane,
     pub resumed_threads: HashSet<String>,
     opened_threads: HashSet<String>,
@@ -183,6 +187,7 @@ pub struct App {
     pub reasoning_effort_returns_to_model: bool,
     pub execution_mode: ExecutionMode,
     pub permission_index: usize,
+    thread_names: HashMap<String, Option<String>>,
     thread_registry: Registry,
     side_chat_registry: SideChatRegistry,
     attention_registry: AttentionRegistry,
@@ -282,6 +287,9 @@ impl App {
             thread_picker_index: 0,
             thread_picker_matches: Vec::new(),
             thread_picker_original_focus: Focus::Navigation,
+            rename_thread_id: None,
+            rename_input: String::new(),
+            rename_return_mode: Mode::Normal,
             active_chat_pane: ChatPane::Main,
             resumed_threads: HashSet::new(),
             opened_threads: HashSet::new(),
@@ -296,6 +304,7 @@ impl App {
             reasoning_effort_returns_to_model: false,
             execution_mode,
             permission_index: usize::from(execution_mode == ExecutionMode::Dangerous),
+            thread_names: HashMap::new(),
             thread_registry,
             side_chat_registry: SideChatRegistry::discover()?,
             attention_registry: AttentionRegistry::discover()?,
@@ -440,6 +449,7 @@ impl App {
         };
         let removed_was_visible = self.side_chat_id.as_deref() == Some(thread_id);
         self.chats.remove(thread_id);
+        self.thread_names.remove(thread_id);
         self.attention_items
             .retain(|item| item.thread_id != thread_id);
         self.resumed_threads.remove(thread_id);
@@ -505,12 +515,10 @@ impl App {
             .map(|chat| (chat.cwd.clone(), chat.title.clone()))
             .context("side chat is not loaded")?;
 
-        self.thread_registry.register_thread_named(
-            thread_id.clone(),
-            &repository_path,
-            &cwd,
-            &title,
-        )?;
+        self.thread_registry
+            .register_thread(thread_id.clone(), &repository_path, &cwd)?;
+        self.thread_names
+            .insert(thread_id.clone(), Some(title.clone()));
         let cleanup_warning = self
             .side_chat_registry
             .remove(&thread_id)
@@ -1083,6 +1091,10 @@ impl App {
     }
 
     pub fn apply_chat_event(&mut self, event: &AppServerEvent) {
+        if let Some((thread_id, name)) = thread_name_update(event) {
+            self.apply_thread_name(thread_id, name);
+            return;
+        }
         let thread_id = event.thread_id.clone();
         if event.method == "turn/completed"
             && let Some(thread_id) = thread_id.as_deref()
@@ -1678,6 +1690,7 @@ impl App {
             .context("thread is no longer selected")?;
         ensure_thread_deletion_context(self.show_archived, &record)?;
         self.thread_registry.remove(thread_id)?;
+        self.thread_names.remove(thread_id);
         self.discard_chat(thread_id);
         self.refresh_current();
         Ok(())
@@ -1926,6 +1939,11 @@ impl App {
                     .filter(|record| registered_paths.contains(&record.repository_path))
                     .filter(|record| record.archived_at.is_some() == self.show_archived)
                     .map(|mut record| {
+                        record.title = display_thread_name(
+                            self.thread_names
+                                .get(&record.id)
+                                .and_then(|name| name.as_deref()),
+                        );
                         let location = self
                             .workspaces_by_repository
                             .get(&record.repository_path)
@@ -2071,6 +2089,7 @@ impl App {
             )?;
         }
         self.thread_registry.remove(thread_id)?;
+        self.thread_names.remove(thread_id);
         self.discard_chat(thread_id);
         self.refresh_current();
         Ok(())
@@ -2091,7 +2110,8 @@ impl App {
         cwd: PathBuf,
     ) -> Result<()> {
         self.thread_registry
-            .register_thread(thread_id, &repository_path, &cwd)?;
+            .register_thread(thread_id.clone(), &repository_path, &cwd)?;
+        self.thread_names.insert(thread_id, None);
         self.refresh_current();
         Ok(())
     }
@@ -2123,6 +2143,7 @@ impl App {
             )?;
         }
         self.thread_registry.remove(thread_id)?;
+        self.thread_names.remove(thread_id);
         self.discard_chat(thread_id);
         self.forget_thread_subscription(thread_id);
         self.refresh_current();
@@ -2145,6 +2166,8 @@ impl App {
         );
         self.thread_registry
             .replace_thread_id(old_thread_id, new_thread_id.clone())?;
+        let name = self.thread_names.remove(old_thread_id).unwrap_or(None);
+        self.thread_names.insert(new_thread_id.clone(), name);
 
         let thread = self
             .threads
@@ -2165,34 +2188,64 @@ impl App {
         Ok(())
     }
 
-    pub fn update_thread_title(&mut self, thread_id: &str, prompt: &str) -> Result<()> {
-        self.thread_registry.set_title(thread_id, prompt)?;
-        if let Some(thread) = self
-            .threads
-            .iter_mut()
-            .find(|thread| thread.record.id == thread_id)
-            && thread.record.title == "Untitled thread"
-        {
-            thread.record.title = prompt
-                .lines()
-                .next()
-                .unwrap_or(prompt)
-                .chars()
-                .take(80)
-                .collect();
+    pub fn thread_has_name(&self, thread_id: &str) -> bool {
+        self.thread_names
+            .get(thread_id)
+            .is_some_and(Option::is_some)
+    }
+
+    pub fn apply_thread_name(&mut self, thread_id: &str, name: Option<String>) {
+        let title = display_thread_name(name.as_deref());
+        self.thread_names.insert(thread_id.to_owned(), name);
+        apply_thread_name_to(&mut self.threads, &mut self.chats, thread_id, &title);
+        if self.mode == Mode::ChooseThread {
+            self.refresh_thread_picker_matches();
         }
-        if let Some(chat) = self.chats.get_mut(thread_id)
-            && chat.title == "Untitled thread"
-        {
-            chat.title = prompt
-                .lines()
-                .next()
-                .unwrap_or(prompt)
-                .chars()
-                .take(80)
-                .collect();
+    }
+
+    pub fn registered_thread_ids(&self) -> Result<Vec<String>> {
+        Ok(self
+            .thread_registry
+            .load()?
+            .into_iter()
+            .map(|thread| thread.id)
+            .collect())
+    }
+
+    pub fn open_thread_rename(&mut self, from_picker: bool) {
+        let thread = if from_picker {
+            self.selected_thread_picker()
+        } else if self.selected_tree_is_thread() {
+            self.selected_thread()
+        } else {
+            None
+        };
+        let Some(thread_id) = thread.map(|thread| thread.record.id.clone()) else {
+            self.message = Some("No thread selected".into());
+            return;
+        };
+        self.rename_thread_id = Some(thread_id.clone());
+        self.rename_input = self
+            .thread_names
+            .get(&thread_id)
+            .and_then(|name| name.clone())
+            .unwrap_or_default();
+        self.rename_return_mode = if from_picker {
+            Mode::ChooseThread
+        } else {
+            Mode::Normal
+        };
+        self.mode = Mode::RenameThread;
+        self.message = None;
+    }
+
+    pub fn close_thread_rename(&mut self) {
+        self.mode = self.rename_return_mode.clone();
+        self.rename_thread_id = None;
+        self.rename_input.clear();
+        if self.mode == Mode::ChooseThread {
+            self.refresh_thread_picker_matches();
         }
-        Ok(())
     }
 
     fn start_scan(&mut self, scope: ScanScope) {
@@ -2306,6 +2359,40 @@ impl App {
         self.thread_picker_matches =
             thread_picker_matches(&self.threads, &self.repositories, &self.thread_picker_query);
         self.thread_picker_index = 0;
+    }
+}
+
+fn display_thread_name(name: Option<&str>) -> String {
+    name.filter(|name| !name.trim().is_empty())
+        .unwrap_or("Untitled thread")
+        .to_owned()
+}
+
+fn thread_name_update(event: &AppServerEvent) -> Option<(&str, Option<String>)> {
+    (event.method == "thread/name/updated").then_some(())?;
+    let thread_id = event.thread_id.as_deref()?;
+    let name = event
+        .params
+        .get("threadName")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    Some((thread_id, name))
+}
+
+fn apply_thread_name_to(
+    threads: &mut [ThreadItem],
+    chats: &mut HashMap<String, ChatState>,
+    thread_id: &str,
+    title: &str,
+) {
+    if let Some(thread) = threads
+        .iter_mut()
+        .find(|thread| thread.record.id == thread_id)
+    {
+        thread.record.title = title.to_owned();
+    }
+    if let Some(chat) = chats.get_mut(thread_id) {
+        chat.title = title.to_owned();
     }
 }
 
@@ -2783,6 +2870,45 @@ mod tests {
         let threads = vec![thread("newest", "/one"), thread("older", "/one")];
 
         assert_eq!(thread_picker_matches(&threads, &[], ""), vec![0, 1]);
+    }
+
+    #[test]
+    fn name_update_changes_tree_chat_and_search_title_together() {
+        let mut threads = vec![thread("thread-1", "/one")];
+        let mut chats = HashMap::from([(
+            "thread-1".into(),
+            ChatState::new("thread-1".into(), "/one".into(), "Old name".into()),
+        )]);
+
+        apply_thread_name_to(&mut threads, &mut chats, "thread-1", "New name");
+
+        assert_eq!(threads[0].record.title, "New name");
+        assert_eq!(chats["thread-1"].title, "New name");
+        assert_eq!(thread_picker_matches(&threads, &[], "New"), vec![0]);
+        assert!(thread_picker_matches(&threads, &[], "Old").is_empty());
+    }
+
+    #[test]
+    fn external_name_notification_accepts_set_and_cleared_names() {
+        let named = AppServerEvent {
+            method: "thread/name/updated".into(),
+            params: json!({"threadId":"thread-1", "threadName":"External name"}),
+            thread_id: Some("thread-1".into()),
+            turn_id: None,
+        };
+        let cleared = AppServerEvent {
+            method: "thread/name/updated".into(),
+            params: json!({"threadId":"thread-1"}),
+            thread_id: Some("thread-1".into()),
+            turn_id: None,
+        };
+
+        assert_eq!(
+            thread_name_update(&named),
+            Some(("thread-1", Some("External name".into())))
+        );
+        assert_eq!(thread_name_update(&cleared), Some(("thread-1", None)));
+        assert_eq!(display_thread_name(None), "Untitled thread");
     }
 
     #[test]
