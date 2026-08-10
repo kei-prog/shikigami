@@ -56,7 +56,7 @@ screen only shows repositories you register.
 - `a`: add repositories
 - `n`: create a thread in the primary repository, a new worktree, or an existing worktree
 - `x`: archive the selected thread, or restore it from the archived view
-- `u`: undo the most recent archive in the current session
+- `u`: undo recent archives in the current session, up to 20 threads
 - `A`: switch between active and archived threads
 - `!`: show threads that completed, failed, or need approval
 - `d`: unregister a repository, or permanently delete a thread from the archived view

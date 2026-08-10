@@ -7,6 +7,7 @@ use std::{
 };
 
 const THREAD_NAME_MODEL: &str = "gpt-5.6-luna";
+const MAX_ARCHIVE_UNDOS: usize = 20;
 
 use anyhow::{Context, Result};
 use directories::BaseDirs;
@@ -253,7 +254,7 @@ pub struct App {
     pub thread_deletion: Option<ThreadDeletionState>,
     pub scanning: bool,
     pub show_archived: bool,
-    last_archived_thread: Option<ArchivedThreadUndo>,
+    archived_thread_undos: VecDeque<ArchivedThreadUndo>,
     pub message: Option<String>,
     pub should_quit: bool,
     pub chats: HashMap<String, ChatState>,
@@ -399,7 +400,7 @@ impl App {
             thread_deletion: None,
             scanning: false,
             show_archived: false,
-            last_archived_thread: None,
+            archived_thread_undos: VecDeque::new(),
             message: (!startup_message.is_empty()).then_some(startup_message),
             should_quit: false,
             chats: HashMap::new(),
@@ -1771,11 +1772,14 @@ impl App {
             "response is running; stop it before archiving"
         );
         self.thread_registry.set_archived(&record.id, true)?;
-        self.last_archived_thread = Some(ArchivedThreadUndo {
-            id: record.id.clone(),
-            title: record.title.clone(),
-            repository_path: record.repository_path.clone(),
-        });
+        remember_archive_undo(
+            &mut self.archived_thread_undos,
+            ArchivedThreadUndo {
+                id: record.id.clone(),
+                title: record.title.clone(),
+                repository_path: record.repository_path.clone(),
+            },
+        );
         self.discard_chat(&record.id);
         self.refresh_current();
         self.select_nearby_thread(&record.repository_path, thread_position);
@@ -1791,25 +1795,18 @@ impl App {
             .selected_thread_position_in_repository()
             .context("no thread selected")?;
         self.thread_registry.set_archived(&record.id, false)?;
-        if self
-            .last_archived_thread
-            .as_ref()
-            .is_some_and(|undo| undo.id == record.id)
-        {
-            self.last_archived_thread = None;
-        }
+        forget_archive_undo(&mut self.archived_thread_undos, &record.id);
         self.refresh_current();
         self.select_nearby_thread(&record.repository_path, thread_position);
         Ok(())
     }
 
     pub fn undo_last_archive(&mut self) -> Result<String> {
-        let undo = self
-            .last_archived_thread
-            .clone()
+        let records = self.thread_registry.load()?;
+        let undo = latest_valid_archive_undo(&mut self.archived_thread_undos, &records)
             .context("nothing to undo")?;
         self.thread_registry.set_archived(&undo.id, false)?;
-        self.last_archived_thread = None;
+        self.archived_thread_undos.pop_back();
         self.show_archived = false;
         self.refresh_current();
         self.restore_tree_selection(TreeSelection::Thread {
@@ -1890,13 +1887,7 @@ impl App {
             .context("thread is no longer selected")?;
         ensure_thread_deletion_context(self.show_archived, &record)?;
         self.thread_registry.remove(thread_id)?;
-        if self
-            .last_archived_thread
-            .as_ref()
-            .is_some_and(|undo| undo.id == thread_id)
-        {
-            self.last_archived_thread = None;
-        }
+        forget_archive_undo(&mut self.archived_thread_undos, thread_id);
         self.remove_thread_name(thread_id);
         self.discard_chat(thread_id);
         self.refresh_current();
@@ -3357,6 +3348,34 @@ fn nearby_thread_tree_index(
     last
 }
 
+fn remember_archive_undo(history: &mut VecDeque<ArchivedThreadUndo>, undo: ArchivedThreadUndo) {
+    forget_archive_undo(history, &undo.id);
+    if history.len() == MAX_ARCHIVE_UNDOS {
+        history.pop_front();
+    }
+    history.push_back(undo);
+}
+
+fn forget_archive_undo(history: &mut VecDeque<ArchivedThreadUndo>, thread_id: &str) {
+    history.retain(|undo| undo.id != thread_id);
+}
+
+fn latest_valid_archive_undo(
+    history: &mut VecDeque<ArchivedThreadUndo>,
+    records: &[ThreadRecord],
+) -> Option<ArchivedThreadUndo> {
+    while let Some(undo) = history.back() {
+        let is_still_archived = records
+            .iter()
+            .any(|record| record.id == undo.id && record.archived_at.is_some());
+        if is_still_archived {
+            return Some(undo.clone());
+        }
+        history.pop_back();
+    }
+    None
+}
+
 fn apply_chat_event_to(chats: &mut HashMap<String, ChatState>, event: &AppServerEvent) {
     if event.method == "skills/changed" {
         for chat in chats.values_mut() {
@@ -3465,6 +3484,48 @@ mod tests {
             thread_id: thread_id.map(str::to_owned),
             turn_id: None,
         }
+    }
+
+    fn archive_undo(id: &str) -> ArchivedThreadUndo {
+        ArchivedThreadUndo {
+            id: id.into(),
+            title: id.into(),
+            repository_path: "/repo".into(),
+        }
+    }
+
+    #[test]
+    fn archive_undo_history_is_bounded_and_deduplicated() {
+        let mut history = VecDeque::new();
+        for index in 0..=MAX_ARCHIVE_UNDOS {
+            remember_archive_undo(&mut history, archive_undo(&index.to_string()));
+        }
+
+        assert_eq!(history.len(), MAX_ARCHIVE_UNDOS);
+        assert_eq!(history.front().map(|undo| undo.id.as_str()), Some("1"));
+        assert_eq!(history.back().map(|undo| undo.id.as_str()), Some("20"));
+
+        remember_archive_undo(&mut history, archive_undo("1"));
+        assert_eq!(history.len(), MAX_ARCHIVE_UNDOS);
+        assert_eq!(history.back().map(|undo| undo.id.as_str()), Some("1"));
+    }
+
+    #[test]
+    fn archive_undo_skips_deleted_and_restored_threads() {
+        let mut archived = thread("archived", "/repo").record;
+        archived.archived_at = Some(1);
+        let restored = thread("restored", "/repo").record;
+        let records = vec![archived, restored];
+        let mut history = VecDeque::from([
+            archive_undo("archived"),
+            archive_undo("restored"),
+            archive_undo("deleted"),
+        ]);
+
+        let undo = latest_valid_archive_undo(&mut history, &records).unwrap();
+
+        assert_eq!(undo.id, "archived");
+        assert_eq!(history.len(), 1);
     }
 
     #[test]
