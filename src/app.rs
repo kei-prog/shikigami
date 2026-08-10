@@ -2326,6 +2326,12 @@ impl App {
         }
     }
 
+    pub fn apply_thread_name_if_unknown(&mut self, thread_id: &str, name: Option<String>) {
+        if !self.thread_names.contains_key(thread_id) {
+            self.apply_thread_name(thread_id, name);
+        }
+    }
+
     pub fn registered_threads_for_name_refresh(&self) -> Result<(HashSet<String>, Vec<PathBuf>)> {
         let records = self.thread_registry.load()?;
         let ids = records.iter().map(|thread| thread.id.clone()).collect();

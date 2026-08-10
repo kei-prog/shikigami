@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{self, Stdout},
     path::{Path, PathBuf},
     sync::{
@@ -127,7 +127,6 @@ struct ApprovalPrompt {
 pub async fn run(mut app: App) -> Result<()> {
     let server = AppServer::spawn("codex", Duration::from_secs(30)).await?;
     cleanup_abandoned_side_chats(&mut app, &server).await;
-    refresh_thread_names(&mut app, &server).await;
     match server.list_models().await {
         Ok(models) => app.set_models(models),
         Err(error) => app.message = Some(format!("Could not load models: {error}")),
@@ -183,6 +182,9 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
     let (preview_sender, mut preview_receiver) = mpsc::unbounded_channel();
     let (deletion_sender, mut deletion_receiver) = mpsc::unbounded_channel();
     let (bulk_rename_sender, mut bulk_rename_receiver) = mpsc::unbounded_channel();
+    let (thread_name_sender, mut thread_name_receiver) = mpsc::unbounded_channel();
+    spawn_thread_name_refresh(app, Arc::clone(&server), thread_name_sender);
+    let mut thread_name_refresh_pending = true;
     let mut preview_task = None;
     let mut redraw_ticker = tokio::time::interval(REDRAW_INTERVAL);
     redraw_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -336,6 +338,13 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                             app.complete_bulk_thread_rename_apply(successes, failures);
                         }
                     }
+                    needs_draw = true;
+                }
+            }
+            result = thread_name_receiver.recv(), if thread_name_refresh_pending => {
+                thread_name_refresh_pending = false;
+                if let Some(result) = result {
+                    apply_thread_name_refresh(app, result, false);
                     needs_draw = true;
                 }
             }
@@ -1379,22 +1388,77 @@ fn validate_thread_name(input: &str) -> std::result::Result<String, String> {
 }
 
 async fn refresh_thread_names(app: &mut App, server: &Arc<AppServer>) {
-    let (thread_ids, cwds) = match app.registered_threads_for_name_refresh() {
+    let scope = match app.registered_threads_for_name_refresh() {
         Ok(scope) => scope,
         Err(error) => {
             app.message = Some(format!("Could not list threads for name refresh: {error}"));
             return;
         }
     };
-    match server.list_thread_names(&cwds).await {
-        Ok(mut names) => {
-            for thread_id in thread_ids {
-                app.apply_thread_name(&thread_id, names.remove(&thread_id).unwrap_or(None));
+    let result = load_thread_names(server, scope)
+        .await
+        .map_err(|error| error.to_string());
+    apply_thread_name_refresh(app, result, true);
+}
+
+type ThreadNameRefreshResult = std::result::Result<Vec<(String, Option<String>)>, String>;
+
+fn spawn_thread_name_refresh(
+    app: &App,
+    server: Arc<AppServer>,
+    sender: mpsc::UnboundedSender<ThreadNameRefreshResult>,
+) {
+    let scope = app
+        .registered_threads_for_name_refresh()
+        .map_err(|error| error.to_string());
+    tokio::spawn(async move {
+        let result = match scope {
+            Ok(scope) => load_thread_names(&server, scope)
+                .await
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+        };
+        let _ = sender.send(result);
+    });
+}
+
+async fn load_thread_names(
+    server: &Arc<AppServer>,
+    (thread_ids, cwds): (HashSet<String>, Vec<PathBuf>),
+) -> Result<Vec<(String, Option<String>)>> {
+    let names = server.list_thread_names(&cwds).await?;
+    Ok(select_registered_thread_names(thread_ids, names))
+}
+
+fn select_registered_thread_names(
+    thread_ids: HashSet<String>,
+    mut names: HashMap<String, Option<String>>,
+) -> Vec<(String, Option<String>)> {
+    thread_ids
+        .into_iter()
+        .map(|thread_id| {
+            let name = names.remove(&thread_id).unwrap_or(None);
+            (thread_id, name)
+        })
+        .collect()
+}
+
+fn apply_thread_name_refresh(
+    app: &mut App,
+    result: ThreadNameRefreshResult,
+    overwrite_existing: bool,
+) {
+    match result {
+        Ok(names) => {
+            for (thread_id, name) in names {
+                if overwrite_existing {
+                    app.apply_thread_name(&thread_id, name);
+                } else {
+                    app.apply_thread_name_if_unknown(&thread_id, name);
+                }
             }
         }
-        Err(error) => {
-            app.message = Some(format!("Could not refresh thread names: {error}"));
-        }
+        Err(error) => app.message = Some(format!("Could not refresh thread names: {error}")),
     }
 }
 
@@ -5028,5 +5092,26 @@ mod tests {
         assert!(validate_thread_name(&"a".repeat(MAX_THREAD_NAME_CHARS)).is_ok());
         assert!(validate_thread_name(&"a".repeat(MAX_THREAD_NAME_CHARS + 1)).is_err());
         assert!(validate_thread_name(&"👨‍👩‍👧‍👦".repeat(MAX_THREAD_NAME_CHARS)).is_ok());
+    }
+
+    #[test]
+    fn thread_name_refresh_keeps_only_registered_threads() {
+        let refreshed = select_registered_thread_names(
+            HashSet::from(["named".into(), "missing".into()]),
+            HashMap::from([
+                ("named".into(), Some("Thread name".into())),
+                ("unregistered".into(), Some("Ignore me".into())),
+            ]),
+        )
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            refreshed,
+            HashMap::from([
+                ("named".into(), Some("Thread name".into())),
+                ("missing".into(), None),
+            ])
+        );
     }
 }
