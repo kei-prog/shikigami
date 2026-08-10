@@ -924,6 +924,12 @@ async fn handle_key(
             KeyCode::Down | KeyCode::Char('j') => app.move_down(),
             KeyCode::Char(' ') => app.toggle_selected_candidate(),
             KeyCode::Char('/') => app.mode = Mode::FilterRepositories,
+            KeyCode::Char('r') => {
+                app.message = Some(match app.start_root_scan() {
+                    Ok(()) => "scanning projects folders".into(),
+                    Err(error) => error.to_string(),
+                });
+            }
             KeyCode::Char('s') => app.start_home_scan(),
             KeyCode::Char('b') => app.open_browser(),
             KeyCode::Enter => {
@@ -955,6 +961,12 @@ async fn handle_key(
             KeyCode::Up | KeyCode::Char('k') => app.move_up(),
             KeyCode::Down | KeyCode::Char('j') => app.move_down(),
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => app.browse_into_selected(),
+            KeyCode::Char('s') => {
+                app.message = Some(match app.scan_browse_path() {
+                    Ok(path) => format!("scanning {}", path.display()),
+                    Err(error) => error.to_string(),
+                });
+            }
             KeyCode::Char('a') => {
                 app.message = Some(match app.register_browse_path() {
                     Ok(()) => "repository registered".into(),
@@ -4169,7 +4181,7 @@ fn render_repository_add(frame: &mut Frame, area: Rect, app: &App) {
             Block::default()
                 .title(title)
                 .title_bottom(Line::from(
-                    " j/k move · Space select · Enter register · / filter · b browse · s scan home · Esc back ",
+                    " Space select · Enter register · / filter · b choose · r rescan · s scan home · Esc back ",
                 ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
@@ -4198,9 +4210,12 @@ fn render_browser(frame: &mut Frame, area: Rect, app: &App) {
     let list = List::new(items)
         .block(
             Block::default()
-                .title(format!(" Browse · {} ", app.browse_path.display()))
+                .title(format!(
+                    " Choose projects folder or repository · {} ",
+                    app.browse_path.display()
+                ))
                 .title_bottom(Line::from(
-                    " Enter/l open · h/Backspace parent · a register current directory · Esc back ",
+                    " Enter open · h parent · s scan folder · a register repository · Esc back ",
                 ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),

@@ -29,15 +29,21 @@ struct RepositoryUiData {
     expanded_repositories: Vec<PathBuf>,
 }
 
+#[derive(Default, Deserialize, Serialize)]
+struct RepositoryRootsData {
+    roots: Vec<PathBuf>,
+}
+
 pub struct RepositoryStore {
     registered_path: PathBuf,
     candidates_path: PathBuf,
     ui_state_path: PathBuf,
+    roots_path: PathBuf,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug)]
 pub enum ScanScope {
-    Quick,
+    Roots(Vec<PathBuf>),
     Home,
 }
 
@@ -52,10 +58,12 @@ impl RepositoryStore {
         let registered_path = dirs.data_local_dir().join("repositories.json");
         let candidates_path = dirs.cache_dir().join("repository-candidates.json");
         let ui_state_path = dirs.data_local_dir().join("repository-ui.json");
+        let roots_path = dirs.data_local_dir().join("repository-roots.json");
         Ok(Self {
             registered_path,
             candidates_path,
             ui_state_path,
+            roots_path,
         })
     }
 
@@ -65,6 +73,7 @@ impl RepositoryStore {
             registered_path: root.join("repositories.json"),
             candidates_path: root.join("candidates.json"),
             ui_state_path: root.join("repository-ui.json"),
+            roots_path: root.join("roots.json"),
         }
     }
 
@@ -112,6 +121,55 @@ impl RepositoryStore {
         Ok(())
     }
 
+    pub fn load_search_roots(&self) -> Result<Vec<PathBuf>> {
+        if !self.roots_path.exists() {
+            return Ok(Vec::new());
+        }
+        let bytes = fs::read(&self.roots_path)
+            .with_context(|| format!("read {}", self.roots_path.display()))?;
+        let mut data: RepositoryRootsData = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse {}", self.roots_path.display()))?;
+        data.roots.retain(|root| root.is_dir());
+        data.roots.sort();
+        data.roots.dedup();
+        Ok(data.roots)
+    }
+
+    pub fn add_search_root(&self, root: &Path) -> Result<PathBuf> {
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("resolve projects folder {}", root.display()))?;
+        if !root.is_dir() {
+            bail!("projects folder is not a directory: {}", root.display());
+        }
+        let mut roots = self.load_search_roots()?;
+        if !roots.contains(&root) {
+            roots.push(root.clone());
+            roots.sort();
+            self.save_search_roots(&roots)?;
+        }
+        Ok(root)
+    }
+
+    fn save_search_roots(&self, roots: &[PathBuf]) -> Result<()> {
+        let parent = self
+            .roots_path
+            .parent()
+            .context("repository roots path has no parent")?;
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        let temporary = self.roots_path.with_extension("json.tmp");
+        fs::write(
+            &temporary,
+            serde_json::to_vec_pretty(&RepositoryRootsData {
+                roots: roots.to_vec(),
+            })?,
+        )
+        .with_context(|| format!("write {}", temporary.display()))?;
+        fs::rename(&temporary, &self.roots_path)
+            .with_context(|| format!("replace {}", self.roots_path.display()))?;
+        Ok(())
+    }
+
     pub fn register(&self, repositories: &[Repository]) -> Result<()> {
         let mut registered = self.load_registered()?;
         for repository in repositories {
@@ -134,8 +192,9 @@ pub fn start_scan(scope: ScanScope) -> Receiver<ScanEvent> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut seen = HashSet::new();
+        let max_depth = max_depth(&scope);
         for root in scan_roots(scope) {
-            walk(&root, 0, max_depth(scope), &sender, &mut seen);
+            walk(&root, 0, max_depth, &sender, &mut seen);
         }
         let _ = sender.send(ScanEvent::Finished);
     });
@@ -166,38 +225,28 @@ pub fn repository_at(path: &Path) -> Result<Repository> {
     })
 }
 
-fn scan_roots(scope: ScanScope) -> Vec<PathBuf> {
-    let Some(base_dirs) = BaseDirs::new() else {
-        return Vec::new();
-    };
-    let home = base_dirs.home_dir();
-    if matches!(scope, ScanScope::Home) {
-        return vec![home.to_path_buf()];
-    }
-
-    let mut roots = [
-        "Developer",
-        "Develop",
-        "Projects",
-        "Code",
-        "Source",
-        "src",
-        "dev",
-    ]
-    .into_iter()
-    .map(|name| home.join(name))
-    .filter(|path| path.is_dir())
-    .collect::<Vec<_>>();
+pub fn detected_search_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
     if let Ok(output) = Command::new("ghq").arg("root").output()
         && output.status.success()
         && let Ok(root) = String::from_utf8(output.stdout)
     {
         let root = PathBuf::from(root.trim());
-        if root.is_dir() && !roots.contains(&root) {
+        if root.is_dir() {
             roots.push(root);
         }
     }
     roots
+}
+
+fn scan_roots(scope: ScanScope) -> Vec<PathBuf> {
+    if let ScanScope::Roots(roots) = scope {
+        return roots;
+    }
+    let Some(base_dirs) = BaseDirs::new() else {
+        return Vec::new();
+    };
+    vec![base_dirs.home_dir().to_path_buf()]
 }
 
 fn walk(
@@ -256,9 +305,9 @@ fn should_skip(path: &Path) -> bool {
         )
 }
 
-fn max_depth(scope: ScanScope) -> usize {
+fn max_depth(scope: &ScanScope) -> usize {
     match scope {
-        ScanScope::Quick => 6,
+        ScanScope::Roots(_) => 6,
         ScanScope::Home => 12,
     }
 }
@@ -349,6 +398,35 @@ mod tests {
             store.load_expanded_repositories().unwrap(),
             Some(HashSet::new())
         );
+    }
+
+    #[test]
+    fn stores_search_roots_without_duplicates() {
+        let temp = tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let store = RepositoryStore::at(temp.path());
+
+        assert!(store.load_search_roots().unwrap().is_empty());
+        assert_eq!(store.add_search_root(&second).unwrap(), second);
+        assert_eq!(store.add_search_root(&first).unwrap(), first);
+        store.add_search_root(&second).unwrap();
+
+        assert_eq!(store.load_search_roots().unwrap(), vec![first, second]);
+    }
+
+    #[test]
+    fn forgets_search_roots_that_no_longer_exist() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("projects");
+        fs::create_dir(&root).unwrap();
+        let store = RepositoryStore::at(temp.path());
+        store.add_search_root(&root).unwrap();
+        fs::remove_dir(&root).unwrap();
+
+        assert!(store.load_search_roots().unwrap().is_empty());
     }
 
     #[test]

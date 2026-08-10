@@ -10,9 +10,6 @@ uses Codex App Server, and only lists threads created through Shikigami.
 - Git
 - Codex CLI (`codex`)
 
-ghq is optional. When available, its repositories are included in the fast
-discovery pass.
-
 ## Install
 
 Install directly from GitHub:
@@ -33,10 +30,11 @@ cargo install --path .
 shi
 ```
 
-On first launch, Shikigami opens the repository picker. The initial background scan
-checks common development directories and `ghq root` when available. Use `s`
-for an explicit home-directory scan or `b` to browse to a repository. Scan
-results are cached, while the main screen only shows repositories you register.
+On first launch, Shikigami asks you to choose a projects folder or a single Git
+repository. Projects folders are saved and scanned only when you request it, and
+scan results are cached. Use `r` to rescan saved folders, `s` for an explicit
+home-directory scan, or `b` to choose another folder or repository. The main
+screen only shows repositories you register.
 
 - `j` / `k`: move through the repository tree and preview the selected thread
 - `h` / `l`: collapse or expand the selected repository
@@ -87,7 +85,8 @@ markers without interrupting the visible thread. The list is updated directly
 from App Server events without polling.
 
 In the repository picker, `/` filters candidates, `Space` selects multiple
-repositories, and `Enter` registers them. Repository discovery is read-only.
+repositories, and `Enter` registers them. Opening the picker shows cached
+candidates immediately without starting a scan. Repository discovery is read-only.
 Existing worktrees from `git worktree list` are offered as locations when a new
 thread is created.
 

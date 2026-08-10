@@ -381,7 +381,7 @@ impl App {
             browse_index: 0,
             focus: Focus::Navigation,
             mode: if first_run {
-                Mode::AddRepositories
+                Mode::BrowseDirectory
             } else {
                 Mode::Normal
             },
@@ -439,7 +439,7 @@ impl App {
             app.message = Some(format!("Could not restore attention list: {error}"));
         }
         if first_run {
-            app.start_scan(ScanScope::Quick);
+            app.refresh_browser();
         }
         Ok(app)
     }
@@ -1933,9 +1933,21 @@ impl App {
         self.candidate_index = 0;
         self.repository_query.clear();
         self.selected_candidates.clear();
-        if !self.scanning {
-            self.start_scan(ScanScope::Quick);
+    }
+
+    pub fn start_root_scan(&mut self) -> Result<()> {
+        if self.scanning {
+            return Ok(());
         }
+        let mut roots = self.repository_store.load_search_roots()?;
+        roots.extend(repository::detected_search_roots());
+        roots.sort();
+        roots.dedup();
+        if roots.is_empty() {
+            anyhow::bail!("choose a projects folder first");
+        }
+        self.start_scan(ScanScope::Roots(roots));
+        Ok(())
     }
 
     pub fn start_home_scan(&mut self) {
@@ -2041,6 +2053,13 @@ impl App {
         self.refresh_repositories()?;
         self.mode = Mode::Normal;
         Ok(())
+    }
+
+    pub fn scan_browse_path(&mut self) -> Result<PathBuf> {
+        let root = self.repository_store.add_search_root(&self.browse_path)?;
+        self.mode = Mode::AddRepositories;
+        self.start_root_scan()?;
+        Ok(root)
     }
 
     pub fn refresh_current(&mut self) {
