@@ -10,9 +10,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::{git_workspace, paths};
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ThreadScope {
+    #[default]
+    Repository,
+    General,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ThreadRecord {
     pub id: String,
+    #[serde(default)]
+    pub scope: ThreadScope,
     pub repository_path: PathBuf,
     pub cwd: PathBuf,
     #[serde(skip, default = "untitled_thread")]
@@ -342,6 +352,7 @@ impl Registry {
         let worktree_branch = git_workspace::current_branch(cwd).ok().flatten();
         self.upsert(ThreadRecord {
             id: thread_id,
+            scope: ThreadScope::Repository,
             repository_path: repository_path.to_path_buf(),
             cwd: cwd.to_path_buf(),
             title: untitled_thread(),
@@ -350,6 +361,22 @@ impl Registry {
             archived_at: None,
             managed_worktree: git_workspace::is_managed_workspace(cwd, worktree_branch.as_deref()),
             worktree_branch,
+        })
+    }
+
+    pub fn register_general_thread(&self, thread_id: String, cwd: &Path) -> Result<()> {
+        let now = now_seconds()?;
+        self.upsert(ThreadRecord {
+            id: thread_id,
+            scope: ThreadScope::General,
+            repository_path: cwd.to_path_buf(),
+            cwd: cwd.to_path_buf(),
+            title: untitled_thread(),
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            managed_worktree: false,
+            worktree_branch: None,
         })
     }
 
@@ -532,6 +559,24 @@ mod tests {
     }
 
     #[test]
+    fn registers_general_threads_without_git_metadata() {
+        let temp = tempdir().unwrap();
+        let registry = Registry::at(temp.path().join("threads.json"));
+        let workspace = temp.path().join("new-chat");
+        fs::create_dir(&workspace).unwrap();
+
+        registry
+            .register_general_thread("general-1".into(), &workspace)
+            .unwrap();
+
+        let thread = registry.load().unwrap().remove(0);
+        assert_eq!(thread.scope, ThreadScope::General);
+        assert_eq!(thread.cwd, workspace);
+        assert!(!thread.managed_worktree);
+        assert_eq!(thread.worktree_branch, None);
+    }
+
+    #[test]
     fn replaces_only_a_thread_id() {
         let temp = tempdir().unwrap();
         let registry = Registry::at(temp.path().join("threads.json"));
@@ -586,6 +631,7 @@ mod tests {
         .unwrap();
         let thread = Registry::at(path).load().unwrap().remove(0);
         assert_eq!(thread.title, "Untitled thread");
+        assert_eq!(thread.scope, ThreadScope::Repository);
         assert_eq!(thread.archived_at, None);
         assert!(!thread.managed_worktree);
         assert_eq!(thread.worktree_branch, None);

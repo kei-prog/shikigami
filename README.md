@@ -36,25 +36,26 @@ cargo install --path .
 shi
 ```
 
-On first launch, Shikigami asks you to choose a projects folder or a single Git
-repository. Projects folders are saved and scanned only when you request it, and
-scan results are cached. Use `r` to rescan saved folders, `s` for an explicit
-home-directory scan, or `b` to choose another folder or repository. The main
-screen only shows repositories you register.
+Shikigami opens with a `General` area for one-off chats, even when no Git
+repository is registered. Add repositories with `a`. Projects folders are saved
+and scanned only when you request it, and scan results are cached. Use `r` to
+rescan saved folders, `s` for an explicit home-directory scan, or `b` to choose
+another folder or repository. The main screen only shows repositories you
+register.
 
-- `j` / `k`: move through the repository tree and preview the selected thread
+- `j` / `k`: move through the thread tree and preview the selected thread
 - `h` / `l`: collapse or expand a repository; `l` focuses a selected thread's messages
 - `H` / `L`: collapse or expand all repositories
 - `Enter`: expand a repository or focus the selected thread's chat input
 - `i`: focus the selected thread's chat input directly
 - `Tab`: focus the open chat
-- `Esc`: select the parent repository or return from chat to the tree
+- `Esc`: select the parent group or return from chat to the tree
 - `/`: open the command palette
-- `f`: fuzzy-search active threads from the repository tree
-- `R`: open thread-name actions for one thread, one repository, or all repositories
+- `f`: fuzzy-search active threads from the thread tree
+- `R`: open thread-name actions for one thread, one repository, or all threads
 - `y` / `Y`: copy the selected thread ID or its `codex resume` command
 - `a`: add repositories
-- `n`: create a thread in the primary repository, a new worktree, or an existing worktree
+- `n`: create a one-off chat in General, or a thread in the selected repository location
 - `x`: archive the selected thread, or restore it from the archived view
 - `u`: undo recent archives in the current session, up to 20 threads
 - `A`: switch between active and archived threads
@@ -64,12 +65,18 @@ screen only shows repositories you register.
 - `?`: show all keys
 - `q`: quit
 
-The left pane is one expandable tree: each registered repository keeps its
-Shikigami-created threads directly underneath it, and multiple repositories can be
-expanded at once. Expansion state is restored on the next launch. The right
-chat pane stays visible while navigating the tree.
-Creating a thread with `n` always uses the selected repository, including when
-the selection is one of that repository's child threads.
+The left pane is one tree: `General` keeps one-off chats at the top, and each
+registered repository keeps its Shikigami-created threads directly underneath
+it. Multiple repositories can be expanded at once, and expansion state is
+restored on the next launch. The right chat pane stays visible while navigating
+the tree. Creating a thread with `n` uses General when General or one of its
+chats is selected; otherwise it uses the selected repository.
+
+Each General chat receives its own scratch directory under
+`~/Documents/Shikigami/new-chat[-N]`, which is passed to Codex as the working
+directory. General chats do not share files or Git/worktree actions. Archiving
+or deleting a General chat does not remove its scratch directory or generated
+files.
 
 Moving onto a thread switches the right pane automatically. Uncached history is
 loaded after a short debounce; previously viewed threads switch immediately.
@@ -79,8 +86,10 @@ working, and approval-waiting threads separately.
 
 A chat can also create an independent thread when asked in natural language.
 Shikigami gives it a single `shikigami.start_thread` tool that starts the first
-turn in either the current workspace or a new managed worktree. The new thread
-does not inherit the current conversation and appears in the repository tree.
+turn in either the current workspace or a new managed worktree. General chats
+can start another thread in their current scratch workspace but cannot request a
+Git worktree. The new thread does not inherit the current conversation and
+appears in the same tree group.
 
 A background turn that completes or fails stays in the attention list until its
 chat is viewed or the item is dismissed, including across Shikigami restarts.
@@ -140,9 +149,9 @@ can be renamed.
 
 Pressing `R` in the repository tree or thread picker always opens the same explicit
 action menu: manually rename the selected thread, suggest names in its repository,
-or suggest names across all registered repositories. Unavailable actions remain
+or suggest names for all active threads. Unavailable actions remain
 visible but disabled. Both suggestion actions then open a multi-select list of active
-threads; the all-repositories scope includes each repository name in its rows. After
+threads; the all-threads scope includes each group name in its rows. After
 choosing the target threads, Shikigami reads only their recent conversation content
 and asks a temporary read-only Codex thread to propose concise names. Each proposal
 follows the natural language used by the user in that conversation while preserving

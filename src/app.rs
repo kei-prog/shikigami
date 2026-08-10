@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::mpsc::{Receiver, TryRecvError},
     time::Instant,
 };
@@ -16,9 +16,10 @@ use crate::{
     app_server::{AppServerEvent, AppServerRequest, ModelMetadata},
     chat::{ChatState, CommandPalette, fuzzy_score},
     git_workspace::{self, Workspace},
+    paths,
     registry::{
         AttentionRegistry, PersistentAttentionKind, Registry, SideChatRegistry, ThreadRecord,
-        ThreadTitleCache,
+        ThreadScope, ThreadTitleCache,
     },
     repository::{self, Repository, RepositoryStore, ScanEvent, ScanScope, start_scan},
     settings::{ExecutionMode, SettingsStore},
@@ -82,6 +83,12 @@ pub struct ThreadItem {
     pub record: ThreadRecord,
     pub location_name: String,
     pub is_primary: bool,
+}
+
+pub struct PreparedThreadWorkspace {
+    pub repository: Option<Repository>,
+    pub workspace: Workspace,
+    pub scope: ThreadScope,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -157,7 +164,7 @@ impl RenameAction {
         match self {
             Self::RenameThread => "Rename selected thread",
             Self::SuggestRepository => "Suggest names in this repository",
-            Self::SuggestAll => "Suggest names in all repositories",
+            Self::SuggestAll => "Suggest names for all threads",
         }
     }
 }
@@ -210,6 +217,10 @@ pub struct ThreadNameApplyRequest {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TreeRow {
+    General,
+    GeneralThread {
+        thread_index: usize,
+    },
     Repository {
         repository_index: usize,
     },
@@ -219,16 +230,17 @@ pub enum TreeRow {
     },
 }
 
+#[derive(PartialEq)]
 enum TreeSelection {
+    General,
     Repository(PathBuf),
-    Thread { id: String, repository: PathBuf },
+    Thread(String),
 }
 
 #[derive(Clone)]
 struct ArchivedThreadUndo {
     id: String,
     title: String,
-    repository_path: PathBuf,
 }
 
 pub struct App {
@@ -342,7 +354,6 @@ impl App {
         let browse_path = BaseDirs::new()
             .map(|dirs| dirs.home_dir().to_path_buf())
             .unwrap_or_else(|| PathBuf::from("/"));
-        let first_run = repositories.is_empty();
         let registered_paths = repositories
             .iter()
             .map(|repository| repository.path.clone())
@@ -391,11 +402,7 @@ impl App {
             candidate_index: 0,
             browse_index: 0,
             focus: Focus::Navigation,
-            mode: if first_run {
-                Mode::BrowseDirectory
-            } else {
-                Mode::Normal
-            },
+            mode: Mode::Normal,
             command_palette: None,
             thread_deletion: None,
             scanning: false,
@@ -451,9 +458,6 @@ impl App {
         app.refresh_current();
         if let Err(error) = app.restore_attention() {
             app.message = Some(format!("Could not restore attention list: {error}"));
-        }
-        if first_run {
-            app.refresh_browser();
         }
         Ok(app)
     }
@@ -643,6 +647,7 @@ impl App {
             .iter()
             .find(|thread| thread.record.id == parent_thread_id)
             .context("parent thread is not registered")?;
+        let scope = parent.record.scope;
         let repository_path = parent.record.repository_path.clone();
         let (cwd, title) = self
             .chats
@@ -650,8 +655,15 @@ impl App {
             .map(|chat| (chat.cwd.clone(), chat.title.clone()))
             .context("side chat is not loaded")?;
 
-        self.thread_registry
-            .register_thread(thread_id.clone(), &repository_path, &cwd)?;
+        match scope {
+            ThreadScope::Repository => {
+                self.thread_registry
+                    .register_thread(thread_id.clone(), &repository_path, &cwd)?
+            }
+            ThreadScope::General => self
+                .thread_registry
+                .register_general_thread(thread_id.clone(), &cwd)?,
+        }
         self.thread_names
             .insert(thread_id.clone(), Some(title.clone()));
         let cleanup_warning = self
@@ -865,6 +877,9 @@ impl App {
     }
 
     pub fn repository_name_for_thread(&self, thread: &ThreadItem) -> &str {
+        if thread.record.scope == ThreadScope::General {
+            return "General";
+        }
         self.repositories
             .iter()
             .find(|repository| repository.path == thread.record.repository_path)
@@ -1339,6 +1354,7 @@ impl App {
         let mut repositories_by_thread = self
             .threads
             .iter()
+            .filter(|thread| thread.record.scope == ThreadScope::Repository)
             .map(|thread| {
                 (
                     thread.record.id.as_str(),
@@ -1467,10 +1483,7 @@ impl App {
             .iter()
             .find(|thread| thread.record.id == thread_id)
         {
-            let selection = TreeSelection::Thread {
-                id: thread.record.id.clone(),
-                repository: thread.record.repository_path.clone(),
-            };
+            let selection = TreeSelection::Thread(thread.record.id.clone());
             self.restore_tree_selection(selection);
             self.sync_selection_from_tree();
             self.show_main_chat_id(thread_id.to_owned());
@@ -1598,8 +1611,18 @@ impl App {
         matches!(self.selected_tree_row(), Some(TreeRow::Repository { .. }))
     }
 
+    pub fn selected_tree_is_general(&self) -> bool {
+        matches!(
+            self.selected_tree_row(),
+            Some(TreeRow::General | TreeRow::GeneralThread { .. })
+        )
+    }
+
     pub fn selected_tree_is_thread(&self) -> bool {
-        matches!(self.selected_tree_row(), Some(TreeRow::Thread { .. }))
+        matches!(
+            self.selected_tree_row(),
+            Some(TreeRow::Thread { .. } | TreeRow::GeneralThread { .. })
+        )
     }
 
     pub fn repository_is_expanded(&self, repository_index: usize) -> bool {
@@ -1648,8 +1671,15 @@ impl App {
         }
     }
 
-    pub fn select_parent_repository(&mut self) {
-        self.select_repository_row(self.repository_index);
+    pub fn select_parent_group(&mut self) {
+        if self
+            .selected_thread()
+            .is_some_and(|thread| thread.record.scope == ThreadScope::General)
+        {
+            self.select_general_row();
+        } else {
+            self.select_repository_row(self.repository_index);
+        }
     }
 
     pub fn primary_location(&self) -> Option<&Workspace> {
@@ -1682,7 +1712,7 @@ impl App {
         &mut self,
         source_thread_id: &str,
         new_worktree: bool,
-    ) -> Result<(Repository, Workspace)> {
+    ) -> Result<PreparedThreadWorkspace> {
         let registered_thread_id = if self.thread_is_registered(source_thread_id) {
             source_thread_id
         } else {
@@ -1702,6 +1732,26 @@ impl App {
             .find(|thread| thread.record.id == registered_thread_id)
             .map(|thread| thread.record.clone())
             .context("source thread is not registered with Shikigami")?;
+        if record.scope == ThreadScope::General {
+            anyhow::ensure!(!new_worktree, "General chats do not have a Git worktree");
+            let cwd = self
+                .chats
+                .get(source_thread_id)
+                .map(|chat| chat.cwd.clone())
+                .unwrap_or(record.cwd);
+            return Ok(PreparedThreadWorkspace {
+                repository: None,
+                workspace: Workspace {
+                    name: cwd
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "general".into()),
+                    is_primary: false,
+                    path: cwd,
+                },
+                scope: ThreadScope::General,
+            });
+        }
         let repository = self
             .repositories
             .iter()
@@ -1712,7 +1762,11 @@ impl App {
             let workspace =
                 git_workspace::create_generated_workspace(&repository.path, &repository.name)?;
             self.refresh_current();
-            return Ok((repository, workspace));
+            return Ok(PreparedThreadWorkspace {
+                repository: Some(repository),
+                workspace,
+                scope: ThreadScope::Repository,
+            });
         }
 
         let cwd = self
@@ -1737,7 +1791,11 @@ impl App {
                 is_primary: cwd == repository.path,
                 path: cwd,
             });
-        Ok((repository, workspace))
+        Ok(PreparedThreadWorkspace {
+            repository: Some(repository),
+            workspace,
+            scope: ThreadScope::Repository,
+        })
     }
 
     pub fn selected_thread_has_active_turn(&self) -> Result<bool> {
@@ -1777,12 +1835,11 @@ impl App {
             ArchivedThreadUndo {
                 id: record.id.clone(),
                 title: record.title.clone(),
-                repository_path: record.repository_path.clone(),
             },
         );
         self.discard_chat(&record.id);
         self.refresh_current();
-        self.select_nearby_thread(&record.repository_path, thread_position);
+        self.select_nearby_thread(&record, thread_position);
         Ok(())
     }
 
@@ -1797,7 +1854,7 @@ impl App {
         self.thread_registry.set_archived(&record.id, false)?;
         forget_archive_undo(&mut self.archived_thread_undos, &record.id);
         self.refresh_current();
-        self.select_nearby_thread(&record.repository_path, thread_position);
+        self.select_nearby_thread(&record, thread_position);
         Ok(())
     }
 
@@ -1809,10 +1866,7 @@ impl App {
         self.archived_thread_undos.pop_back();
         self.show_archived = false;
         self.refresh_current();
-        self.restore_tree_selection(TreeSelection::Thread {
-            id: undo.id,
-            repository: undo.repository_path,
-        });
+        self.restore_tree_selection(TreeSelection::Thread(undo.id));
         self.sync_selection_from_tree();
         Ok(undo.title)
     }
@@ -2112,29 +2166,24 @@ impl App {
 
     pub fn refresh_current(&mut self) {
         let selection = match self.selected_tree_row() {
+            Some(TreeRow::General) => Some(TreeSelection::General),
+            Some(TreeRow::GeneralThread { thread_index }) => self
+                .threads
+                .get(thread_index)
+                .map(|thread| TreeSelection::Thread(thread.record.id.clone())),
             Some(TreeRow::Repository { repository_index }) => self
                 .repositories
                 .get(repository_index)
                 .map(|repository| TreeSelection::Repository(repository.path.clone())),
-            Some(TreeRow::Thread { thread_index, .. }) => {
-                self.threads
-                    .get(thread_index)
-                    .map(|thread| TreeSelection::Thread {
-                        id: thread.record.id.clone(),
-                        repository: thread.record.repository_path.clone(),
-                    })
-            }
-            None => self
-                .selected_repository()
-                .map(|repository| TreeSelection::Repository(repository.path.clone())),
+            Some(TreeRow::Thread { thread_index, .. }) => self
+                .threads
+                .get(thread_index)
+                .map(|thread| TreeSelection::Thread(thread.record.id.clone())),
+            None => Some(TreeSelection::General),
         };
         self.locations.clear();
         self.threads.clear();
         self.workspaces_by_repository.clear();
-        if self.repositories.is_empty() {
-            return;
-        }
-
         for repository in &self.repositories {
             match git_workspace::list_workspaces(&repository.path) {
                 Ok(locations) => {
@@ -2153,7 +2202,10 @@ impl App {
             Ok(records) => {
                 self.threads = records
                     .into_iter()
-                    .filter(|record| registered_paths.contains(&record.repository_path))
+                    .filter(|record| {
+                        record.scope == ThreadScope::General
+                            || registered_paths.contains(&record.repository_path)
+                    })
                     .filter(|record| record.archived_at.is_some() == self.show_archived)
                     .map(|mut record| {
                         record.title = display_thread_name(
@@ -2161,25 +2213,38 @@ impl App {
                                 .get(&record.id)
                                 .and_then(|name| name.as_deref()),
                         );
-                        let location = self
-                            .workspaces_by_repository
-                            .get(&record.repository_path)
+                        let location = (record.scope == ThreadScope::Repository)
+                            .then(|| self.workspaces_by_repository.get(&record.repository_path))
+                            .flatten()
                             .into_iter()
                             .flatten()
                             .filter(|location| record.cwd.starts_with(&location.path))
                             .max_by_key(|location| location.path.components().count());
-                        if record.worktree_branch.is_none() {
-                            record.worktree_branch = location.map(|location| location.name.clone());
+                        if record.scope == ThreadScope::Repository {
+                            if record.worktree_branch.is_none() {
+                                record.worktree_branch =
+                                    location.map(|location| location.name.clone());
+                            }
+                            record.managed_worktree |= git_workspace::is_managed_workspace(
+                                &record.cwd,
+                                record.worktree_branch.as_deref(),
+                            );
                         }
-                        record.managed_worktree |= git_workspace::is_managed_workspace(
-                            &record.cwd,
-                            record.worktree_branch.as_deref(),
-                        );
                         ThreadItem {
                             location_name: location
                                 .map(|location| location.name.clone())
                                 .or_else(|| record.worktree_branch.clone())
-                                .unwrap_or_else(|| "removed location".into()),
+                                .unwrap_or_else(|| {
+                                    if record.scope == ThreadScope::General {
+                                        record
+                                            .cwd
+                                            .file_name()
+                                            .map(|name| name.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| "scratch".into())
+                                    } else {
+                                        "removed location".into()
+                                    }
+                                }),
                             is_primary: location.is_some_and(|location| location.is_primary),
                             record,
                         }
@@ -2328,6 +2393,31 @@ impl App {
     ) -> Result<()> {
         self.thread_registry
             .register_thread(thread_id.clone(), &repository_path, &cwd)?;
+        self.confirmed_thread_names.insert(thread_id.clone());
+        self.thread_names.insert(thread_id, None);
+        self.refresh_current();
+        Ok(())
+    }
+
+    pub fn create_general_workspace(&self) -> Result<Workspace> {
+        let path = paths::create_general_workspace()?;
+        Ok(Workspace {
+            name: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "new-chat".into()),
+            is_primary: false,
+            path,
+        })
+    }
+
+    pub fn register_app_server_general_thread(
+        &mut self,
+        thread_id: String,
+        cwd: PathBuf,
+    ) -> Result<()> {
+        self.thread_registry
+            .register_general_thread(thread_id.clone(), &cwd)?;
         self.confirmed_thread_names.insert(thread_id.clone());
         self.thread_names.insert(thread_id, None);
         self.refresh_current();
@@ -2485,10 +2575,15 @@ impl App {
         };
         let thread_id = thread.map(|thread| thread.record.id.clone());
         let repository_path = thread
+            .filter(|thread| thread.record.scope == ThreadScope::Repository)
             .map(|thread| thread.record.repository_path.clone())
             .or_else(|| {
-                self.selected_repository()
-                    .map(|repository| repository.path.clone())
+                (thread.is_none() && !self.selected_tree_is_general())
+                    .then(|| {
+                        self.selected_repository()
+                            .map(|repository| repository.path.clone())
+                    })
+                    .flatten()
             });
         let return_mode = if from_picker {
             Mode::ChooseThread
@@ -2605,23 +2700,37 @@ impl App {
             return;
         }
         let action_state = action_state.clone();
-        let Some(repository_path) = action_state.repository_path.clone() else {
-            self.message = Some("No repository selected".into());
+        let workspace_path = if all_repositories {
+            action_state
+                .thread_id
+                .as_ref()
+                .and_then(|id| self.threads.iter().find(|thread| &thread.record.id == id))
+                .or_else(|| self.threads.first())
+                .map(|thread| thread.record.cwd.clone())
+        } else {
+            action_state.repository_path.clone()
+        };
+        let Some(workspace_path) = workspace_path else {
+            self.message = Some("No active threads are available for that scope".into());
             return;
         };
         let scope_name = if all_repositories {
-            "All repositories".into()
+            "All threads".into()
         } else {
             self.repositories
                 .iter()
-                .find(|repository| repository.path == repository_path)
+                .find(|repository| repository.path == workspace_path)
                 .map(|repository| repository.name.clone())
                 .unwrap_or_else(|| "Selected repository".into())
         };
         let candidates = self
             .threads
             .iter()
-            .filter(|thread| all_repositories || thread.record.repository_path == repository_path)
+            .filter(|thread| {
+                all_repositories
+                    || (thread.record.scope == ThreadScope::Repository
+                        && thread.record.repository_path == workspace_path)
+            })
             .map(|thread| BulkRenameCandidate {
                 thread_id: thread.record.id.clone(),
                 repository_name: self.repository_name_for_thread(thread).to_owned(),
@@ -2638,7 +2747,7 @@ impl App {
         self.rename_actions = None;
         self.bulk_rename = Some(BulkRenameState {
             scope_name,
-            repository_path,
+            repository_path: workspace_path,
             show_repository_names: all_repositories,
             return_mode: action_state.return_mode,
             candidates,
@@ -2963,6 +3072,10 @@ impl App {
 
     fn sync_selection_from_tree(&mut self) {
         match self.selected_tree_row() {
+            Some(TreeRow::General) => {}
+            Some(TreeRow::GeneralThread { thread_index }) => {
+                self.thread_index = thread_index;
+            }
             Some(TreeRow::Repository { repository_index }) => {
                 self.repository_index = repository_index;
             }
@@ -2978,11 +3091,17 @@ impl App {
                 self.thread_index = 0;
             }
         }
-        self.locations = self
-            .selected_repository()
-            .and_then(|repository| self.workspaces_by_repository.get(&repository.path))
-            .cloned()
-            .unwrap_or_default();
+        self.locations = if matches!(
+            self.selected_tree_row(),
+            Some(TreeRow::General | TreeRow::GeneralThread { .. })
+        ) {
+            Vec::new()
+        } else {
+            self.selected_repository()
+                .and_then(|repository| self.workspaces_by_repository.get(&repository.path))
+                .cloned()
+                .unwrap_or_default()
+        };
         self.location_index = self
             .location_index
             .min(self.existing_worktrees().len().saturating_sub(1));
@@ -2997,53 +3116,70 @@ impl App {
         }
     }
 
+    fn select_general_row(&mut self) {
+        self.tree_index = 0;
+        self.sync_selection_from_tree();
+    }
+
     fn selected_thread_position_in_repository(&self) -> Option<usize> {
         let rows = self.tree_rows();
-        let TreeRow::Thread {
-            repository_index, ..
-        } = rows.get(self.tree_index)?
-        else {
-            return None;
-        };
+        let selected = rows.get(self.tree_index)?;
         Some(
             rows[..self.tree_index]
                 .iter()
-                .filter(|row| {
-                    matches!(
-                        row,
-                        TreeRow::Thread {
-                            repository_index: index,
-                            ..
-                        } if index == repository_index
-                    )
-                })
+                .filter(|row| same_thread_group(row, selected))
                 .count(),
         )
     }
 
-    fn select_nearby_thread(&mut self, repository_path: &Path, preferred_position: usize) {
-        let Some(repository_index) = self
-            .repositories
-            .iter()
-            .position(|repository| repository.path == repository_path)
-        else {
-            return;
-        };
+    fn select_nearby_thread(&mut self, record: &ThreadRecord, preferred_position: usize) {
         let rows = self.tree_rows();
-        if let Some(tree_index) =
-            nearby_thread_tree_index(&rows, repository_index, preferred_position)
+        let indexes = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row_belongs_to_record_group(row, record, &self.repositories))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if let Some(tree_index) = indexes
+            .get(preferred_position)
+            .or_else(|| indexes.last())
+            .copied()
         {
             self.tree_index = tree_index;
             self.sync_selection_from_tree();
-        } else {
+        } else if record.scope == ThreadScope::General {
+            self.select_general_row();
+        } else if let Some(repository_index) = self
+            .repositories
+            .iter()
+            .position(|repository| repository.path == record.repository_path)
+        {
             self.select_repository_row(repository_index);
         }
     }
 
     fn restore_tree_selection(&mut self, selection: TreeSelection) {
+        if selection == TreeSelection::General {
+            self.select_general_row();
+            return;
+        }
         let (repository_path, thread_id) = match selection {
+            TreeSelection::General => unreachable!(),
             TreeSelection::Repository(path) => (path, None),
-            TreeSelection::Thread { id, repository } => (repository, Some(id)),
+            TreeSelection::Thread(id) => {
+                let Some(thread) = self.threads.iter().find(|thread| thread.record.id == id) else {
+                    return;
+                };
+                if thread.record.scope == ThreadScope::General {
+                    if let Some(index) = self.tree_rows().iter().position(|row| {
+                        matches!(row, TreeRow::GeneralThread { thread_index } if self.threads[*thread_index].record.id == id)
+                    }) {
+                        self.tree_index = index;
+                    }
+                    return;
+                }
+                (thread.record.repository_path.clone(), Some(id))
+            }
         };
         let Some(repository_index) = self
             .repositories
@@ -3304,7 +3440,15 @@ fn tree_rows_for(
     threads: &[ThreadItem],
     expanded_repositories: &HashSet<PathBuf>,
 ) -> Vec<TreeRow> {
-    let mut rows = Vec::with_capacity(repositories.len() + threads.len());
+    let mut rows = Vec::with_capacity(1 + repositories.len() + threads.len());
+    rows.push(TreeRow::General);
+    rows.extend(
+        threads
+            .iter()
+            .enumerate()
+            .filter(|(_, thread)| thread.record.scope == ThreadScope::General)
+            .map(|(thread_index, _)| TreeRow::GeneralThread { thread_index }),
+    );
     for (repository_index, repository) in repositories.iter().enumerate() {
         rows.push(TreeRow::Repository { repository_index });
         if expanded_repositories.contains(&repository.path) {
@@ -3312,7 +3456,10 @@ fn tree_rows_for(
                 threads
                     .iter()
                     .enumerate()
-                    .filter(|(_, thread)| thread.record.repository_path == repository.path)
+                    .filter(|(_, thread)| {
+                        thread.record.scope == ThreadScope::Repository
+                            && thread.record.repository_path == repository.path
+                    })
                     .map(|(thread_index, _)| TreeRow::Thread {
                         repository_index,
                         thread_index,
@@ -3323,29 +3470,40 @@ fn tree_rows_for(
     rows
 }
 
-fn nearby_thread_tree_index(
-    rows: &[TreeRow],
-    repository_index: usize,
-    preferred_position: usize,
-) -> Option<usize> {
-    let mut position = 0;
-    let mut last = None;
-    for (tree_index, row) in rows.iter().enumerate() {
-        if matches!(
-            row,
+fn same_thread_group(left: &TreeRow, right: &TreeRow) -> bool {
+    match (left, right) {
+        (TreeRow::GeneralThread { .. }, TreeRow::GeneralThread { .. }) => true,
+        (
             TreeRow::Thread {
-                repository_index: index,
+                repository_index: left,
                 ..
-            } if *index == repository_index
-        ) {
-            last = Some(tree_index);
-            if position == preferred_position {
-                return Some(tree_index);
-            }
-            position += 1;
-        }
+            },
+            TreeRow::Thread {
+                repository_index: right,
+                ..
+            },
+        ) => left == right,
+        _ => false,
     }
-    last
+}
+
+fn row_belongs_to_record_group(
+    row: &TreeRow,
+    record: &ThreadRecord,
+    repositories: &[Repository],
+) -> bool {
+    match row {
+        TreeRow::GeneralThread { .. } => record.scope == ThreadScope::General,
+        TreeRow::Thread {
+            repository_index, ..
+        } => {
+            record.scope == ThreadScope::Repository
+                && repositories
+                    .get(*repository_index)
+                    .is_some_and(|repository| repository.path == record.repository_path)
+        }
+        _ => false,
+    }
 }
 
 fn remember_archive_undo(history: &mut VecDeque<ArchivedThreadUndo>, undo: ArchivedThreadUndo) {
@@ -3439,6 +3597,7 @@ mod tests {
         ThreadItem {
             record: ThreadRecord {
                 id: id.into(),
+                scope: ThreadScope::Repository,
                 repository_path: repository.into(),
                 cwd: format!("{repository}/{id}").into(),
                 title: id.into(),
@@ -3451,6 +3610,13 @@ mod tests {
             location_name: "primary".into(),
             is_primary: true,
         }
+    }
+
+    fn general_thread(id: &str) -> ThreadItem {
+        let mut thread = thread(id, "/general");
+        thread.record.scope = ThreadScope::General;
+        thread.is_primary = false;
+        thread
     }
 
     fn model(default: &str, efforts: &[&str]) -> ModelMetadata {
@@ -3490,7 +3656,6 @@ mod tests {
         ArchivedThreadUndo {
             id: id.into(),
             title: id.into(),
-            repository_path: "/repo".into(),
         }
     }
 
@@ -3665,6 +3830,7 @@ mod tests {
         assert_eq!(
             tree_rows_for(&repositories, &threads, &expanded),
             vec![
+                TreeRow::General,
                 TreeRow::Repository {
                     repository_index: 0,
                 },
@@ -3678,6 +3844,26 @@ mod tests {
                 TreeRow::Thread {
                     repository_index: 1,
                     thread_index: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tree_groups_general_threads_before_repositories() {
+        let repositories = vec![Repository {
+            name: "repo".into(),
+            path: "/repo".into(),
+        }];
+        let threads = vec![thread("repo-thread", "/repo"), general_thread("quick")];
+
+        assert_eq!(
+            tree_rows_for(&repositories, &threads, &HashSet::new()),
+            vec![
+                TreeRow::General,
+                TreeRow::GeneralThread { thread_index: 1 },
+                TreeRow::Repository {
+                    repository_index: 0,
                 },
             ]
         );
@@ -3701,6 +3887,7 @@ mod tests {
         assert_eq!(
             tree_rows_for(&repositories, &threads, &expanded),
             vec![
+                TreeRow::General,
                 TreeRow::Repository {
                     repository_index: 0,
                 },
@@ -3716,8 +3903,9 @@ mod tests {
     }
 
     #[test]
-    fn nearby_thread_selection_keeps_position_or_uses_previous_thread() {
-        let rows = vec![
+    fn thread_group_matching_distinguishes_general_and_repositories() {
+        let rows = [
+            TreeRow::GeneralThread { thread_index: 0 },
             TreeRow::Repository {
                 repository_index: 0,
             },
@@ -3738,10 +3926,9 @@ mod tests {
             },
         ];
 
-        assert_eq!(nearby_thread_tree_index(&rows, 0, 0), Some(1));
-        assert_eq!(nearby_thread_tree_index(&rows, 0, 1), Some(2));
-        assert_eq!(nearby_thread_tree_index(&rows, 0, 2), Some(2));
-        assert_eq!(nearby_thread_tree_index(&rows, 2, 0), None);
+        assert!(same_thread_group(&rows[2], &rows[3]));
+        assert!(!same_thread_group(&rows[0], &rows[2]));
+        assert!(!same_thread_group(&rows[2], &rows[5]));
     }
 
     #[test]

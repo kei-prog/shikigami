@@ -51,7 +51,7 @@ use crate::{
     chat::{ChatMode, ChatState, CommandPalette, EditorTarget, PaletteCommand, PaletteEntry},
     clipboard,
     git_workspace::{self, Workspace},
-    registry::ThreadRecord,
+    registry::{ThreadRecord, ThreadScope},
     settings::ExecutionMode,
 };
 
@@ -1052,12 +1052,12 @@ async fn handle_key(
             KeyCode::Enter => match app.thread_target_index {
                 0 => {
                     if let Some(workspace) = app.primary_location().cloned() {
-                        open_new_chat(app, server, workspace).await?;
+                        open_new_chat(app, server, workspace, ThreadScope::Repository).await?;
                     }
                 }
                 1 => match app.create_generated_worktree() {
                     Ok(workspace) => {
-                        open_new_chat(app, server, workspace).await?;
+                        open_new_chat(app, server, workspace, ThreadScope::Repository).await?;
                     }
                     Err(error) => app.message = Some(error.to_string()),
                 },
@@ -1078,7 +1078,7 @@ async fn handle_key(
             KeyCode::Down | KeyCode::Char('j') => app.move_down(),
             KeyCode::Enter => {
                 if let Some(workspace) = app.selected_existing_worktree().cloned() {
-                    open_new_chat(app, server, workspace).await?;
+                    open_new_chat(app, server, workspace, ThreadScope::Repository).await?;
                 }
             }
             _ => {}
@@ -1108,7 +1108,12 @@ async fn handle_key(
             KeyCode::Char('!') => app.open_attention(),
             KeyCode::Char('/') => open_command_palette(app, server).await?,
             KeyCode::Char('f') => app.open_thread_picker(),
-            KeyCode::Esc if app.selected_tree_is_thread() => app.select_parent_repository(),
+            KeyCode::Esc if app.selected_tree_is_thread() => app.select_parent_group(),
+            KeyCode::Char('h') | KeyCode::Left
+                if matches!(app.selected_tree_row(), Some(TreeRow::GeneralThread { .. })) =>
+            {
+                app.select_parent_group();
+            }
             KeyCode::Char('h') | KeyCode::Left => app.collapse_selected_repository(),
             KeyCode::Char('l') | KeyCode::Right if app.selected_tree_is_repository() => {
                 app.expand_selected_repository();
@@ -1160,8 +1165,18 @@ async fn handle_key(
                     Err(error) => error.to_string(),
                 });
             }
+            KeyCode::Char('n') if app.show_archived => {
+                app.message = Some("switch to active threads before creating a chat".into());
+            }
             KeyCode::Char('n') => {
-                if app.locations.is_empty() {
+                if app.selected_tree_is_general() {
+                    match app.create_general_workspace() {
+                        Ok(workspace) => {
+                            open_new_chat(app, server, workspace, ThreadScope::General).await?;
+                        }
+                        Err(error) => app.message = Some(error.to_string()),
+                    }
+                } else if app.locations.is_empty() {
                     app.message = Some("no available repository location".into());
                 } else {
                     app.thread_target_index = 0;
@@ -2380,7 +2395,12 @@ async fn interrupt_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     Ok(())
 }
 
-async fn open_new_chat(app: &mut App, server: &Arc<AppServer>, workspace: Workspace) -> Result<()> {
+async fn open_new_chat(
+    app: &mut App,
+    server: &Arc<AppServer>,
+    workspace: Workspace,
+    scope: ThreadScope,
+) -> Result<()> {
     let model_settings = app.default_model_settings();
     let thread_id = server
         .start_thread(
@@ -2389,7 +2409,14 @@ async fn open_new_chat(app: &mut App, server: &Arc<AppServer>, workspace: Worksp
             app.execution_mode,
         )
         .await?;
-    app.register_app_server_thread(thread_id.clone(), workspace.path.clone())?;
+    match scope {
+        ThreadScope::Repository => {
+            app.register_app_server_thread(thread_id.clone(), workspace.path.clone())?
+        }
+        ThreadScope::General => {
+            app.register_app_server_general_thread(thread_id.clone(), workspace.path.clone())?
+        }
+    }
     app.mark_thread_opened(thread_id.clone());
     let mut chat = ChatState::new(thread_id, workspace.path, "Untitled thread".into());
     if let Some((model, display_name, effort)) = model_settings {
@@ -2460,8 +2487,8 @@ async fn start_thread_from_tool(
     let prompt = arguments.prompt.trim();
     anyhow::ensure!(!prompt.is_empty(), "prompt cannot be empty");
     let create_worktree = matches!(arguments.workspace, StartThreadWorkspace::NewWorktree);
-    let (repository, workspace) =
-        app.prepare_thread_workspace(source_thread_id, create_worktree)?;
+    let prepared = app.prepare_thread_workspace(source_thread_id, create_worktree)?;
+    let workspace = prepared.workspace;
     let model_settings = app.default_model_settings();
     let thread_id = match server
         .start_thread(
@@ -2473,19 +2500,32 @@ async fn start_thread_from_tool(
     {
         Ok(thread_id) => thread_id,
         Err(error) => {
-            let cleanup =
-                cleanup_created_tool_workspace(&repository.path, &workspace, create_worktree);
+            let cleanup = prepared.repository.as_ref().map_or(Ok(()), |repository| {
+                cleanup_created_tool_workspace(&repository.path, &workspace, create_worktree)
+            });
             return Err(with_cleanup_error(error, cleanup));
         }
     };
-    if let Err(error) = app.register_app_server_thread_in_repository(
-        thread_id.clone(),
-        repository.path.clone(),
-        workspace.path.clone(),
-    ) {
+    let registration = match prepared.scope {
+        ThreadScope::Repository => app.register_app_server_thread_in_repository(
+            thread_id.clone(),
+            prepared
+                .repository
+                .as_ref()
+                .context("repository workspace has no repository")?
+                .path
+                .clone(),
+            workspace.path.clone(),
+        ),
+        ThreadScope::General => {
+            app.register_app_server_general_thread(thread_id.clone(), workspace.path.clone())
+        }
+    };
+    if let Err(error) = registration {
         let server_cleanup = delete_temporary_thread(server, &thread_id).await.err();
-        let workspace_cleanup =
-            cleanup_created_tool_workspace(&repository.path, &workspace, create_worktree).err();
+        let workspace_cleanup = prepared.repository.as_ref().and_then(|repository| {
+            cleanup_created_tool_workspace(&repository.path, &workspace, create_worktree).err()
+        });
         return Err(with_cleanup_errors(
             error,
             server_cleanup,
@@ -4445,6 +4485,26 @@ fn render_navigation_tree(frame: &mut Frame, app: &App, area: Rect) {
     let attention_by_repository = app.repository_attention_counts();
     let rows = app.tree_rows();
     let items = rows.iter().map(|row| match row {
+        TreeRow::General => {
+            let attention_count = app
+                .threads
+                .iter()
+                .filter(|thread| thread.record.scope == ThreadScope::General)
+                .filter(|thread| attention_by_thread.contains_key(thread.record.id.as_str()))
+                .count();
+            let attention = if attention_count == 0 {
+                String::new()
+            } else {
+                format!(" [{attention_count}]")
+            };
+            ListItem::new(Text::from(vec![
+                Line::styled(
+                    format!("▾{attention} General"),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Line::styled("  One-off chats", Style::default().fg(Color::DarkGray)),
+            ]))
+        }
         TreeRow::Repository { repository_index } => {
             let repository = &app.repositories[*repository_index];
             let attention_count = attention_by_repository
@@ -4472,7 +4532,7 @@ fn render_navigation_tree(frame: &mut Frame, app: &App, area: Rect) {
                 ),
             ]))
         }
-        TreeRow::Thread { thread_index, .. } => {
+        TreeRow::GeneralThread { thread_index } | TreeRow::Thread { thread_index, .. } => {
             let thread = &app.threads[*thread_index];
             let visible = visible_thread_id == Some(thread.record.id.as_str());
             let working = app
@@ -4519,7 +4579,9 @@ fn render_navigation_tree(frame: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Style::default()
                 };
-            let kind = if thread.is_primary {
+            let kind = if thread.record.scope == ThreadScope::General {
+                "general"
+            } else if thread.is_primary {
                 "primary"
             } else {
                 "worktree"
@@ -4534,9 +4596,9 @@ fn render_navigation_tree(frame: &mut Frame, app: &App, area: Rect) {
         }
     });
     let title = if app.show_archived {
-        " Repositories · archived "
+        " Threads · archived "
     } else {
-        " Repositories "
+        " Threads "
     };
     let mut block = Block::default()
         .title(title)
@@ -4874,7 +4936,7 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
 fn render_help(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(72, 35, area);
     let help = format!(
-        "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / return from messages\nl / →        expand repository / focus selected thread messages\ni            focus selected thread input / switch from messages to input\nH / L        collapse / expand all repositories\nEnter        expand/focus input / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            open the command palette\nf            filter threads / repository candidates\n/permissions choose Auto or Dangerous execution\nR            open thread-name actions\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nu            undo the last archive\nA            active / archived threads\nd            unregister repository / delete archived thread\nr            reload repositories and names\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {}\nPress any key to close",
+        "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / return from messages\nl / →        expand repository / focus selected thread messages\ni            focus selected thread input / switch from messages to input\nH / L        collapse / expand all repositories\nEnter        expand/focus input / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            open the command palette\nf            filter threads / repository candidates\n/permissions choose Auto or Dangerous execution\nR            open thread-name actions\n!            show threads that need attention\nEsc          return to thread tree / cancel\na            add repositories\nn            create General chat or repository thread\nx            archive / restore thread\nu            undo the last archive\nA            active / archived threads\nd            unregister repository / delete archived thread\nr            reload repositories and names\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {}\nPress any key to close",
         execution_status(app.execution_mode)
     );
     frame.render_widget(Clear, popup);
