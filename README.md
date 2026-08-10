@@ -78,8 +78,8 @@ Named keys such as `enter`, `esc`, `space`, `backspace`, arrows, `pageup`,
 Shikigami after editing the file. Missing actions keep their built-in defaults,
 so older configs remain compatible when new commands are added. An invalid file
 or conflicting key in the same mode falls back to the full default keymap and
-shows the error in the TUI. `Esc` remains an emergency way out of dialogs and
-`Ctrl-c` remains an interrupt fallback even when extra bindings are configured.
+shows the error in the TUI. `Esc` remains an emergency way out of dialogs;
+chat focus and interrupt bindings are fully replaceable.
 The `?` help screen displays the active bindings and config path.
 
 Shikigami opens with a `General` area for one-off chats. On the first launch it

@@ -143,16 +143,9 @@ static ACTIONS: &[ActionSpec] = &[
         "chat_scroll.focus_tree",
         ChatScroll,
         "esc",
-        ["esc", "h", "left"],
-        fallback["esc"]
+        ["esc", "h", "left"]
     ),
-    action!(
-        "chat_scroll.interrupt",
-        ChatScroll,
-        "ctrl+c",
-        ["ctrl+c"],
-        fallback["ctrl+c"]
-    ),
+    action!("chat_scroll.interrupt", ChatScroll, "ctrl+c", ["ctrl+c"]),
     action!("chat_scroll.palette", ChatScroll, "/", ["/"]),
     action!("chat_scroll.toggle_pane", ChatScroll, "ctrl+g", ["ctrl+g"]),
     action!("chat_scroll.next_chat", ChatScroll, "ctrl+n", ["ctrl+n"]),
@@ -191,20 +184,8 @@ static ACTIONS: &[ActionSpec] = &[
     action!("chat_scroll.top", ChatScroll, "home", ["home", "g"]),
     action!("chat_scroll.bottom", ChatScroll, "end", ["end", "G"]),
     action!("chat_input.scroll", ChatInput, "tab", ["tab"]),
-    action!(
-        "chat_input.focus_tree",
-        ChatInput,
-        "esc",
-        ["esc"],
-        fallback["esc"]
-    ),
-    action!(
-        "chat_input.interrupt",
-        ChatInput,
-        "ctrl+c",
-        ["ctrl+c"],
-        fallback["ctrl+c"]
-    ),
+    action!("chat_input.focus_tree", ChatInput, "esc", ["esc"]),
+    action!("chat_input.interrupt", ChatInput, "ctrl+c", ["ctrl+c"]),
     action!("chat_input.toggle_pane", ChatInput, "ctrl+g", ["ctrl+g"]),
     action!("chat_input.next_chat", ChatInput, "ctrl+n", ["ctrl+n"]),
     action!("chat_input.previous_chat", ChatInput, "ctrl+p", ["ctrl+p"]),
@@ -248,20 +229,8 @@ static ACTIONS: &[ActionSpec] = &[
     ),
     action!("chat_input.submit", ChatInput, "enter", ["enter"]),
     action!("chat_input.scroll", ChatInputEmpty, "tab", ["tab"]),
-    action!(
-        "chat_input.focus_tree",
-        ChatInputEmpty,
-        "esc",
-        ["esc"],
-        fallback["esc"]
-    ),
-    action!(
-        "chat_input.interrupt",
-        ChatInputEmpty,
-        "ctrl+c",
-        ["ctrl+c"],
-        fallback["ctrl+c"]
-    ),
+    action!("chat_input.focus_tree", ChatInputEmpty, "esc", ["esc"]),
+    action!("chat_input.interrupt", ChatInputEmpty, "ctrl+c", ["ctrl+c"]),
     action!(
         "chat_input.toggle_pane",
         ChatInputEmpty,
@@ -1260,6 +1229,31 @@ mod tests {
 
         assert_eq!(typed.code, KeyCode::Char('u'));
         assert!(typed.modifiers.is_empty());
+    }
+
+    #[test]
+    fn chat_escape_and_interrupt_bindings_can_be_swapped() {
+        let mut config = default_config();
+        config
+            .keybindings
+            .insert("chat_input.focus_tree".into(), vec!["ctrl+c".into()]);
+        config
+            .keybindings
+            .insert("chat_input.interrupt".into(), vec!["esc".into()]);
+        let bindings = KeyBindings::from_config(PathBuf::new(), config).unwrap();
+
+        let interrupt = bindings.resolve(
+            &[KeyContext::ChatInput],
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        let focus_tree = bindings.resolve(
+            &[KeyContext::ChatInput],
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(interrupt.code, KeyCode::Char('c'));
+        assert!(interrupt.modifiers.contains(KeyModifiers::CONTROL));
+        assert_eq!(focus_tree.code, KeyCode::Esc);
     }
 
     #[test]
