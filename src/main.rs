@@ -4,6 +4,7 @@ mod chat;
 mod clipboard;
 mod git_workspace;
 mod keybindings;
+mod onboarding;
 mod paths;
 mod registry;
 mod repository;

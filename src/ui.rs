@@ -52,6 +52,7 @@ use crate::{
     clipboard,
     git_workspace::{self, Workspace},
     keybindings::{KeyBindings, KeyContext},
+    onboarding,
     registry::{ThreadRecord, ThreadScope},
     settings::ExecutionMode,
 };
@@ -229,6 +230,10 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                     terminal.draw(|frame| render(frame, app, &mut render_cache))?;
                     needs_draw = false;
                     redraw_ticker.reset();
+                    if let Some(onboarding) = app.take_pending_onboarding() {
+                        start_onboarding_chat(app, &server, onboarding).await;
+                        needs_draw = true;
+                    }
                 }
             }
             _ = ticker.tick() => {
@@ -449,6 +454,82 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
         task.abort();
     }
     Ok(())
+}
+
+async fn start_onboarding_chat(
+    app: &mut App,
+    server: &Arc<AppServer>,
+    onboarding: crate::app::PendingOnboarding,
+) {
+    if !app.is_draft_thread(&onboarding.draft_id) || !app.chats.contains_key(&onboarding.draft_id) {
+        return;
+    }
+    let Some(chat) = app.chats.get(&onboarding.draft_id) else {
+        return;
+    };
+    let cwd = chat.cwd.clone();
+    let model = chat.model.clone();
+    let effort = chat.reasoning_effort.clone();
+    let instructions = onboarding::developer_instructions(&onboarding.locale);
+    let thread_id = match server
+        .start_thread_with_developer_instructions(
+            &cwd,
+            model.as_deref(),
+            app.execution_mode,
+            Some(&instructions),
+        )
+        .await
+    {
+        Ok(thread_id) => thread_id,
+        Err(error) => {
+            app.message = Some(format!("Could not start welcome chat: {error}"));
+            return;
+        }
+    };
+    if let Err(error) = app.materialize_draft_thread(&onboarding.draft_id, thread_id.clone()) {
+        let cleanup = delete_temporary_thread(server, &thread_id).await;
+        app.message = Some(match cleanup {
+            Ok(()) => format!("Could not register welcome chat: {error}"),
+            Err(cleanup_error) => format!(
+                "Could not register welcome chat: {error}; Codex cleanup also failed: {cleanup_error}"
+            ),
+        });
+        return;
+    }
+    app.mark_thread_opened(thread_id.clone());
+    let turn_id = match server
+        .start_turn(
+            &thread_id,
+            &cwd,
+            "👋",
+            &[],
+            &[],
+            TurnSettings {
+                model: model.as_deref(),
+                effort: effort.as_deref(),
+                execution_mode: app.execution_mode,
+            },
+        )
+        .await
+    {
+        Ok(turn_id) => turn_id,
+        Err(error) => {
+            app.message = Some(format!("Could not start welcome message: {error}"));
+            return;
+        }
+    };
+    app.record_owned_turn(thread_id.clone(), turn_id.clone());
+    if let Some(chat) = app.chats.get_mut(&thread_id) {
+        chat.begin_user_turn("👋".into(), turn_id);
+    }
+    if let Err(error) = onboarding::OnboardingStore::discover().and_then(|store| store.mark_shown())
+    {
+        app.message = Some(error.to_string());
+    }
+    match server.set_thread_name(&thread_id, "👋 Shikigami").await {
+        Ok(()) => app.apply_thread_name(&thread_id, Some("👋 Shikigami".into())),
+        Err(error) => app.message = Some(format!("Welcome started, but naming failed: {error}")),
+    }
 }
 
 async fn handle_key(

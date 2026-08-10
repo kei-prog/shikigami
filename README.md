@@ -82,11 +82,17 @@ shows the error in the TUI. `Esc` remains an emergency way out of dialogs;
 chat focus and interrupt bindings are fully replaceable.
 The `?` help screen displays the active bindings and config path.
 
-Shikigami opens with a `General` area for one-off chats. On the first launch it
-opens the repository picker and discovers repositories from `ghq` and saved
-projects folders in the background; if neither is available, it falls back to a
-home-directory scan. Results are cached for later launches. Whenever no Git
-repository is registered, the picker opens automatically. Add more repositories
+Shikigami opens with a `General` area for one-off chats. On a fresh installation,
+it starts one welcome chat there after drawing the first screen. Codex explains
+the main workflow in the operating system's preferred locale; locale detection
+supports macOS, Windows, Linux, and other supported Unix systems, with English
+as the fallback. Repository discovery continues in the background while the
+welcome response runs. The welcome is versioned and shown only once.
+
+After onboarding, whenever no Git repository is registered, Shikigami opens the
+repository picker and discovers repositories from `ghq` and saved projects
+folders in the background; if neither is available, it falls back to a
+home-directory scan. Results are cached for later launches. Add more repositories
 with `a`, use `r` to rescan `ghq` and saved projects folders, `s` to explicitly
 scan the home directory, or `b` to choose another folder or repository. The main
 screen only shows repositories you register. Home scans search six directory

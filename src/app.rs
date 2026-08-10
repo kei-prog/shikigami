@@ -21,6 +21,7 @@ use crate::{
     chat::{ChatState, CommandPalette, fuzzy_score},
     git_workspace::{self, Workspace},
     keybindings::KeyBindings,
+    onboarding::{self, OnboardingStore},
     paths,
     registry::{
         AttentionRegistry, PersistentAttentionKind, Registry, SideChatRegistry, ThreadRecord,
@@ -96,6 +97,12 @@ struct DraftThread {
     repository_path: PathBuf,
     workspace_path: PathBuf,
     cleanup_workspace_on_cancel: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingOnboarding {
+    pub draft_id: String,
+    pub locale: String,
 }
 
 #[derive(Clone, Debug)]
@@ -295,6 +302,7 @@ pub struct App {
     pub should_quit: bool,
     pub chats: HashMap<String, ChatState>,
     draft_threads: HashMap<String, DraftThread>,
+    pending_onboarding: Option<PendingOnboarding>,
     preview_cache_order: VecDeque<String>,
     pub visible_chat_id: Option<String>,
     pub side_chat_id: Option<String>,
@@ -349,6 +357,7 @@ impl App {
     pub fn load() -> Result<Self> {
         let repository_store = RepositoryStore::discover()?;
         let settings_store = SettingsStore::discover()?;
+        let onboarding_store = OnboardingStore::discover()?;
         let (execution_mode, settings_error) = match settings_store.load() {
             Ok(mode) => (mode, None),
             Err(error) => (
@@ -380,15 +389,26 @@ impl App {
                 Some(format!("Could not load cached thread titles: {error}")),
             ),
         };
-        if let Ok(records) = thread_registry.load() {
-            let registered = records
-                .into_iter()
-                .map(|thread| thread.id)
-                .collect::<HashSet<_>>();
-            thread_names.retain(|thread_id, _| registered.contains(thread_id));
-        }
+        let has_existing_threads = match thread_registry.load() {
+            Ok(records) => {
+                let has_existing_threads = !records.is_empty();
+                let registered = records
+                    .into_iter()
+                    .map(|thread| thread.id)
+                    .collect::<HashSet<_>>();
+                thread_names.retain(|thread_id, _| registered.contains(thread_id));
+                has_existing_threads
+            }
+            Err(_) => true,
+        };
         let repositories = repository_store.load_registered()?;
         let initial_home_scan_is_pending = repository_store.initial_home_scan_is_pending();
+        let should_show_onboarding = should_show_onboarding(
+            onboarding_store.is_pending(),
+            initial_home_scan_is_pending,
+            repositories.is_empty(),
+            has_existing_threads,
+        );
         let candidates = repository_store.load_candidates().unwrap_or_default();
         let browse_path = BaseDirs::new()
             .map(|dirs| dirs.home_dir().to_path_buf())
@@ -472,6 +492,7 @@ impl App {
             should_quit: false,
             chats: HashMap::new(),
             draft_threads: HashMap::new(),
+            pending_onboarding: None,
             preview_cache_order: VecDeque::new(),
             visible_chat_id: None,
             side_chat_id: None,
@@ -539,8 +560,36 @@ impl App {
             app.restore_tree_selection(TreeSelection::Repository(repository));
             app.sync_selection_from_tree();
         }
+        let onboarding_opened = if should_show_onboarding {
+            match app.create_general_workspace().and_then(|workspace| {
+                let draft_id = app.begin_draft_thread(&workspace, ThreadScope::General, true)?;
+                let mut chat =
+                    ChatState::new(draft_id.clone(), workspace.path, "👋 Shikigami".into());
+                if let Some((model, display_name, effort)) = app.default_model_settings() {
+                    chat.set_model(model, display_name, effort);
+                }
+                app.show_chat(chat);
+                app.focus = Focus::Chat;
+                app.mode = Mode::Chat;
+                app.pending_onboarding = Some(PendingOnboarding {
+                    draft_id,
+                    locale: onboarding::preferred_locale(),
+                });
+                Ok(())
+            }) {
+                Ok(()) => true,
+                Err(error) => {
+                    app.message = Some(format!("Could not open welcome chat: {error}"));
+                    false
+                }
+            }
+        } else {
+            false
+        };
         if app.repositories.is_empty() {
-            app.open_repository_add();
+            if !onboarding_opened {
+                app.open_repository_add();
+            }
             if initial_home_scan_is_pending {
                 if app.start_root_scan().is_err() {
                     app.start_home_scan();
@@ -552,6 +601,10 @@ impl App {
             app.message = Some(format!("Could not restore attention list: {error}"));
         }
         Ok(app)
+    }
+
+    pub fn take_pending_onboarding(&mut self) -> Option<PendingOnboarding> {
+        self.pending_onboarding.take()
     }
 
     pub fn selected_repository(&self) -> Option<&Repository> {
@@ -3570,6 +3623,15 @@ fn apply_thread_name_to(
     }
 }
 
+fn should_show_onboarding(
+    marker_is_pending: bool,
+    initial_scan_is_pending: bool,
+    repositories_are_empty: bool,
+    has_existing_threads: bool,
+) -> bool {
+    marker_is_pending && initial_scan_is_pending && repositories_are_empty && !has_existing_threads
+}
+
 fn thread_picker_matches(
     threads: &[ThreadItem],
     repositories: &[Repository],
@@ -4524,5 +4586,14 @@ mod tests {
             attention_kind_for_event(&event),
             Some(AttentionKind::Failed)
         );
+    }
+
+    #[test]
+    fn onboarding_is_limited_to_a_genuinely_fresh_installation() {
+        assert!(should_show_onboarding(true, true, true, false));
+        assert!(!should_show_onboarding(false, true, true, false));
+        assert!(!should_show_onboarding(true, false, true, false));
+        assert!(!should_show_onboarding(true, true, false, false));
+        assert!(!should_show_onboarding(true, true, true, true));
     }
 }

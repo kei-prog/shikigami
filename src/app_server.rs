@@ -332,6 +332,17 @@ impl AppServer {
         model: Option<&str>,
         execution_mode: ExecutionMode,
     ) -> Result<String> {
+        self.start_thread_with_developer_instructions(cwd, model, execution_mode, None)
+            .await
+    }
+
+    pub async fn start_thread_with_developer_instructions(
+        &self,
+        cwd: &Path,
+        model: Option<&str>,
+        execution_mode: ExecutionMode,
+        developer_instructions: Option<&str>,
+    ) -> Result<String> {
         let (approval_policy, sandbox) = execution_policy(execution_mode);
         let approvals_reviewer = approvals_reviewer(execution_mode);
         let response = self
@@ -344,6 +355,7 @@ impl AppServer {
                     "approvalsReviewer": approvals_reviewer,
                     "sandbox": sandbox,
                     "ephemeral": false,
+                    "developerInstructions": developer_instructions,
                     "dynamicTools": shikigami_dynamic_tools()
                 }),
             )
@@ -888,7 +900,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_threads_receive_the_shikigami_tool() {
+    async fn new_threads_receive_the_shikigami_tool_and_developer_instructions() {
         let (writer, mut messages) = mpsc::channel(1);
         let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
         let (events, _) = broadcast::channel(1);
@@ -910,7 +922,12 @@ mod tests {
             let server = server.clone();
             async move {
                 server
-                    .start_thread(Path::new("/tmp/project"), None, ExecutionMode::Auto)
+                    .start_thread_with_developer_instructions(
+                        Path::new("/tmp/project"),
+                        None,
+                        ExecutionMode::Auto,
+                        Some("Welcome the user"),
+                    )
                     .await
             }
         });
@@ -919,6 +936,10 @@ mod tests {
         };
         assert_eq!(message["params"]["dynamicTools"], shikigami_dynamic_tools());
         assert_eq!(message["params"]["approvalsReviewer"], "auto_review");
+        assert_eq!(
+            message["params"]["developerInstructions"],
+            "Welcome the user"
+        );
         dispatch_response(
             &pending,
             &json!({"id":message["id"],"result":{"thread":{"id":"thread-1"}}}),
