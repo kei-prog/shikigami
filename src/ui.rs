@@ -122,8 +122,16 @@ enum ThreadDeletionEvent {
 
 struct ApprovalPrompt {
     thread_title: String,
-    method: String,
-    detail: String,
+    title: String,
+    explanation: String,
+    details: Vec<(String, String)>,
+    options: Vec<ApprovalOption>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ApprovalOption {
+    label: String,
+    response: Value,
 }
 
 pub async fn run(mut app: App) -> Result<()> {
@@ -404,12 +412,28 @@ async fn handle_key(
     if app.mode == Mode::Chat && app.focus == Focus::Chat && app.active_chat_has_pending_approval()
     {
         match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                let option_count = active_approval_option_count(app);
+                move_approval_selection(app, option_count, -1);
+                return Ok(None);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let option_count = active_approval_option_count(app);
+                move_approval_selection(app, option_count, 1);
+                return Ok(None);
+            }
+            KeyCode::Enter => {
+                let index = app.approval_index;
+                resolve_active_chat_approval(app, server, index).await?;
+                return Ok(None);
+            }
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                resolve_active_chat_approval(app, server, true).await?;
+                resolve_active_chat_approval(app, server, 0).await?;
                 return Ok(None);
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
-                resolve_active_chat_approval(app, server, false).await?;
+                let index = active_approval_negative_index(app);
+                resolve_active_chat_approval(app, server, index).await?;
                 return Ok(None);
             }
             KeyCode::Esc => {
@@ -909,12 +933,26 @@ async fn handle_key(
             _ => {}
         },
         Mode::Approval => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                let option_count = unscoped_approval_option_count(app);
+                move_approval_selection(app, option_count, -1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let option_count = unscoped_approval_option_count(app);
+                move_approval_selection(app, option_count, 1)
+            }
+            KeyCode::Enter => {
+                let index = app.approval_index;
+                resolve_unscoped_approval(app, server, index).await?
+            }
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                resolve_unscoped_approval(app, server, true).await?
+                resolve_unscoped_approval(app, server, 0).await?
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                resolve_unscoped_approval(app, server, false).await?
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                let index = unscoped_approval_negative_index(app);
+                resolve_unscoped_approval(app, server, index).await?
             }
+            KeyCode::Esc => app.mode = Mode::Normal,
             _ => {}
         },
         Mode::AddRepositories => match key.code {
@@ -2805,18 +2843,18 @@ fn is_approval(request: &AppServerRequest) -> bool {
 async fn resolve_active_chat_approval(
     app: &mut App,
     server: &Arc<AppServer>,
-    accept: bool,
+    selected_index: usize,
 ) -> Result<()> {
     let Some(request) = app.take_active_chat_approval() else {
         return Ok(());
     };
-    respond_to_approval(app, server, request, accept).await
+    respond_to_approval(app, server, request, selected_index).await
 }
 
 async fn resolve_unscoped_approval(
     app: &mut App,
     server: &Arc<AppServer>,
-    accept: bool,
+    selected_index: usize,
 ) -> Result<()> {
     let Some(request) = app.take_unscoped_pending_approval() else {
         app.mode = if app.chat().is_some() && app.focus == Focus::Chat {
@@ -2826,7 +2864,7 @@ async fn resolve_unscoped_approval(
         };
         return Ok(());
     };
-    respond_to_approval(app, server, request, accept).await?;
+    respond_to_approval(app, server, request, selected_index).await?;
     app.mode = if app.unscoped_pending_approval().is_some() {
         Mode::Approval
     } else if app.chat().is_some() && app.focus == Focus::Chat {
@@ -2841,21 +2879,85 @@ async fn respond_to_approval(
     app: &mut App,
     server: &Arc<AppServer>,
     request: AppServerRequest,
-    accept: bool,
+    selected_index: usize,
 ) -> Result<()> {
     let thread_id = request.thread_id.clone();
-    let result = if request.method == "item/permissions/requestApproval" {
-        if accept {
-            json!({"permissions": request.params.get("permissions").cloned().unwrap_or_else(|| json!({})), "scope":"turn"})
-        } else {
-            json!({"permissions":{"fileSystem":{"entries":[]},"network":{"enabled":false}},"scope":"turn"})
-        }
-    } else {
-        json!({"decision": if accept { "accept" } else { "decline" }})
-    };
+    let options = approval_options(&request);
+    let result = options
+        .get(selected_index.min(options.len().saturating_sub(1)))
+        .map(|option| option.response.clone())
+        .context("approval has no available decisions")?;
     server.respond(request.id, result).await?;
+    app.approval_index = 0;
     app.approval_resolved(thread_id.as_deref());
     Ok(())
+}
+
+fn active_approval_option_count(app: &App) -> usize {
+    let thread_id = match app.active_chat_pane {
+        ChatPane::Main => app.visible_chat_id.as_deref(),
+        ChatPane::Side => app.side_chat_id.as_deref(),
+    };
+    thread_id
+        .and_then(|thread_id| app.pending_approval_for_thread(thread_id))
+        .map(|request| approval_options(request).len())
+        .unwrap_or(0)
+}
+
+fn unscoped_approval_option_count(app: &App) -> usize {
+    app.unscoped_pending_approval()
+        .map(|request| approval_options(request).len())
+        .unwrap_or(0)
+}
+
+fn active_approval_negative_index(app: &App) -> usize {
+    active_approval_option_count(app).saturating_sub(1)
+}
+
+fn unscoped_approval_negative_index(app: &App) -> usize {
+    unscoped_approval_option_count(app).saturating_sub(1)
+}
+
+fn move_approval_selection(app: &mut App, option_count: usize, direction: i8) {
+    if option_count == 0 {
+        app.approval_index = 0;
+    } else if direction < 0 {
+        app.approval_index = if app.approval_index == 0 {
+            option_count - 1
+        } else {
+            app.approval_index.min(option_count - 1) - 1
+        };
+    } else {
+        app.approval_index = (app.approval_index + 1) % option_count;
+    }
+}
+
+fn active_approval_prompt(app: &App) -> Option<ApprovalPrompt> {
+    let thread_id = match app.active_chat_pane {
+        ChatPane::Main => app.visible_chat_id.as_deref(),
+        ChatPane::Side => app.side_chat_id.as_deref(),
+    }?;
+    let request = app.pending_approval_for_thread(thread_id)?;
+    let title = app
+        .chats
+        .get(thread_id)
+        .map(|chat| chat.title.as_str())
+        .unwrap_or("thread");
+    Some(approval_prompt(title, request))
+}
+
+fn active_chat_pane_area(chat_area: Rect, app: &App) -> Rect {
+    if !app.has_side_chat() {
+        return chat_area;
+    }
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chat_area);
+    match app.active_chat_pane {
+        ChatPane::Main => panes[0],
+        ChatPane::Side => panes[1],
+    }
 }
 
 fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
@@ -2904,7 +3006,7 @@ fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
         header.push(Span::raw(" "));
     } else if app.chat().is_some() {
         let (label, color) = match app.execution_mode {
-            ExecutionMode::Auto => (" AUTO ", Color::Green),
+            ExecutionMode::Auto => (" AUTO · WORKSPACE ", Color::Green),
             ExecutionMode::Dangerous => (" DANGEROUS ", Color::Red),
         };
         header.push(Span::styled(
@@ -2977,7 +3079,16 @@ fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
         && let Some(request) = app.unscoped_pending_approval()
     {
         let prompt = approval_prompt("Codex", request);
-        render_approval(frame, area, &prompt, true);
+        render_approval(frame, area, &prompt, app.approval_index, true);
+    } else if let Some(prompt) = active_approval_prompt(app) {
+        let popup_area = active_chat_pane_area(panes[1], app);
+        render_approval(
+            frame,
+            popup_area,
+            &prompt,
+            app.approval_index,
+            app.mode == Mode::Chat && app.focus == Focus::Chat,
+        );
     }
     if app.thread_deletion.is_some() && app.mode != Mode::DeletingThread {
         render_thread_deletion_progress(frame, area, app);
@@ -3051,14 +3162,6 @@ fn render_chat_pane(
         );
         return;
     };
-    let approval = app.pending_approval_for_thread(&chat_id).map(|request| {
-        let title = app
-            .chats
-            .get(&chat_id)
-            .map(|chat| chat.title.as_str())
-            .unwrap_or("thread");
-        approval_prompt(title, request)
-    });
     let Some(chat) = app.chats.get_mut(&chat_id) else {
         return;
     };
@@ -3225,14 +3328,6 @@ fn render_chat_pane(
     );
     if pane_active && let Some(palette) = &chat.palette {
         render_command_palette(frame, area, palette);
-    }
-    if let Some(approval) = approval {
-        render_approval(
-            frame,
-            area,
-            &approval,
-            app.mode == Mode::Chat && chat_focused,
-        );
     }
 }
 
@@ -3918,33 +4013,286 @@ fn wrap_composer(composer: &str, max_width: usize) -> Vec<String> {
 }
 
 fn approval_prompt(thread_title: &str, request: &AppServerRequest) -> ApprovalPrompt {
+    let (title, explanation) = match request.method.as_str() {
+        "item/commandExecution/requestApproval" => (
+            "Run this command?",
+            "AUTO runs workspace actions automatically. This command needs additional permission.",
+        ),
+        "item/fileChange/requestApproval" => (
+            "Make these edits?",
+            "AUTO can edit the workspace. These changes need additional permission.",
+        ),
+        "item/permissions/requestApproval" => (
+            "Grant additional permissions?",
+            "AUTO needs temporary access beyond its current workspace permissions.",
+        ),
+        _ => (
+            "Continue this action?",
+            "AUTO needs additional permission before Codex can continue.",
+        ),
+    };
+    let mut details = Vec::new();
+    if let Some(reason) = request.params.get("reason").and_then(Value::as_str)
+        && !reason.trim().is_empty()
+    {
+        details.push(("Reason".into(), reason.trim().into()));
+    }
+    if let Some(network) = request.params.get("networkApprovalContext") {
+        details.push(("Network access".into(), network_approval_summary(network)));
+    } else if let Some(command) = approval_command(&request.params) {
+        details.push(("Command".into(), command));
+    }
+    if let Some(cwd) = request.params.get("cwd").and_then(Value::as_str)
+        && !cwd.is_empty()
+    {
+        details.push(("Working directory".into(), cwd.into()));
+    }
+    if let Some(root) = request.params.get("grantRoot").and_then(Value::as_str)
+        && !root.is_empty()
+    {
+        details.push(("Files".into(), root.into()));
+    }
+    if request.method == "item/permissions/requestApproval" {
+        details.push((
+            "Requested access".into(),
+            permissions_summary(request.params.get("permissions")),
+        ));
+    }
+    if details.is_empty() {
+        details.push((
+            "Request".into(),
+            "Codex needs permission to continue this action.".into(),
+        ));
+    }
     ApprovalPrompt {
         thread_title: thread_title.to_owned(),
-        method: request.method.clone(),
-        detail: request.params.to_string(),
+        title: title.into(),
+        explanation: explanation.into(),
+        details,
+        options: approval_options(request),
     }
 }
 
-fn render_approval(frame: &mut Frame, area: Rect, prompt: &ApprovalPrompt, interactive: bool) {
-    let popup = centered_rect(90, 12, area);
+fn approval_options(request: &AppServerRequest) -> Vec<ApprovalOption> {
+    if request.method == "item/permissions/requestApproval" {
+        let permissions = request
+            .params
+            .get("permissions")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        return vec![
+            ApprovalOption {
+                label: "Yes, grant these permissions for this turn".into(),
+                response: json!({"permissions": permissions, "scope": "turn"}),
+            },
+            ApprovalOption {
+                label: "Yes, grant these permissions for this session".into(),
+                response: json!({"permissions": permissions, "scope": "session"}),
+            },
+            ApprovalOption {
+                label: "No, continue without permissions".into(),
+                response: json!({"permissions":{"fileSystem":{"entries":[]},"network":{"enabled":false}},"scope":"turn"}),
+            },
+        ];
+    }
+
+    let decisions = request
+        .params
+        .get("availableDecisions")
+        .and_then(Value::as_array)
+        .filter(|decisions| !decisions.is_empty())
+        .cloned()
+        .unwrap_or_else(|| vec![json!("accept"), json!("decline")]);
+    decisions
+        .into_iter()
+        .map(|decision| ApprovalOption {
+            label: approval_decision_label(request, &decision),
+            response: json!({"decision": decision}),
+        })
+        .collect()
+}
+
+fn approval_decision_label(request: &AppServerRequest, decision: &Value) -> String {
+    if decision == "accept" {
+        "Yes, proceed".into()
+    } else if decision == "acceptForSession" {
+        if request.method == "item/fileChange/requestApproval" {
+            "Yes, and don't ask again for these files in this session".into()
+        } else {
+            "Yes, and don't ask again for this command in this session".into()
+        }
+    } else if decision == "decline" {
+        if request.method == "item/fileChange/requestApproval" {
+            "No, continue without making these edits".into()
+        } else {
+            "No, continue without running it".into()
+        }
+    } else if decision == "cancel" {
+        "No, and tell Codex what to do differently".into()
+    } else if let Some(amendment) = decision
+        .pointer("/acceptWithExecpolicyAmendment/execpolicy_amendment")
+        .and_then(Value::as_array)
+    {
+        let prefix = amendment
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("Yes, and don't ask again for commands that start with `{prefix}`")
+    } else if decision.get("applyNetworkPolicyAmendment").is_some() {
+        "Yes, and allow this network destination in the future".into()
+    } else {
+        "Continue with this option".into()
+    }
+}
+
+fn approval_command(params: &Value) -> Option<String> {
+    params
+        .get("command")
+        .and_then(display_string_value)
+        .or_else(|| {
+            params
+                .get("commandActions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|action| action.get("command").and_then(display_string_value))
+                .next()
+        })
+}
+
+fn display_string_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) if !value.is_empty() => Some(value.clone()),
+        Value::Array(values) => {
+            let parts = values.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+            (!parts.is_empty()).then(|| parts.join(" "))
+        }
+        _ => None,
+    }
+}
+
+fn network_approval_summary(network: &Value) -> String {
+    let host = network
+        .get("host")
+        .and_then(Value::as_str)
+        .unwrap_or("requested destination");
+    let protocol = network.get("protocol").and_then(Value::as_str);
+    let port = network.get("port").and_then(Value::as_u64);
+    match (protocol, port) {
+        (Some(protocol), Some(port)) => format!("{protocol}://{host}:{port}"),
+        (Some(protocol), None) => format!("{protocol}://{host}"),
+        (None, Some(port)) => format!("{host}:{port}"),
+        (None, None) => host.into(),
+    }
+}
+
+fn permissions_summary(permissions: Option<&Value>) -> String {
+    let Some(permissions) = permissions else {
+        return "Additional network or file access".into();
+    };
+    let mut requested = Vec::new();
+    if permissions
+        .pointer("/network/enabled")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        requested.push("Network access".into());
+    }
+    if let Some(entries) = permissions
+        .pointer("/fileSystem/entries")
+        .and_then(Value::as_array)
+    {
+        requested.extend(entries.iter().filter_map(|entry| {
+            let path = entry
+                .get("path")
+                .or_else(|| entry.get("value"))
+                .and_then(Value::as_str)?;
+            let access = entry
+                .get("access")
+                .and_then(Value::as_str)
+                .unwrap_or("File access");
+            Some(format!("{access}: {path}"))
+        }));
+    }
+    if requested.is_empty() {
+        "Additional network or file access".into()
+    } else {
+        requested.join(" · ")
+    }
+}
+
+fn approval_clear_area(popup: Rect, bounds: Rect) -> Rect {
+    let x = popup.x.saturating_sub(1).max(bounds.x);
+    let y = popup.y.saturating_sub(1).max(bounds.y);
+    let right = popup.right().saturating_add(1).min(bounds.right());
+    let bottom = popup.bottom().saturating_add(1).min(bounds.bottom());
+    Rect::new(x, y, right.saturating_sub(x), bottom.saturating_sub(y))
+}
+
+fn render_approval(
+    frame: &mut Frame,
+    area: Rect,
+    prompt: &ApprovalPrompt,
+    selected_index: usize,
+    interactive: bool,
+) {
+    let desired_height = 9usize
+        .saturating_add(prompt.details.len().saturating_mul(2))
+        .saturating_add(prompt.options.len());
+    let height = u16::try_from(desired_height)
+        .unwrap_or(u16::MAX)
+        .min(area.height.saturating_sub(2).max(1));
+    let popup = centered_rect(90, height, area);
     let instruction = if interactive {
-        "Approve this request? [y/N] · Esc switch threads"
+        "↑/↓ select · Enter confirm · y allow once · n deny · Esc switch threads"
     } else {
         "Focus this chat to approve or decline"
     };
-    frame.render_widget(Clear, popup);
+    let mut lines = vec![
+        Line::styled(&prompt.explanation, Style::default().fg(Color::Yellow)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Chat: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(&prompt.thread_title),
+        ]),
+    ];
+    for (label, value) in &prompt.details {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
+            Span::raw(value),
+        ]));
+    }
+    lines.push(Line::from(""));
+    let selected_index = selected_index.min(prompt.options.len().saturating_sub(1));
+    for (index, option) in prompt.options.iter().enumerate() {
+        let selected = interactive && index == selected_index;
+        lines.push(Line::styled(
+            format!("{} {}", if selected { "›" } else { " " }, option.label),
+            if selected {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            },
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        instruction,
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(Clear, approval_clear_area(popup, area));
     frame.render_widget(
-        Paragraph::new(format!(
-            "{}\n{}\n\n{}\n\n{instruction}",
-            prompt.thread_title, prompt.method, prompt.detail,
-        ))
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .title(" Codex approval ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
-        ),
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(format!(" AUTO paused · {} ", prompt.title))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow)),
+            ),
         popup,
     );
 }
@@ -4455,6 +4803,130 @@ mod tests {
     use crate::app_server::AppServerEvent;
 
     use super::*;
+
+    fn approval_request(method: &str, params: Value) -> AppServerRequest {
+        AppServerRequest {
+            id: json!(1),
+            method: method.into(),
+            thread_id: params
+                .get("threadId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            turn_id: params
+                .get("turnId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            params,
+        }
+    }
+
+    #[test]
+    fn command_approval_uses_human_details_and_available_decisions() {
+        let request = approval_request(
+            "item/commandExecution/requestApproval",
+            json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "command": "rtk git fetch origin main --prune",
+                "cwd": "/tmp/project",
+                "reason": "Check the latest main branch",
+                "availableDecisions": [
+                    "accept",
+                    {"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["rtk","git","fetch"]}},
+                    "cancel"
+                ]
+            }),
+        );
+
+        let prompt = approval_prompt("Update Shikigami", &request);
+
+        assert_eq!(prompt.title, "Run this command?");
+        assert!(
+            prompt
+                .details
+                .contains(&("Command".into(), "rtk git fetch origin main --prune".into()))
+        );
+        assert!(
+            prompt
+                .details
+                .contains(&("Reason".into(), "Check the latest main branch".into()))
+        );
+        assert_eq!(prompt.options.len(), 3);
+        assert_eq!(prompt.options[0].label, "Yes, proceed");
+        assert_eq!(
+            prompt.options[1].label,
+            "Yes, and don't ask again for commands that start with `rtk git fetch`"
+        );
+        assert_eq!(
+            prompt.options[1].response,
+            json!({"decision":{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["rtk","git","fetch"]}}})
+        );
+        assert_eq!(
+            prompt.options[2].label,
+            "No, and tell Codex what to do differently"
+        );
+    }
+
+    #[test]
+    fn permission_approval_offers_turn_session_and_denial_scopes() {
+        let request = approval_request(
+            "item/permissions/requestApproval",
+            json!({
+                "permissions": {
+                    "network": {"enabled": true},
+                    "fileSystem": {"entries": [{"path":"/tmp/cache","access":"write"}]}
+                }
+            }),
+        );
+
+        let prompt = approval_prompt("Build", &request);
+
+        assert_eq!(prompt.options.len(), 3);
+        assert_eq!(prompt.options[0].response["scope"], "turn");
+        assert_eq!(prompt.options[1].response["scope"], "session");
+        assert_eq!(
+            prompt.options[2].response["permissions"]["network"]["enabled"],
+            false
+        );
+        assert!(
+            prompt
+                .details
+                .iter()
+                .any(|(_, value)| { value == "Network access · write: /tmp/cache" })
+        );
+    }
+
+    #[test]
+    fn network_approval_uses_destination_instead_of_command_json() {
+        let request = approval_request(
+            "item/commandExecution/requestApproval",
+            json!({
+                "command": "internal proxy command",
+                "networkApprovalContext": {"host":"github.com","protocol":"https","port":443}
+            }),
+        );
+
+        let prompt = approval_prompt("Fetch", &request);
+
+        assert!(
+            prompt
+                .details
+                .contains(&("Network access".into(), "https://github.com:443".into()))
+        );
+        assert!(!prompt.details.iter().any(|(label, _)| label == "Command"));
+    }
+
+    #[test]
+    fn approval_clear_area_keeps_a_gutter_around_the_popup() {
+        let bounds = Rect::new(0, 0, 100, 40);
+        let popup = Rect::new(10, 5, 80, 20);
+
+        assert_eq!(approval_clear_area(popup, bounds), Rect::new(9, 4, 82, 22));
+        assert_eq!(
+            approval_clear_area(Rect::new(0, 0, 20, 10), bounds),
+            Rect::new(0, 0, 21, 11)
+        );
+    }
 
     #[test]
     fn bulk_rename_progress_describes_real_stages_and_counts() {

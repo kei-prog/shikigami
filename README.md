@@ -84,11 +84,14 @@ chat is viewed or the item is dismissed, including across Shikigami restarts.
 Entries for threads no longer registered with Shikigami are removed on startup.
 The header and repository rows show pending counts; `!` opens the list, `j` / `k`
 selects an item, `Enter` opens it, and `d` dismisses a completed or failed item.
-Pending approvals must be accepted or declined and remain session-local because
-their App Server request cannot be answered after a restart. An approval is shown
-only inside its requesting chat; approvals from background threads add attention
-markers without interrupting the visible thread. The list is updated directly
-from App Server events without polling.
+Pending approvals remain session-local because their App Server request cannot
+be answered after a restart. An approval is shown only inside its requesting
+chat; approvals from background threads add attention markers without
+interrupting the visible thread. The popup explains the command, reason, working
+directory, or requested access without exposing App Server JSON. Use `j` / `k`
+or the arrow keys and `Enter` to choose from the decisions offered by Codex,
+including one-time approval and a proposed persistent command rule when
+available. The list is updated directly from App Server events without polling.
 
 In the repository picker, `/` filters candidates, `Space` selects multiple
 repositories, and `Enter` registers them. Opening the picker shows cached
@@ -164,8 +167,8 @@ asks for approval before elevated actions. Choose `/permissions` to switch
 between `Auto` and `Dangerous`; the selection is saved for future Shikigami
 sessions and applies to subsequent turns across all threads. `Dangerous` uses
 `danger-full-access` with approval prompts disabled and requires confirmation
-when enabled. The green `AUTO` or red `DANGEROUS` label in the header keeps the
-current policy visible.
+when enabled. The green `AUTO · WORKSPACE` or red `DANGEROUS` label in the
+header keeps the current policy visible.
 User messages are shown as full-width colored input bands, while Codex responses
 use the normal chat background. Commands, reasoning, file changes, and other
 activity use compact full-width gray bands separated by one line. Their heading
