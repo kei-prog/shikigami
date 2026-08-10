@@ -50,6 +50,8 @@ Print its platform-specific location without opening it with:
 shi --config-path
 ```
 
+The equivalent subcommand form is `shi config path`.
+
 Restore every binding to its default with:
 
 ```bash
@@ -315,7 +317,9 @@ Built-in Shikigami
 commands and enabled Codex skills for the current workspace appear in one
 fuzzy-searchable list, ranked by name and description matches. Selecting a
 skill inserts its `$skill-name` mention and sends the corresponding App Server
-skill input with the next message. Choose `/threads` to fuzzy-search active
+skill input with the next message. Choose `/scroll` to enter chat scroll mode,
+or `/status` to add the current thread, workspace, model, and permissions to the
+chat as a local notice. Choose `/threads` to fuzzy-search active
 threads across registered repositories by title, repository, location, or path;
 the picker also shows current, working, and attention state. `Enter` opens the
 selected thread and `Esc` returns to the current chat without changing it.
