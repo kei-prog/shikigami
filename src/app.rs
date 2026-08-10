@@ -223,6 +223,13 @@ enum TreeSelection {
     Thread { id: String, repository: PathBuf },
 }
 
+#[derive(Clone)]
+struct ArchivedThreadUndo {
+    id: String,
+    title: String,
+    repository_path: PathBuf,
+}
+
 pub struct App {
     pub repositories: Vec<Repository>,
     pub threads: Vec<ThreadItem>,
@@ -246,6 +253,7 @@ pub struct App {
     pub thread_deletion: Option<ThreadDeletionState>,
     pub scanning: bool,
     pub show_archived: bool,
+    last_archived_thread: Option<ArchivedThreadUndo>,
     pub message: Option<String>,
     pub should_quit: bool,
     pub chats: HashMap<String, ChatState>,
@@ -391,6 +399,7 @@ impl App {
             thread_deletion: None,
             scanning: false,
             show_archived: false,
+            last_archived_thread: None,
             message: (!startup_message.is_empty()).then_some(startup_message),
             should_quit: false,
             chats: HashMap::new(),
@@ -1762,6 +1771,11 @@ impl App {
             "response is running; stop it before archiving"
         );
         self.thread_registry.set_archived(&record.id, true)?;
+        self.last_archived_thread = Some(ArchivedThreadUndo {
+            id: record.id.clone(),
+            title: record.title.clone(),
+            repository_path: record.repository_path.clone(),
+        });
         self.discard_chat(&record.id);
         self.refresh_current();
         self.select_nearby_thread(&record.repository_path, thread_position);
@@ -1777,9 +1791,33 @@ impl App {
             .selected_thread_position_in_repository()
             .context("no thread selected")?;
         self.thread_registry.set_archived(&record.id, false)?;
+        if self
+            .last_archived_thread
+            .as_ref()
+            .is_some_and(|undo| undo.id == record.id)
+        {
+            self.last_archived_thread = None;
+        }
         self.refresh_current();
         self.select_nearby_thread(&record.repository_path, thread_position);
         Ok(())
+    }
+
+    pub fn undo_last_archive(&mut self) -> Result<String> {
+        let undo = self
+            .last_archived_thread
+            .clone()
+            .context("nothing to undo")?;
+        self.thread_registry.set_archived(&undo.id, false)?;
+        self.last_archived_thread = None;
+        self.show_archived = false;
+        self.refresh_current();
+        self.restore_tree_selection(TreeSelection::Thread {
+            id: undo.id,
+            repository: undo.repository_path,
+        });
+        self.sync_selection_from_tree();
+        Ok(undo.title)
     }
 
     pub fn selected_thread_delete_target(&self) -> Result<ThreadRecord> {
@@ -1852,6 +1890,13 @@ impl App {
             .context("thread is no longer selected")?;
         ensure_thread_deletion_context(self.show_archived, &record)?;
         self.thread_registry.remove(thread_id)?;
+        if self
+            .last_archived_thread
+            .as_ref()
+            .is_some_and(|undo| undo.id == thread_id)
+        {
+            self.last_archived_thread = None;
+        }
         self.remove_thread_name(thread_id);
         self.discard_chat(thread_id);
         self.refresh_current();

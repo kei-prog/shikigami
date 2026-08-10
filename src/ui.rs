@@ -1154,6 +1154,12 @@ async fn handle_key(
             }
             KeyCode::Char('a') => app.open_repository_add(),
             KeyCode::Char('A') => app.toggle_archive_view(),
+            KeyCode::Char('u') => {
+                app.message = Some(match app.undo_last_archive() {
+                    Ok(title) => format!("restored {title}"),
+                    Err(error) => error.to_string(),
+                });
+            }
             KeyCode::Char('n') => {
                 if app.locations.is_empty() {
                     app.message = Some("no available repository location".into());
@@ -1204,7 +1210,7 @@ async fn handle_key(
                         }
                         Ok(false) => {
                             app.message = Some(match app.archive_selected_thread() {
-                                Ok(()) => "thread archived".into(),
+                                Ok(()) => "thread archived · u undo".into(),
                                 Err(error) => error.to_string(),
                             });
                         }
@@ -4871,7 +4877,7 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
 fn render_help(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(72, 35, area);
     let help = format!(
-        "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / return from messages\nl / →        expand repository / focus selected thread messages\ni            focus selected thread input / switch from messages to input\nH / L        collapse / expand all repositories\nEnter        expand/focus input / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            open the command palette\nf            filter threads / repository candidates\n/permissions choose Auto or Dangerous execution\nR            open thread-name actions\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / delete archived thread\nr            reload repositories and names\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {}\nPress any key to close",
+        "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / return from messages\nl / →        expand repository / focus selected thread messages\ni            focus selected thread input / switch from messages to input\nH / L        collapse / expand all repositories\nEnter        expand/focus input / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            open the command palette\nf            filter threads / repository candidates\n/permissions choose Auto or Dangerous execution\nR            open thread-name actions\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nu            undo the last archive\nA            active / archived threads\nd            unregister repository / delete archived thread\nr            reload repositories and names\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {}\nPress any key to close",
         execution_status(app.execution_mode)
     );
     frame.render_widget(Clear, popup);
