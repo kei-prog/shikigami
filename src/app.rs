@@ -2332,16 +2332,13 @@ impl App {
         }
     }
 
-    pub fn registered_threads_for_name_refresh(&self) -> Result<(HashSet<String>, Vec<PathBuf>)> {
-        let records = self.thread_registry.load()?;
-        let ids = records.iter().map(|thread| thread.id.clone()).collect();
-        let mut cwds = records
+    pub fn registered_thread_ids(&self) -> Result<HashSet<String>> {
+        Ok(self
+            .thread_registry
+            .load()?
             .into_iter()
-            .map(|thread| thread.cwd)
-            .collect::<Vec<_>>();
-        cwds.sort();
-        cwds.dedup();
-        Ok((ids, cwds))
+            .map(|thread| thread.id)
+            .collect())
     }
 
     pub fn open_rename_actions(&mut self, from_picker: bool) {

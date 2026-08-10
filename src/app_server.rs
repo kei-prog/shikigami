@@ -425,79 +425,17 @@ impl AppServer {
         .await
     }
 
-    pub async fn list_thread_names(
-        &self,
-        cwds: &[PathBuf],
-    ) -> Result<HashMap<String, Option<String>>> {
-        if cwds.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let mut names = self.list_thread_names_by_archive(cwds, false).await?;
-        names.extend(self.list_thread_names_by_archive(cwds, true).await?);
-        Ok(names)
-    }
-
-    async fn list_thread_names_by_archive(
-        &self,
-        cwds: &[PathBuf],
-        archived: bool,
-    ) -> Result<HashMap<String, Option<String>>> {
-        let mut names = HashMap::new();
-        let mut cursor = None;
-        loop {
-            let response = self
-                .request(
-                    "thread/list",
-                    json!({
-                        "cursor": cursor,
-                        "limit": 100,
-                        "cwd": cwds,
-                        "archived": archived,
-                        "sourceKinds": [
-                            "cli",
-                            "vscode",
-                            "exec",
-                            "appServer",
-                            "subAgent",
-                            "subAgentReview",
-                            "subAgentCompact",
-                            "subAgentThreadSpawn",
-                            "subAgentOther",
-                            "unknown"
-                        ]
-                    }),
-                )
-                .await?;
-            let data = response
-                .get("data")
-                .and_then(Value::as_array)
-                .context("thread/list response missing data")?;
-            for thread in data {
-                if let Some(id) = thread.get("id").and_then(Value::as_str) {
-                    let name = thread
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .filter(|name| !name.trim().is_empty())
-                        .map(str::to_owned)
-                        .or_else(|| {
-                            let preview = thread.get("preview").and_then(Value::as_str)?;
-                            let title =
-                                preview.lines().next()?.chars().take(80).collect::<String>();
-                            (!title.trim().is_empty()).then_some(title)
-                        });
-                    names.insert(id.to_owned(), name);
-                }
-            }
-            let Some(next_cursor) = response
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-            else {
-                break;
-            };
-            cursor = Some(next_cursor);
-        }
-        Ok(names)
+    pub async fn read_thread_name(&self, thread_id: &str) -> Result<Option<String>> {
+        let response = self
+            .request(
+                "thread/read",
+                json!({"threadId": thread_id, "includeTurns": false}),
+            )
+            .await?;
+        let thread = response
+            .get("thread")
+            .context("thread/read response missing thread")?;
+        Ok(thread_display_name(thread))
     }
 
     pub async fn set_thread_name(&self, thread_id: &str, name: &str) -> Result<()> {
@@ -813,6 +751,19 @@ fn preview_history(mut response: Value) -> Result<Value> {
     Ok(json!({"thread": {"turns": std::mem::take(turns)}}))
 }
 
+fn thread_display_name(thread: &Value) -> Option<String> {
+    thread
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            let preview = thread.get("preview").and_then(Value::as_str)?;
+            let title = preview.lines().next()?.chars().take(80).collect::<String>();
+            (!title.trim().is_empty()).then_some(title)
+        })
+}
+
 async fn dispatch_message(
     pending: &PendingResponses,
     events: &broadcast::Sender<AppServerEvent>,
@@ -1092,7 +1043,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_and_archived_thread_names_are_listed_in_independent_pages() {
+    async fn thread_names_are_read_without_turn_history() {
         let (writer, mut messages) = mpsc::channel(1);
         let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
         let (events, _) = broadcast::channel(1);
@@ -1112,64 +1063,36 @@ mod tests {
 
         let task = tokio::spawn({
             let server = server.clone();
-            async move {
-                server
-                    .list_thread_names(&[PathBuf::from("/tmp/project")])
-                    .await
-            }
+            async move { server.read_thread_name("thread-1").await }
         });
-        let OutgoingMessage::Json(first) = messages.recv().await.unwrap() else {
+        let OutgoingMessage::Json(message) = messages.recv().await.unwrap() else {
             panic!("unexpected shutdown message");
         };
-        assert_eq!(first["method"], "thread/list");
-        assert_eq!(first["params"]["cwd"], json!(["/tmp/project"]));
-        assert!(first["params"].get("useStateDbOnly").is_none());
-        assert_eq!(first["params"]["archived"], false);
+        assert_eq!(message["method"], "thread/read");
+        assert_eq!(
+            message["params"],
+            json!({"threadId":"thread-1", "includeTurns":false})
+        );
         dispatch_response(
             &pending,
-            &json!({"id":first["id"],"result":{"data":[{"id":"one","name":"First"}],"nextCursor":"page-2"}}),
-        )
-        .await;
-        let OutgoingMessage::Json(second) = messages.recv().await.unwrap() else {
-            panic!("unexpected shutdown message");
-        };
-        assert_eq!(second["params"]["cursor"], "page-2");
-        assert_eq!(second["params"]["archived"], false);
-        dispatch_response(
-            &pending,
-            &json!({"id":second["id"],"result":{"data":[{"id":"two","name":null,"preview":"Second thread\nMore details"}],"nextCursor":null}}),
-        )
-        .await;
-        let OutgoingMessage::Json(third) = messages.recv().await.unwrap() else {
-            panic!("unexpected shutdown message");
-        };
-        assert_eq!(third["params"]["cursor"], Value::Null);
-        assert_eq!(third["params"]["archived"], true);
-        dispatch_response(
-            &pending,
-            &json!({"id":third["id"],"result":{"data":[{"id":"three","name":"Archived"}],"nextCursor":"archived-2"}}),
-        )
-        .await;
-        let OutgoingMessage::Json(fourth) = messages.recv().await.unwrap() else {
-            panic!("unexpected shutdown message");
-        };
-        assert_eq!(fourth["params"]["cursor"], "archived-2");
-        assert_eq!(fourth["params"]["archived"], true);
-        dispatch_response(
-            &pending,
-            &json!({"id":fourth["id"],"result":{"data":[{"id":"four","name":"Older archived"}],"nextCursor":null}}),
+            &json!({"id":message["id"],"result":{"thread":{"id":"thread-1","name":null,"preview":"Preview title\nMore details"}}}),
         )
         .await;
 
         assert_eq!(
-            task.await.unwrap().unwrap(),
-            HashMap::from([
-                ("one".into(), Some("First".into())),
-                ("two".into(), Some("Second thread".into())),
-                ("three".into(), Some("Archived".into())),
-                ("four".into(), Some("Older archived".into())),
-            ])
+            task.await.unwrap().unwrap().as_deref(),
+            Some("Preview title")
         );
+    }
+
+    #[test]
+    fn explicit_thread_name_takes_priority_over_preview() {
+        assert_eq!(
+            thread_display_name(&json!({"name":"Chosen name", "preview":"Preview title"}))
+                .as_deref(),
+            Some("Chosen name")
+        );
+        assert_eq!(thread_display_name(&json!({"name":"", "preview":""})), None);
     }
 
     #[tokio::test]
