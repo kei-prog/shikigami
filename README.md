@@ -250,7 +250,7 @@ or `Y` to copy its `codex resume` command. Choose `/attention` to open the
 attention list or `/model` to select a model and its
 reasoning effort from the live App Server model catalog. The current selection
 appears in the header and applies to subsequent turns in that thread. Press
-`Ctrl-r` in chat input to open the current model's reasoning-effort slider;
+`Ctrl-r` in chat input to open the current model's reasoning-effort list;
 `j` / `k` changes the effort, `Enter` applies it, and `Esc` cancels.
 New chats default to `medium` reasoning when the selected model supports it.
 

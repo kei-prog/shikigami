@@ -3641,51 +3641,52 @@ fn render_reasoning_effort_picker(frame: &mut Frame, area: Rect, app: &App) {
     let selected = app
         .reasoning_effort_index
         .min(efforts.len().saturating_sub(1));
-    let mut slider = Vec::new();
-    for (index, effort) in efforts.iter().enumerate() {
-        if index > 0 {
-            slider.push(Span::styled(" ─ ", Style::default().fg(Color::DarkGray)));
-        }
-        let active = index == selected;
-        slider.push(Span::styled(
-            format!(
-                "{} {}",
-                if active { "●" } else { "○" },
-                effort.reasoning_effort
-            ),
-            if active {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            },
-        ));
-    }
+    let items = efforts.iter().map(|effort| {
+        ListItem::new(effort.reasoning_effort.as_str()).style(Style::default().fg(Color::DarkGray))
+    });
     let description = efforts
         .get(selected)
         .map(|effort| effort.description.as_str())
         .unwrap_or("No reasoning effort options are available");
-    let popup = centered_rect(78, 9, area);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(Text::from(vec![
-            Line::from(""),
-            Line::from(slider),
-            Line::from(""),
-            Line::styled(description, Style::default().fg(Color::DarkGray)),
-        ]))
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .title(format!(" {} · reasoning effort ", model.display_name))
-                .title_bottom(Line::from(" j/k change · Enter apply · Esc cancel "))
-                .borders(Borders::ALL)
-                .padding(Padding::horizontal(2))
-                .border_style(Style::default().fg(Color::Green)),
-        ),
-        popup,
+    let popup = centered_rect(78, reasoning_effort_picker_height(efforts.len()), area);
+    let block = Block::default()
+        .title(format!(" {} · reasoning effort ", model.display_name))
+        .title_bottom(Line::from(" j/k change · Enter apply · Esc cancel "))
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(2))
+        .border_style(Style::default().fg(Color::Green));
+    let inner = block.inner(popup);
+    let content = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(u16::try_from(efforts.len()).unwrap_or(u16::MAX)),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+    let list = List::new(items).highlight_symbol("› ").highlight_style(
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
     );
+    let mut state = ListState::default().with_selected((!efforts.is_empty()).then_some(selected));
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    frame.render_stateful_widget(list, content[0], &mut state);
+    frame.render_widget(
+        Paragraph::new(description)
+            .style(Style::default().fg(Color::DarkGray))
+            .wrap(Wrap { trim: false }),
+        content[2],
+    );
+}
+
+fn reasoning_effort_picker_height(option_count: usize) -> u16 {
+    u16::try_from(option_count)
+        .unwrap_or(u16::MAX)
+        .saturating_add(4)
+        .max(9)
 }
 
 fn render_permissions_picker(frame: &mut Frame, area: Rect, app: &App) {
@@ -5003,6 +5004,12 @@ mod tests {
 
         let paste = receiver.recv().await.unwrap();
         assert_eq!(paste.result.unwrap_err(), "clipboard unavailable");
+    }
+
+    #[test]
+    fn reasoning_effort_picker_grows_for_vertical_options() {
+        assert_eq!(reasoning_effort_picker_height(3), 9);
+        assert_eq!(reasoning_effort_picker_height(6), 10);
     }
 
     fn approval_request(method: &str, params: Value) -> AppServerRequest {
