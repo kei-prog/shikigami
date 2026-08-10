@@ -1172,6 +1172,7 @@ async fn handle_key(
             KeyCode::Char('H') => app.collapse_all_repositories(),
             KeyCode::Char('L') => app.expand_all_repositories(),
             KeyCode::Tab if app.chat().is_some() => {
+                app.message = None;
                 app.focus = Focus::Chat;
                 app.mode = Mode::Chat;
                 if let Some(chat) = app.chat_mut() {
@@ -1375,6 +1376,7 @@ fn selected_thread_entry_mode(code: &KeyCode) -> Option<ChatMode> {
 }
 
 async fn return_to_repository_tree(app: &mut App, server: &Arc<AppServer>) -> Option<UiAction> {
+    app.message = None;
     let action = if let Some(cleanup) = app.cancel_visible_draft_thread() {
         Some(UiAction::CleanupDraftWorkspace(cleanup))
     } else {
@@ -2881,6 +2883,7 @@ async fn load_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()
 }
 
 async fn focus_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
+    app.message = None;
     load_selected_chat(app, server).await?;
     let Some(chat) = app.chat() else {
         return Ok(());
