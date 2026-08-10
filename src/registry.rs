@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -30,6 +30,11 @@ pub struct ThreadRecord {
 #[derive(Default, Deserialize, Serialize)]
 struct RegistryData {
     threads: Vec<ThreadRecord>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct ThreadTitleCacheData {
+    titles: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -69,6 +74,11 @@ pub struct Registry {
 }
 
 #[derive(Debug)]
+pub struct ThreadTitleCache {
+    path: PathBuf,
+}
+
+#[derive(Debug)]
 pub struct SideChatRegistry {
     path: PathBuf,
 }
@@ -76,6 +86,53 @@ pub struct SideChatRegistry {
 #[derive(Debug)]
 pub struct AttentionRegistry {
     path: PathBuf,
+}
+
+impl ThreadTitleCache {
+    pub fn discover() -> Result<Self> {
+        let dirs = paths::project_dirs()?;
+        Ok(Self {
+            path: dirs.data_local_dir().join("thread-title-cache.json"),
+        })
+    }
+
+    #[cfg(test)]
+    fn at(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn load(&self) -> Result<HashMap<String, String>> {
+        if !self.path.exists() {
+            return Ok(HashMap::new());
+        }
+        let bytes = fs::read(&self.path)
+            .with_context(|| format!("read thread title cache {}", self.path.display()))?;
+        let data: ThreadTitleCacheData = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse thread title cache {}", self.path.display()))?;
+        Ok(data.titles)
+    }
+
+    pub fn sync(&self, names: &HashMap<String, Option<String>>) -> Result<()> {
+        let titles = names
+            .iter()
+            .filter_map(|(thread_id, name)| {
+                name.as_ref().map(|name| (thread_id.clone(), name.clone()))
+            })
+            .collect();
+        let parent = self
+            .path
+            .parent()
+            .context("thread title cache has no parent")?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create cache directory {}", parent.display()))?;
+        let temporary = self.path.with_extension("json.tmp");
+        let data = serde_json::to_vec_pretty(&ThreadTitleCacheData { titles })?;
+        fs::write(&temporary, data)
+            .with_context(|| format!("write thread title cache {}", temporary.display()))?;
+        fs::rename(&temporary, &self.path)
+            .with_context(|| format!("replace thread title cache {}", self.path.display()))?;
+        Ok(())
+    }
 }
 
 impl AttentionRegistry {
@@ -369,6 +426,23 @@ mod tests {
         assert_eq!(threads[0].title, "Untitled thread");
         let saved = fs::read_to_string(temp.path().join("threads.json")).unwrap();
         assert!(!saved.contains("title"));
+    }
+
+    #[test]
+    fn thread_title_cache_persists_only_observed_titles() {
+        let temp = tempdir().unwrap();
+        let cache = ThreadTitleCache::at(temp.path().join("thread-title-cache.json"));
+        cache
+            .sync(&HashMap::from([
+                ("named".into(), Some("Cached title".into())),
+                ("untitled".into(), None),
+            ]))
+            .unwrap();
+
+        assert_eq!(
+            cache.load().unwrap(),
+            HashMap::from([("named".into(), "Cached title".into())])
+        );
     }
 
     #[test]

@@ -1455,15 +1455,7 @@ fn apply_thread_name_refresh(
     overwrite_existing: bool,
 ) {
     match result {
-        Ok(names) => {
-            for (thread_id, name) in names {
-                if overwrite_existing {
-                    app.apply_thread_name(&thread_id, name);
-                } else {
-                    app.apply_thread_name_if_unknown(&thread_id, name);
-                }
-            }
-        }
+        Ok(names) => app.apply_thread_names(names, overwrite_existing),
         Err(error) => app.message = Some(format!("Could not refresh thread names: {error}")),
     }
 }
@@ -2513,14 +2505,10 @@ async fn load_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()
         Err(error) if is_recoverable_empty_thread(&thread.record.title, &error) => None,
         Err(error) => return Err(error),
     };
-    if let Some(history) = history.as_ref() {
-        app.apply_thread_name(
-            &thread_id,
-            history
-                .pointer("/thread/name")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        );
+    if let Some(history) = history.as_ref()
+        && let Some(name) = history.pointer("/thread/name").and_then(Value::as_str)
+    {
+        app.apply_thread_name(&thread_id, Some(name.to_owned()));
     }
     if let Some(chat) = app.chats.get_mut(&thread_id) {
         if let Some(history) = history {

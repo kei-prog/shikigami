@@ -17,6 +17,7 @@ use crate::{
     git_workspace::{self, Workspace},
     registry::{
         AttentionRegistry, PersistentAttentionKind, Registry, SideChatRegistry, ThreadRecord,
+        ThreadTitleCache,
     },
     repository::{self, Repository, RepositoryStore, ScanEvent, ScanScope, start_scan},
     settings::{ExecutionMode, SettingsStore},
@@ -280,6 +281,9 @@ pub struct App {
     pub execution_mode: ExecutionMode,
     pub permission_index: usize,
     thread_names: HashMap<String, Option<String>>,
+    // Cached titles are displayed immediately but do not become authoritative until observed live.
+    confirmed_thread_names: HashSet<String>,
+    thread_title_cache: ThreadTitleCache,
     thread_registry: Registry,
     side_chat_registry: SideChatRegistry,
     attention_registry: AttentionRegistry,
@@ -301,6 +305,27 @@ impl App {
             ),
         };
         let thread_registry = Registry::discover()?;
+        let thread_title_cache = ThreadTitleCache::discover()?;
+        let (mut thread_names, thread_title_cache_error) = match thread_title_cache.load() {
+            Ok(titles) => (
+                titles
+                    .into_iter()
+                    .map(|(thread_id, title)| (thread_id, Some(title)))
+                    .collect(),
+                None,
+            ),
+            Err(error) => (
+                HashMap::new(),
+                Some(format!("Could not load cached thread titles: {error}")),
+            ),
+        };
+        if let Ok(records) = thread_registry.load() {
+            let registered = records
+                .into_iter()
+                .map(|thread| thread.id)
+                .collect::<HashSet<_>>();
+            thread_names.retain(|thread_id, _| registered.contains(thread_id));
+        }
         let repositories = repository_store.load_registered()?;
         let candidates = repository_store.load_candidates().unwrap_or_default();
         let browse_path = BaseDirs::new()
@@ -332,7 +357,7 @@ impl App {
                     Some(format!("Could not load repository view state: {error}")),
                 ),
             };
-        let startup_message = [ui_state_error, settings_error]
+        let startup_message = [ui_state_error, settings_error, thread_title_cache_error]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>()
@@ -398,7 +423,9 @@ impl App {
             reasoning_effort_returns_to_model: false,
             execution_mode,
             permission_index: usize::from(execution_mode == ExecutionMode::Dangerous),
-            thread_names: HashMap::new(),
+            thread_names,
+            confirmed_thread_names: HashSet::new(),
+            thread_title_cache,
             thread_registry,
             side_chat_registry: SideChatRegistry::discover()?,
             attention_registry: AttentionRegistry::discover()?,
@@ -543,7 +570,7 @@ impl App {
         };
         let removed_was_visible = self.side_chat_id.as_deref() == Some(thread_id);
         self.chats.remove(thread_id);
-        self.thread_names.remove(thread_id);
+        self.remove_thread_name(thread_id);
         self.attention_items
             .retain(|item| item.thread_id != thread_id);
         self.resumed_threads.remove(thread_id);
@@ -1813,7 +1840,7 @@ impl App {
             .context("thread is no longer selected")?;
         ensure_thread_deletion_context(self.show_archived, &record)?;
         self.thread_registry.remove(thread_id)?;
-        self.thread_names.remove(thread_id);
+        self.remove_thread_name(thread_id);
         self.discard_chat(thread_id);
         self.refresh_current();
         Ok(())
@@ -2212,7 +2239,7 @@ impl App {
             )?;
         }
         self.thread_registry.remove(thread_id)?;
-        self.thread_names.remove(thread_id);
+        self.remove_thread_name(thread_id);
         self.discard_chat(thread_id);
         self.refresh_current();
         Ok(())
@@ -2234,6 +2261,7 @@ impl App {
     ) -> Result<()> {
         self.thread_registry
             .register_thread(thread_id.clone(), &repository_path, &cwd)?;
+        self.confirmed_thread_names.insert(thread_id.clone());
         self.thread_names.insert(thread_id, None);
         self.refresh_current();
         Ok(())
@@ -2266,7 +2294,7 @@ impl App {
             )?;
         }
         self.thread_registry.remove(thread_id)?;
-        self.thread_names.remove(thread_id);
+        self.remove_thread_name(thread_id);
         self.discard_chat(thread_id);
         self.forget_thread_subscription(thread_id);
         self.refresh_current();
@@ -2291,6 +2319,10 @@ impl App {
             .replace_thread_id(old_thread_id, new_thread_id.clone())?;
         let name = self.thread_names.remove(old_thread_id).unwrap_or(None);
         self.thread_names.insert(new_thread_id.clone(), name);
+        if self.confirmed_thread_names.remove(old_thread_id) {
+            self.confirmed_thread_names.insert(new_thread_id.clone());
+        }
+        self.sync_thread_title_cache();
 
         let thread = self
             .threads
@@ -2318,17 +2350,52 @@ impl App {
     }
 
     pub fn apply_thread_name(&mut self, thread_id: &str, name: Option<String>) {
+        let changed = self.apply_thread_name_in_memory(thread_id, name);
+        self.confirmed_thread_names.insert(thread_id.to_owned());
+        if changed {
+            self.sync_thread_title_cache();
+        }
+    }
+
+    pub fn apply_thread_names(
+        &mut self,
+        names: Vec<(String, Option<String>)>,
+        overwrite_existing: bool,
+    ) {
+        for (thread_id, name) in names {
+            if should_apply_refreshed_thread_name(
+                overwrite_existing,
+                &self.confirmed_thread_names,
+                &thread_id,
+            ) {
+                self.apply_thread_name_in_memory(&thread_id, name);
+                self.confirmed_thread_names.insert(thread_id);
+            }
+        }
+        self.sync_thread_title_cache();
+    }
+
+    fn apply_thread_name_in_memory(&mut self, thread_id: &str, name: Option<String>) -> bool {
+        let changed = self.thread_names.get(thread_id) != Some(&name);
         let title = display_thread_name(name.as_deref());
         self.thread_names.insert(thread_id.to_owned(), name);
         apply_thread_name_to(&mut self.threads, &mut self.chats, thread_id, &title);
         if self.mode == Mode::ChooseThread {
             self.refresh_thread_picker_matches();
         }
+        changed
     }
 
-    pub fn apply_thread_name_if_unknown(&mut self, thread_id: &str, name: Option<String>) {
-        if !self.thread_names.contains_key(thread_id) {
-            self.apply_thread_name(thread_id, name);
+    fn sync_thread_title_cache(&mut self) {
+        if let Err(error) = self.thread_title_cache.sync(&self.thread_names) {
+            self.message = Some(format!("Could not cache thread titles: {error}"));
+        }
+    }
+
+    fn remove_thread_name(&mut self, thread_id: &str) {
+        self.confirmed_thread_names.remove(thread_id);
+        if self.thread_names.remove(thread_id).is_some() {
+            self.sync_thread_title_cache();
         }
     }
 
@@ -2909,6 +2976,14 @@ fn display_thread_name(name: Option<&str>) -> String {
     name.filter(|name| !name.trim().is_empty())
         .unwrap_or("Untitled thread")
         .to_owned()
+}
+
+fn should_apply_refreshed_thread_name(
+    overwrite_existing: bool,
+    confirmed_thread_names: &HashSet<String>,
+    thread_id: &str,
+) -> bool {
+    overwrite_existing || !confirmed_thread_names.contains(thread_id)
 }
 
 fn thread_name_update(event: &AppServerEvent) -> Option<(&str, Option<String>)> {
@@ -3657,6 +3732,19 @@ mod tests {
         );
 
         assert!(chats.values().all(|chat| chat.skills_stale));
+    }
+
+    #[test]
+    fn live_name_updates_win_over_delayed_background_refreshes() {
+        let confirmed = HashSet::from(["live".into()]);
+
+        assert!(should_apply_refreshed_thread_name(
+            false, &confirmed, "cached"
+        ));
+        assert!(!should_apply_refreshed_thread_name(
+            false, &confirmed, "live"
+        ));
+        assert!(should_apply_refreshed_thread_name(true, &confirmed, "live"));
     }
 
     #[test]
