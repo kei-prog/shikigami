@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::{Receiver, TryRecvError},
     time::Instant,
 };
@@ -1745,6 +1745,9 @@ impl App {
             .selected_thread()
             .map(|thread| thread.record.clone())
             .context("no thread selected")?;
+        let thread_position = self
+            .selected_thread_position_in_repository()
+            .context("no thread selected")?;
         anyhow::ensure!(
             !thread_group_has_active_turn(
                 &record.id,
@@ -1757,6 +1760,7 @@ impl App {
         self.thread_registry.set_archived(&record.id, true)?;
         self.discard_chat(&record.id);
         self.refresh_current();
+        self.select_nearby_thread(&record.repository_path, thread_position);
         Ok(())
     }
 
@@ -1765,8 +1769,12 @@ impl App {
             .selected_thread()
             .map(|thread| thread.record.clone())
             .context("no thread selected")?;
+        let thread_position = self
+            .selected_thread_position_in_repository()
+            .context("no thread selected")?;
         self.thread_registry.set_archived(&record.id, false)?;
         self.refresh_current();
+        self.select_nearby_thread(&record.repository_path, thread_position);
         Ok(())
     }
 
@@ -2949,6 +2957,49 @@ impl App {
         }
     }
 
+    fn selected_thread_position_in_repository(&self) -> Option<usize> {
+        let rows = self.tree_rows();
+        let TreeRow::Thread {
+            repository_index, ..
+        } = rows.get(self.tree_index)?
+        else {
+            return None;
+        };
+        Some(
+            rows[..self.tree_index]
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        row,
+                        TreeRow::Thread {
+                            repository_index: index,
+                            ..
+                        } if index == repository_index
+                    )
+                })
+                .count(),
+        )
+    }
+
+    fn select_nearby_thread(&mut self, repository_path: &Path, preferred_position: usize) {
+        let Some(repository_index) = self
+            .repositories
+            .iter()
+            .position(|repository| repository.path == repository_path)
+        else {
+            return;
+        };
+        let rows = self.tree_rows();
+        if let Some(tree_index) =
+            nearby_thread_tree_index(&rows, repository_index, preferred_position)
+        {
+            self.tree_index = tree_index;
+            self.sync_selection_from_tree();
+        } else {
+            self.select_repository_row(repository_index);
+        }
+    }
+
     fn restore_tree_selection(&mut self, selection: TreeSelection) {
         let (repository_path, thread_id) = match selection {
             TreeSelection::Repository(path) => (path, None),
@@ -3230,6 +3281,31 @@ fn tree_rows_for(
         }
     }
     rows
+}
+
+fn nearby_thread_tree_index(
+    rows: &[TreeRow],
+    repository_index: usize,
+    preferred_position: usize,
+) -> Option<usize> {
+    let mut position = 0;
+    let mut last = None;
+    for (tree_index, row) in rows.iter().enumerate() {
+        if matches!(
+            row,
+            TreeRow::Thread {
+                repository_index: index,
+                ..
+            } if *index == repository_index
+        ) {
+            last = Some(tree_index);
+            if position == preferred_position {
+                return Some(tree_index);
+            }
+            position += 1;
+        }
+    }
+    last
 }
 
 fn apply_chat_event_to(chats: &mut HashMap<String, ChatState>, event: &AppServerEvent) {
@@ -3527,6 +3603,35 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn nearby_thread_selection_keeps_position_or_uses_previous_thread() {
+        let rows = vec![
+            TreeRow::Repository {
+                repository_index: 0,
+            },
+            TreeRow::Thread {
+                repository_index: 0,
+                thread_index: 0,
+            },
+            TreeRow::Thread {
+                repository_index: 0,
+                thread_index: 1,
+            },
+            TreeRow::Repository {
+                repository_index: 1,
+            },
+            TreeRow::Thread {
+                repository_index: 1,
+                thread_index: 2,
+            },
+        ];
+
+        assert_eq!(nearby_thread_tree_index(&rows, 0, 0), Some(1));
+        assert_eq!(nearby_thread_tree_index(&rows, 0, 1), Some(2));
+        assert_eq!(nearby_thread_tree_index(&rows, 0, 2), Some(2));
+        assert_eq!(nearby_thread_tree_index(&rows, 2, 0), None);
     }
 
     #[test]
