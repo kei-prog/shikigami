@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     io::{self, Stdout},
     path::{Path, PathBuf},
     sync::{
@@ -64,12 +65,19 @@ const REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 const PREVIEW_TURN_LIMIT: u32 = 5;
 const PREVIEW_CACHE_CAPACITY: usize = 20;
 const MAX_THREAD_NAME_CHARS: usize = 100;
+const PASTING_CLIPBOARD_IMAGE_MESSAGE: &str = "Pasting clipboard image…";
+const CLIPBOARD_IMAGE_ALREADY_PASTING_MESSAGE: &str = "A clipboard image is already being pasted";
 // Four reads kept measured p95 below one 60 Hz frame; higher limits gave no material gain.
 const THREAD_NAME_READ_CONCURRENCY: usize = 4;
 
 struct ChatPreview {
     generation: u64,
     result: std::result::Result<ChatState, String>,
+}
+
+struct ClipboardImagePaste {
+    thread_id: String,
+    result: std::result::Result<PathBuf, String>,
 }
 
 #[derive(Deserialize)]
@@ -98,6 +106,7 @@ struct RenderCache {
 
 enum UiAction {
     CopyEditorCommand { cwd: PathBuf, target: EditorTarget },
+    PasteClipboardImage { thread_id: String },
     DeleteThread(ThreadRecord),
     GenerateThreadNames(ThreadNameGenerationRequest),
     ApplyThreadNames(ThreadNameApplyRequest),
@@ -193,8 +202,10 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
     let (deletion_sender, mut deletion_receiver) = mpsc::unbounded_channel();
     let (bulk_rename_sender, mut bulk_rename_receiver) = mpsc::unbounded_channel();
     let (thread_name_sender, mut thread_name_receiver) = mpsc::unbounded_channel();
+    let (clipboard_image_sender, mut clipboard_image_receiver) = mpsc::unbounded_channel();
     spawn_thread_name_refresh(app, Arc::clone(&server), thread_name_sender);
     let mut thread_name_refresh_pending = true;
+    let mut clipboard_image_paste_pending = false;
     let mut preview_task = None;
     let mut redraw_ticker = tokio::time::interval(REDRAW_INTERVAL);
     redraw_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -235,6 +246,7 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                             &preview_generation,
                             &preview_sender,
                             &mut preview_task,
+                            clipboard_image_paste_pending,
                         ).await?;
                         match action {
                             Some(UiAction::CopyEditorCommand { cwd, target }) => {
@@ -246,6 +258,13 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                                     ),
                                     Err(error) => format!("Could not copy editor command: {error}"),
                                 });
+                            }
+                            Some(UiAction::PasteClipboardImage { thread_id }) => {
+                                clipboard_image_paste_pending = true;
+                                spawn_clipboard_image_paste(
+                                    thread_id,
+                                    clipboard_image_sender.clone(),
+                                );
                             }
                             Some(UiAction::DeleteThread(record)) => {
                                 spawn_thread_deletion(
@@ -310,6 +329,13 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                         Err(error) => app.message = Some(error),
                     }
                     preview_task = None;
+                    needs_draw = true;
+                }
+            }
+            paste = clipboard_image_receiver.recv() => {
+                if let Some(paste) = paste {
+                    clipboard_image_paste_pending = false;
+                    apply_clipboard_image_paste(app, paste);
                     needs_draw = true;
                 }
             }
@@ -405,6 +431,7 @@ async fn handle_key(
     preview_generation: &Arc<AtomicU64>,
     preview_sender: &mpsc::UnboundedSender<ChatPreview>,
     preview_task: &mut Option<JoinHandle<()>>,
+    clipboard_image_paste_pending: bool,
 ) -> Result<Option<UiAction>> {
     if app.thread_deletion.is_some() {
         return Ok(None);
@@ -584,19 +611,12 @@ async fn handle_key(
                     app.message = Some("Read-only: cannot attach an image".into());
                 } else if !app.active_model_supports_images() {
                     app.message = Some(image_not_supported_message(app));
+                } else if clipboard_image_paste_pending {
+                    app.message = Some(CLIPBOARD_IMAGE_ALREADY_PASTING_MESSAGE.into());
                 } else {
-                    match tokio::task::spawn_blocking(clipboard::paste_image_to_temp_png).await {
-                        Ok(Ok(path)) => {
-                            if let Some(chat) = app.chat_mut() {
-                                chat.attach_local_image(path);
-                            }
-                        }
-                        Ok(Err(error)) => {
-                            app.message = Some(format!("Could not paste clipboard image: {error}"));
-                        }
-                        Err(error) => {
-                            app.message = Some(format!("Could not paste clipboard image: {error}"));
-                        }
+                    if let Some(thread_id) = app.chat().map(|chat| chat.thread_id.clone()) {
+                        app.message = Some(PASTING_CLIPBOARD_IMAGE_MESSAGE.into());
+                        action = Some(UiAction::PasteClipboardImage { thread_id });
                     }
                 }
             }
@@ -1200,6 +1220,63 @@ fn handle_paste(app: &mut App, pasted: String) {
         }
     } else if let Some(chat) = app.chat_mut() {
         chat.insert_composer_str(&pasted.replace("\r\n", "\n").replace('\r', "\n"));
+    }
+}
+
+fn spawn_clipboard_image_paste(
+    thread_id: String,
+    sender: mpsc::UnboundedSender<ClipboardImagePaste>,
+) {
+    spawn_clipboard_image_paste_with(thread_id, sender, clipboard::paste_image_to_temp_png);
+}
+
+fn spawn_clipboard_image_paste_with<F>(
+    thread_id: String,
+    sender: mpsc::UnboundedSender<ClipboardImagePaste>,
+    paste: F,
+) where
+    F: FnOnce() -> Result<PathBuf> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let result = match tokio::task::spawn_blocking(paste).await {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        let event = ClipboardImagePaste { thread_id, result };
+        if let Err(error) = sender.send(event)
+            && let Ok(path) = error.0.result
+        {
+            let _ = fs::remove_file(path);
+        }
+    });
+}
+
+fn apply_clipboard_image_paste(app: &mut App, paste: ClipboardImagePaste) {
+    match paste.result {
+        Ok(path)
+            if app
+                .chat()
+                .is_some_and(|chat| chat.thread_id == paste.thread_id) =>
+        {
+            if let Some(chat) = app.chat_mut() {
+                chat.attach_local_image(path);
+            }
+            if app.message.as_deref().is_some_and(|message| {
+                matches!(
+                    message,
+                    PASTING_CLIPBOARD_IMAGE_MESSAGE | CLIPBOARD_IMAGE_ALREADY_PASTING_MESSAGE
+                )
+            }) {
+                app.message = None;
+            }
+        }
+        Ok(path) => {
+            let _ = fs::remove_file(path);
+            app.message = Some("Clipboard image discarded because the active chat changed".into());
+        }
+        Err(error) => {
+            app.message = Some(format!("Could not paste clipboard image: {error}"));
+        }
     }
 }
 
@@ -4803,6 +4880,38 @@ mod tests {
     use crate::app_server::AppServerEvent;
 
     use super::*;
+
+    #[tokio::test]
+    async fn clipboard_image_paste_does_not_wait_for_image_extraction() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+
+        spawn_clipboard_image_paste_with("thread-1".into(), sender, move || {
+            release_receiver.recv().unwrap();
+            Ok(PathBuf::from("/tmp/image.png"))
+        });
+
+        assert!(receiver.try_recv().is_err());
+        release_sender.send(()).unwrap();
+        let paste = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paste.thread_id, "thread-1");
+        assert_eq!(paste.result.unwrap(), PathBuf::from("/tmp/image.png"));
+    }
+
+    #[tokio::test]
+    async fn clipboard_image_paste_reports_background_errors() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+        spawn_clipboard_image_paste_with("thread-1".into(), sender, || {
+            bail!("clipboard unavailable")
+        });
+
+        let paste = receiver.recv().await.unwrap();
+        assert_eq!(paste.result.unwrap_err(), "clipboard unavailable");
+    }
 
     fn approval_request(method: &str, params: Value) -> AppServerRequest {
         AppServerRequest {
