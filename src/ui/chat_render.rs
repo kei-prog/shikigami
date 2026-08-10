@@ -327,7 +327,7 @@ impl MarkdownRenderer {
     }
 
     fn blank_line(&mut self) {
-        if !self.lines.last().is_some_and(|line| line.width() == 0) {
+        if self.lines.last().is_none_or(|line| line.width() != 0) {
             self.lines.push(Line::from(""));
         }
     }
