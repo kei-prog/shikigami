@@ -1,6 +1,6 @@
 # Shikigami
 
-`shi` is a fast, lightweight TUI for switching between Codex CLI threads
+Shikigami is a fast, lightweight TUI for switching between Codex CLI threads
 across repositories. It keeps a small list of repositories chosen by the user,
 uses Codex App Server, and only lists threads created through Shikigami.
 
