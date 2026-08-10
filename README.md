@@ -163,12 +163,13 @@ history visible using `thread/read` and marks the chat `READ ONLY`. Close the
 other Codex session and select the thread again through `/threads` to retry
 `thread/resume`; a successful retry restores normal input.
 Execution defaults to `Auto`: Codex can write inside the thread workspace and
-asks for approval before elevated actions. Choose `/permissions` to switch
-between `Auto` and `Dangerous`; the selection is saved for future Shikigami
-sessions and applies to subsequent turns across all threads. `Dangerous` uses
-`danger-full-access` with approval prompts disabled and requires confirmation
-when enabled. The green `AUTO · WORKSPACE` or red `DANGEROUS` label in the
-header keeps the current policy visible.
+routes elevated actions to Codex's automatic approval reviewer. A request is
+shown only when Codex still requires a user decision. Choose `/permissions` to
+switch between `Auto` and `Dangerous`; the selection is saved for future
+Shikigami sessions and applies to subsequent turns across all threads.
+`Dangerous` uses `danger-full-access` with approval prompts disabled and
+requires confirmation when enabled. The green `AUTO · WORKSPACE` or red
+`DANGEROUS` label in the header keeps the current policy visible.
 User messages are shown as full-width colored input bands, while Codex responses
 use the normal chat background. Commands, reasoning, file changes, and other
 activity use compact full-width gray bands separated by one line. Their heading

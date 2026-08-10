@@ -2826,7 +2826,7 @@ fn is_active_writer_conflict(error: &anyhow::Error) -> bool {
 
 fn execution_status(mode: ExecutionMode) -> &'static str {
     match mode {
-        ExecutionMode::Auto => "AUTO · workspace-write · approvals on-request",
+        ExecutionMode::Auto => "AUTO · workspace-write · approvals auto-reviewed",
         ExecutionMode::Dangerous => "DANGEROUS · danger-full-access · approvals never",
     }
 }
@@ -5218,7 +5218,7 @@ mod tests {
     fn execution_status_describes_both_permission_modes() {
         assert_eq!(
             execution_status(ExecutionMode::Auto),
-            "AUTO · workspace-write · approvals on-request"
+            "AUTO · workspace-write · approvals auto-reviewed"
         );
         assert_eq!(
             execution_status(ExecutionMode::Dangerous),

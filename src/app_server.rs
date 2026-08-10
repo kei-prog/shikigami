@@ -333,6 +333,7 @@ impl AppServer {
         execution_mode: ExecutionMode,
     ) -> Result<String> {
         let (approval_policy, sandbox) = execution_policy(execution_mode);
+        let approvals_reviewer = approvals_reviewer(execution_mode);
         let response = self
             .request(
                 "thread/start",
@@ -340,6 +341,7 @@ impl AppServer {
                     "cwd": cwd,
                     "model": model,
                     "approvalPolicy": approval_policy,
+                    "approvalsReviewer": approvals_reviewer,
                     "sandbox": sandbox,
                     "ephemeral": false,
                     "dynamicTools": shikigami_dynamic_tools()
@@ -378,6 +380,7 @@ impl AppServer {
         execution_mode: ExecutionMode,
     ) -> Result<()> {
         let (approval_policy, sandbox) = execution_policy(execution_mode);
+        let approvals_reviewer = approvals_reviewer(execution_mode);
         self.request(
             "thread/resume",
             json!({
@@ -385,6 +388,7 @@ impl AppServer {
                 "cwd": cwd,
                 "model": model,
                 "approvalPolicy": approval_policy,
+                "approvalsReviewer": approvals_reviewer,
                 "sandbox": sandbox,
                 "dynamicTools": shikigami_dynamic_tools()
             }),
@@ -401,6 +405,7 @@ impl AppServer {
         execution_mode: ExecutionMode,
     ) -> Result<(String, Value)> {
         let (approval_policy, sandbox) = execution_policy(execution_mode);
+        let approvals_reviewer = approvals_reviewer(execution_mode);
         let response = self
             .request(
                 "thread/fork",
@@ -408,6 +413,7 @@ impl AppServer {
                     "threadId": thread_id,
                     "cwd": cwd,
                     "approvalPolicy": approval_policy,
+                    "approvalsReviewer": approvals_reviewer,
                     "sandbox": sandbox,
                     "ephemeral": ephemeral
                 }),
@@ -494,6 +500,7 @@ impl AppServer {
         settings: TurnSettings<'_>,
     ) -> Result<String> {
         let (approval_policy, _) = execution_policy(settings.execution_mode);
+        let approvals_reviewer = approvals_reviewer(settings.execution_mode);
         let sandbox_policy = turn_sandbox_policy(settings.execution_mode);
         let response = self
             .request(
@@ -505,6 +512,7 @@ impl AppServer {
                     "model": settings.model,
                     "effort": settings.effort,
                     "approvalPolicy": approval_policy,
+                    "approvalsReviewer": approvals_reviewer,
                     "sandboxPolicy": {"type": sandbox_policy}
                 }),
             )
@@ -594,6 +602,13 @@ fn execution_policy(mode: ExecutionMode) -> (&'static str, &'static str) {
     match mode {
         ExecutionMode::Auto => ("on-request", "workspace-write"),
         ExecutionMode::Dangerous => ("never", "danger-full-access"),
+    }
+}
+
+fn approvals_reviewer(mode: ExecutionMode) -> &'static str {
+    match mode {
+        ExecutionMode::Auto => "auto_review",
+        ExecutionMode::Dangerous => "user",
     }
 }
 
@@ -850,10 +865,12 @@ mod tests {
             ("never", "danger-full-access")
         );
         assert_eq!(turn_sandbox_policy(ExecutionMode::Auto), "workspaceWrite");
+        assert_eq!(approvals_reviewer(ExecutionMode::Auto), "auto_review");
         assert_eq!(
             turn_sandbox_policy(ExecutionMode::Dangerous),
             "dangerFullAccess"
         );
+        assert_eq!(approvals_reviewer(ExecutionMode::Dangerous), "user");
     }
 
     #[test]
@@ -901,6 +918,7 @@ mod tests {
             panic!("unexpected shutdown message");
         };
         assert_eq!(message["params"]["dynamicTools"], shikigami_dynamic_tools());
+        assert_eq!(message["params"]["approvalsReviewer"], "auto_review");
         dispatch_response(
             &pending,
             &json!({"id":message["id"],"result":{"thread":{"id":"thread-1"}}}),
@@ -1145,6 +1163,7 @@ mod tests {
             ])
         );
         assert_eq!(message["params"]["approvalPolicy"], "on-request");
+        assert_eq!(message["params"]["approvalsReviewer"], "auto_review");
         assert_eq!(
             message["params"]["sandboxPolicy"],
             json!({"type":"workspaceWrite"})
