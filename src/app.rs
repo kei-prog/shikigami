@@ -2418,10 +2418,10 @@ impl App {
         };
         let available = RenameAction::ALL.map(|action| self.rename_action_is_available(action));
         let current = state.index;
-        if let Some(next) = next_available_index(current, forward, &available) {
-            if let Some(state) = self.rename_actions.as_mut() {
-                state.index = next;
-            }
+        if let Some(next) = next_available_index(current, forward, &available)
+            && let Some(state) = self.rename_actions.as_mut()
+        {
+            state.index = next;
         }
     }
 

@@ -6,7 +6,7 @@ uses Codex App Server, and only lists threads created through Shikigami.
 
 ## Requirements
 
-- Rust 1.85 or later
+- Rust 1.88 or later
 - Git
 - Codex CLI (`codex`)
 
