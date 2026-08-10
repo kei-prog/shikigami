@@ -1052,7 +1052,7 @@ impl ChatState {
         let id = item_id(item);
         let summary = reasoning_summary(item);
         if summary.is_empty() {
-            self.upsert_activity(id, "Thought through the task".into());
+            self.remove_activity(id);
         } else {
             self.upsert_activity(id, format!("Thought\n{}", compact(&summary, 800)));
         }
@@ -1133,6 +1133,16 @@ impl ChatState {
         self.messages.iter().position(|message| {
             message.role == ChatRole::Activity && message.item_id.as_deref() == Some(item_id)
         })
+    }
+
+    fn remove_activity(&mut self, item_id: Option<&str>) {
+        let Some(index) = item_id.and_then(|item_id| self.activity_index(item_id)) else {
+            return;
+        };
+        self.messages.remove(index);
+        self.streaming_message = index_after_removal(self.streaming_message, index);
+        self.selected_message_index = index_after_removal(self.selected_message_index, index);
+        self.render_generation = NEXT_RENDER_GENERATION.fetch_add(1, Ordering::Relaxed);
     }
 
     fn upsert_activity(&mut self, item_id: Option<&str>, content: String) {
@@ -1396,6 +1406,14 @@ fn status_label(status: &str) -> &str {
         "inProgress" => "in progress",
         value => value,
     }
+}
+
+fn index_after_removal(index: Option<usize>, removed: usize) -> Option<usize> {
+    index.and_then(|index| match index.cmp(&removed) {
+        std::cmp::Ordering::Less => Some(index),
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => Some(index - 1),
+    })
 }
 
 fn reasoning_summary(item: &Value) -> String {
@@ -1796,6 +1814,28 @@ mod tests {
         assert_eq!(chat.messages.len(), 1);
         assert!(chat.messages[0].content.contains("Checking the code"));
         assert!(!chat.messages[0].content.contains("hidden reasoning"));
+    }
+
+    #[test]
+    fn removes_completed_reasoning_without_a_public_summary() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.apply(&event(
+            "item/started",
+            json!({"item":{"id":"reason-1","type":"reasoning"}}),
+        ));
+        chat.apply(&event("item/agentMessage/delta", json!({"delta":"answer"})));
+        chat.apply(&event(
+            "item/completed",
+            json!({"item":{"id":"reason-1","type":"reasoning","summary":[]}}),
+        ));
+        chat.apply(&event(
+            "item/completed",
+            json!({"item":{"id":"message-1","type":"agentMessage","text":"answer"}}),
+        ));
+
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, ChatRole::Assistant);
+        assert_eq!(chat.messages[0].content, "answer");
     }
 
     #[test]
