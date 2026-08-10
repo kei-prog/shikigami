@@ -4991,16 +4991,13 @@ fn render_repository_add(frame: &mut Frame, area: Rect, app: &App) {
             ),
         ]))
     });
-    let scan = if app.scanning { " · scanning…" } else { "" };
-    let filter = if app.repository_query.is_empty() {
-        String::new()
+    let scan_label = app.scan_label();
+    let title = repository_add_title(candidates.len(), scan_label, &app.repository_query);
+    let border_color = if scan_label.is_some() {
+        Color::Yellow
     } else {
-        format!(" · filter: {}", app.repository_query)
+        Color::Cyan
     };
-    let title = format!(
-        " Add repositories · {} found{scan}{filter} ",
-        candidates.len()
-    );
     let list = List::new(items)
         .block(
             Block::default()
@@ -5017,7 +5014,7 @@ fn render_repository_add(frame: &mut Frame, area: Rect, app: &App) {
                     app.keybindings.label("repositories.cancel"),
                 )))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(border_color)),
         )
         .highlight_symbol("› ")
         .highlight_style(
@@ -5029,6 +5026,19 @@ fn render_repository_add(frame: &mut Frame, area: Rect, app: &App) {
         ListState::default().with_selected((!candidates.is_empty()).then_some(app.candidate_index));
     frame.render_widget(Clear, popup);
     frame.render_stateful_widget(list, popup, &mut state);
+}
+
+fn repository_add_title(candidate_count: usize, scan_label: Option<&str>, query: &str) -> String {
+    let filter = if query.is_empty() {
+        String::new()
+    } else {
+        format!(" · filter: {query}")
+    };
+    if let Some(label) = scan_label {
+        format!(" Scanning {label}… · {candidate_count} found{filter} ")
+    } else {
+        format!(" Add repositories · {candidate_count} found{filter} ")
+    }
 }
 
 fn render_browser(frame: &mut Frame, area: Rect, app: &App) {
@@ -5899,6 +5909,22 @@ mod tests {
         assert_eq!(activity_header_color("Running: tests"), Color::Yellow);
         assert_eq!(activity_header_color("✗ tests [failed]"), Color::Red);
         assert_eq!(activity_header_color("Thought\nDone"), Color::Green);
+    }
+
+    #[test]
+    fn repository_picker_title_makes_scanning_prominent() {
+        assert_eq!(
+            repository_add_title(1, Some("home directory"), ""),
+            " Scanning home directory… · 1 found "
+        );
+        assert_eq!(
+            repository_add_title(55, Some("projects folders"), "vision"),
+            " Scanning projects folders… · 55 found · filter: vision "
+        );
+        assert_eq!(
+            repository_add_title(55, None, ""),
+            " Add repositories · 55 found "
+        );
     }
 
     #[test]

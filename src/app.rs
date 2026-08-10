@@ -316,6 +316,7 @@ pub struct App {
     settings_store: SettingsStore,
     workspaces_by_repository: HashMap<PathBuf, Vec<Workspace>>,
     scan_receiver: Option<Receiver<ScanEvent>>,
+    scan_label: Option<&'static str>,
     initial_home_scan_in_progress: bool,
 }
 
@@ -473,6 +474,7 @@ impl App {
             settings_store,
             workspaces_by_repository: HashMap::new(),
             scan_receiver: None,
+            scan_label: None,
             initial_home_scan_in_progress: false,
         };
         app.refresh_current();
@@ -2085,6 +2087,10 @@ impl App {
         }
     }
 
+    pub fn scan_label(&self) -> Option<&'static str> {
+        self.scan_label
+    }
+
     pub fn poll_scan(&mut self) {
         let mut finished = false;
         let mut completed = false;
@@ -2119,6 +2125,7 @@ impl App {
         if finished {
             self.scanning = false;
             self.scan_receiver = None;
+            self.scan_label = None;
             let mut errors = Vec::new();
             if let Err(error) = self.repository_store.save_candidates(&self.candidates) {
                 errors.push(error.to_string());
@@ -3079,6 +3086,10 @@ impl App {
     }
 
     fn start_scan(&mut self, scope: ScanScope) {
+        self.scan_label = Some(match &scope {
+            ScanScope::Roots(_) => "projects folders",
+            ScanScope::Home => "home directory",
+        });
         self.scan_receiver = Some(start_scan(scope));
         self.scanning = true;
     }
