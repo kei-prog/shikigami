@@ -169,13 +169,15 @@ pub enum BulkRenameProgress {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenameAction {
     RenameThread,
+    SuggestThread,
     SuggestRepository,
     SuggestAll,
 }
 
 impl RenameAction {
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 4] = [
         Self::RenameThread,
+        Self::SuggestThread,
         Self::SuggestRepository,
         Self::SuggestAll,
     ];
@@ -183,6 +185,7 @@ impl RenameAction {
     pub fn label(self) -> &'static str {
         match self {
             Self::RenameThread => "Rename selected thread",
+            Self::SuggestThread => "Suggest name for selected thread",
             Self::SuggestRepository => "Suggest names in this repository",
             Self::SuggestAll => "Suggest names for all threads",
         }
@@ -2826,6 +2829,7 @@ impl App {
         }
         match action {
             RenameAction::RenameThread => state.thread_id.is_some(),
+            RenameAction::SuggestThread => state.thread_id.is_some(),
             RenameAction::SuggestRepository => state.repository_path.as_ref().is_some_and(|path| {
                 self.threads
                     .iter()
@@ -2872,6 +2876,58 @@ impl App {
         self.rename_return_mode = state.return_mode;
         self.mode = Mode::RenameThread;
         self.message = None;
+    }
+
+    pub fn open_selected_thread_suggestion_from_action(
+        &mut self,
+    ) -> Result<ThreadNameGenerationRequest> {
+        let action_state = self
+            .rename_actions
+            .as_ref()
+            .context("rename actions are not open")?;
+        anyhow::ensure!(
+            self.rename_action_is_available_for(action_state, RenameAction::SuggestThread),
+            "No active thread is selected"
+        );
+        let action_state = action_state.clone();
+        let thread_id = action_state
+            .thread_id
+            .as_ref()
+            .context("No thread selected")?;
+        let thread = self
+            .threads
+            .iter()
+            .find(|thread| &thread.record.id == thread_id)
+            .cloned()
+            .context("Selected thread is no longer available")?;
+        let repository_name = self.repository_name_for_thread(&thread).to_owned();
+        let workspace_path = thread.record.cwd.clone();
+        let candidate = BulkRenameCandidate {
+            thread_id: thread.record.id,
+            repository_name,
+            current_name: thread.record.title.clone(),
+            proposed_name: thread.record.title,
+            selected: true,
+            error: None,
+        };
+
+        self.rename_actions = None;
+        self.bulk_rename = Some(BulkRenameState {
+            scope_name: "Selected thread".into(),
+            repository_path: workspace_path,
+            show_repository_names: false,
+            return_mode: action_state.return_mode,
+            candidates: vec![candidate],
+            index: 0,
+            phase: BulkRenamePhase::Select,
+            progress: None,
+            progress_started_at: Instant::now(),
+            edit_input: String::new(),
+            generating_ids: HashSet::new(),
+        });
+        self.mode = Mode::BulkRenameThreads;
+        self.message = None;
+        self.begin_bulk_name_generation(false)
     }
 
     pub fn close_thread_rename(&mut self) {
@@ -3965,6 +4021,23 @@ mod tests {
         assert_eq!(
             thread_name_model_settings(&models),
             Some(("default".into(), Some("medium".into())))
+        );
+    }
+
+    #[test]
+    fn rename_actions_offer_a_selected_thread_suggestion_before_bulk_scopes() {
+        assert_eq!(
+            RenameAction::ALL,
+            [
+                RenameAction::RenameThread,
+                RenameAction::SuggestThread,
+                RenameAction::SuggestRepository,
+                RenameAction::SuggestAll,
+            ]
+        );
+        assert_eq!(
+            RenameAction::SuggestThread.label(),
+            "Suggest name for selected thread"
         );
     }
 

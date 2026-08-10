@@ -855,6 +855,12 @@ async fn handle_key(
             KeyCode::Down | KeyCode::Char('j') => app.move_rename_action(true),
             KeyCode::Enter => match app.selected_rename_action() {
                 Some(RenameAction::RenameThread) => app.open_thread_rename_from_action(),
+                Some(RenameAction::SuggestThread) => {
+                    match app.open_selected_thread_suggestion_from_action() {
+                        Ok(request) => action = Some(UiAction::GenerateThreadNames(request)),
+                        Err(error) => app.message = Some(error.to_string()),
+                    }
+                }
                 Some(RenameAction::SuggestRepository) => {
                     app.open_bulk_thread_rename_from_action(false)
                 }
@@ -4198,7 +4204,7 @@ fn render_rename_actions(frame: &mut Frame, area: Rect, app: &App) {
     let Some(state) = app.rename_actions.as_ref() else {
         return;
     };
-    let popup = centered_rect(62, 7, area);
+    let popup = centered_rect(62, 8, area);
     let items = RenameAction::ALL.into_iter().map(|action| {
         let available = app.rename_action_is_available(action);
         let style = if available {
