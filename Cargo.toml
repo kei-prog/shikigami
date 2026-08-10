@@ -5,6 +5,8 @@ edition = "2024"
 rust-version = "1.88"
 description = "A fast, lightweight TUI for managing Codex threads across repositories"
 license = "MIT"
+repository = "https://github.com/kei-prog/shikigami"
+readme = "README.md"
 
 [[bin]]
 name = "shi"

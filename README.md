@@ -15,6 +15,14 @@ discovery pass.
 
 ## Install
 
+Install directly from GitHub:
+
+```bash
+cargo install --git https://github.com/kei-prog/shikigami
+```
+
+Or install from a local checkout:
+
 ```bash
 cargo install --path .
 ```
