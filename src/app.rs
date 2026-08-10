@@ -6,6 +6,8 @@ use std::{
     time::Instant,
 };
 
+const THREAD_NAME_MODEL: &str = "gpt-5.6-luna";
+
 use anyhow::{Context, Result};
 use directories::BaseDirs;
 
@@ -2565,7 +2567,7 @@ impl App {
         &mut self,
         selected_only: bool,
     ) -> Result<ThreadNameGenerationRequest> {
-        let model_settings = self.default_model_settings();
+        let model_settings = thread_name_model_settings(&self.models);
         let state = self
             .bulk_rename
             .as_mut()
@@ -2596,7 +2598,7 @@ impl App {
         });
         state.progress_started_at = Instant::now();
         let (model, effort) = model_settings
-            .map(|(model, _, effort)| (Some(model), effort))
+            .map(|(model, effort)| (Some(model), effort))
             .unwrap_or_default();
         Ok(ThreadNameGenerationRequest {
             repository_path: state.repository_path.clone(),
@@ -3059,6 +3061,21 @@ fn preferred_reasoning_effort(model: &ModelMetadata) -> Option<&str> {
         .map(|effort| effort.reasoning_effort.as_str())
 }
 
+fn thread_name_model_settings(models: &[ModelMetadata]) -> Option<(String, Option<String>)> {
+    let model = models
+        .iter()
+        .find(|model| model.model == THREAD_NAME_MODEL)
+        .or_else(|| models.iter().find(|model| model.is_default))
+        .or_else(|| models.first())?;
+    let effort = model
+        .supported_reasoning_efforts
+        .iter()
+        .find(|effort| effort.reasoning_effort == "low")
+        .map(|effort| effort.reasoning_effort.clone())
+        .or_else(|| preferred_reasoning_effort(model).map(str::to_owned));
+    Some((model.model.clone(), effort))
+}
+
 fn cycle_index(current: usize, count: usize, forward: bool) -> usize {
     if count == 0 {
         return 0;
@@ -3196,10 +3213,14 @@ mod tests {
     }
 
     fn model(default: &str, efforts: &[&str]) -> ModelMetadata {
+        named_model("test", true, default, efforts)
+    }
+
+    fn named_model(name: &str, is_default: bool, default: &str, efforts: &[&str]) -> ModelMetadata {
         ModelMetadata {
-            id: "test".into(),
-            model: "test".into(),
-            display_name: "Test".into(),
+            id: name.into(),
+            model: name.into(),
+            display_name: name.into(),
             description: String::new(),
             default_reasoning_effort: default.into(),
             supported_reasoning_efforts: efforts
@@ -3210,7 +3231,7 @@ mod tests {
                 })
                 .collect(),
             input_modalities: vec!["text".into(), "image".into()],
-            is_default: true,
+            is_default,
         }
     }
 
@@ -3234,6 +3255,32 @@ mod tests {
     fn model_default_is_used_when_medium_is_unavailable() {
         let model = model("low", &["low", "high"]);
         assert_eq!(preferred_reasoning_effort(&model), Some("low"));
+    }
+
+    #[test]
+    fn luna_with_low_effort_is_used_for_thread_names() {
+        let models = vec![
+            named_model("gpt-5.6-sol", true, "medium", &["low", "medium"]),
+            named_model(THREAD_NAME_MODEL, false, "medium", &["low", "medium"]),
+        ];
+
+        assert_eq!(
+            thread_name_model_settings(&models),
+            Some((THREAD_NAME_MODEL.into(), Some("low".into())))
+        );
+    }
+
+    #[test]
+    fn thread_names_fall_back_to_the_default_model() {
+        let models = vec![
+            named_model("other", false, "medium", &["medium"]),
+            named_model("default", true, "medium", &["medium"]),
+        ];
+
+        assert_eq!(
+            thread_name_model_settings(&models),
+            Some(("default".into(), Some("medium".into())))
+        );
     }
 
     #[test]
