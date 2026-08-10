@@ -3377,37 +3377,7 @@ fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
     render_navigation_tree(frame, app, panes[0]);
     render_chat_area(frame, panes[1], app, render_cache);
 
-    let default_status = if app.attention_count() > 0 {
-        format!(
-            "{} attention ({}) · {} / {} move · {} messages · {} input · {} filter · {} commands · {} new · {} quit",
-            app.keybindings.label("normal.attention"),
-            app.attention_count(),
-            app.keybindings.label("normal.up"),
-            app.keybindings.label("normal.down"),
-            app.keybindings.label("normal.thread.open_scroll"),
-            app.keybindings.label("normal.thread.open_input"),
-            app.keybindings.label("normal.find_thread"),
-            app.keybindings.label("normal.palette"),
-            app.keybindings.label("normal.new_thread"),
-            app.keybindings.label("normal.quit"),
-        )
-    } else {
-        format!(
-            "{} help · {} / {} move · {} / {} tree · {} input · {} / {} all · {} filter · {} commands · {} new · {} quit",
-            app.keybindings.label("normal.help"),
-            app.keybindings.label("normal.up"),
-            app.keybindings.label("normal.down"),
-            app.keybindings.label("normal.repository.collapse"),
-            app.keybindings.label("normal.thread.open_scroll"),
-            app.keybindings.label("normal.thread.open_input"),
-            app.keybindings.label("normal.collapse_all"),
-            app.keybindings.label("normal.expand_all"),
-            app.keybindings.label("normal.find_thread"),
-            app.keybindings.label("normal.palette"),
-            app.keybindings.label("normal.new_thread"),
-            app.keybindings.label("normal.quit"),
-        )
-    };
+    let default_status = footer_help(app);
     let status = app.message.as_deref().unwrap_or(&default_status);
     frame.render_widget(
         Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
@@ -3469,6 +3439,52 @@ fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
     }
 }
 
+fn footer_help(app: &App) -> String {
+    if app.focus == Focus::Chat
+        && let Some(chat) = app.chat()
+    {
+        return chat_help(
+            app.active_chat_is_read_only(),
+            chat.mode,
+            app.has_side_chat(),
+            chat.active_turn_id.is_some(),
+            &app.keybindings,
+        );
+    }
+
+    if app.attention_count() > 0 {
+        format!(
+            "REPOSITORIES · {} attention ({}) · {} / {} move · {} messages · {} input · {} filter · {} commands · {} new · {} quit",
+            app.keybindings.label("normal.attention"),
+            app.attention_count(),
+            app.keybindings.label("normal.up"),
+            app.keybindings.label("normal.down"),
+            app.keybindings.label("normal.thread.open_scroll"),
+            app.keybindings.label("normal.thread.open_input"),
+            app.keybindings.label("normal.find_thread"),
+            app.keybindings.label("normal.palette"),
+            app.keybindings.label("normal.new_thread"),
+            app.keybindings.label("normal.quit"),
+        )
+    } else {
+        format!(
+            "REPOSITORIES · {} help · {} / {} move · {} / {} tree · {} input · {} / {} all · {} filter · {} commands · {} new · {} quit",
+            app.keybindings.label("normal.help"),
+            app.keybindings.label("normal.up"),
+            app.keybindings.label("normal.down"),
+            app.keybindings.label("normal.repository.collapse"),
+            app.keybindings.label("normal.thread.open_scroll"),
+            app.keybindings.label("normal.thread.open_input"),
+            app.keybindings.label("normal.collapse_all"),
+            app.keybindings.label("normal.expand_all"),
+            app.keybindings.label("normal.find_thread"),
+            app.keybindings.label("normal.palette"),
+            app.keybindings.label("normal.new_thread"),
+            app.keybindings.label("normal.quit"),
+        )
+    }
+}
+
 fn render_chat_area(frame: &mut Frame, area: Rect, app: &mut App, render_cache: &mut RenderCache) {
     if app.has_side_chat() {
         let panes = Layout::default()
@@ -3491,7 +3507,6 @@ fn render_chat_pane(
 ) {
     let pane_active = app.active_chat_pane == pane;
     let chat_focused = app.focus == Focus::Chat && pane_active;
-    let has_side_chat = app.has_side_chat();
     let side_chat_position = app.current_side_chat_position();
     let chat_id = match pane {
         ChatPane::Main => app.visible_chat_id.clone(),
@@ -3556,7 +3571,7 @@ fn render_chat_pane(
     if show_pending {
         constraints.push(Constraint::Length(pending_height));
     }
-    constraints.extend([Constraint::Length(4), Constraint::Length(1)]);
+    constraints.push(Constraint::Length(4));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
@@ -3565,7 +3580,6 @@ fn render_chat_pane(
     let pending_area = show_pending.then_some(chunks[1]);
     let message_index = usize::from(show_pending) + 1;
     let message_area = chunks[message_index];
-    let help_area = chunks[message_index + 1];
     let visible_height = chat_area.height.saturating_sub(2).max(1) as usize;
     let chat_border = chat_border_color(chat_focused, chat.mode);
     let chat_block = Block::default()
@@ -3686,17 +3700,6 @@ fn render_chat_pane(
             .min(message_inner.bottom().saturating_sub(1));
         frame.set_cursor_position((x, y));
     }
-    let help = chat_help(
-        read_only,
-        chat.mode,
-        has_side_chat,
-        chat.active_turn_id.is_some(),
-        &app.keybindings,
-    );
-    frame.render_widget(
-        Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
-        help_area,
-    );
 }
 
 fn chat_help(
@@ -3708,7 +3711,7 @@ fn chat_help(
 ) -> String {
     let controls = if read_only {
         format!(
-            "READ ONLY · {} palette · /threads retry · {} scroll · {} threads",
+            "MESSAGE · READ ONLY · {} palette · /threads retry · {} scroll · {} repositories",
             keybindings.label("chat_input.palette"),
             keybindings.label("chat_input.scroll"),
             keybindings.label("chat_input.focus_tree"),
@@ -3716,7 +3719,7 @@ fn chat_help(
     } else {
         match (mode, has_side_chat) {
             (ChatMode::Input, true) => format!(
-                "INPUT · {} image · {} newline · {} pane · {} / {} side · {} {}",
+                "MESSAGE · {} image · {} newline · {} pane · {} / {} side · {} {}",
                 keybindings.label("chat_input.paste_image"),
                 keybindings.label("chat_input.newline"),
                 keybindings.label("chat_input.toggle_pane"),
@@ -3726,7 +3729,7 @@ fn chat_help(
                 if active_turn { "steer" } else { "send" }
             ),
             (ChatMode::Input, false) => format!(
-                "INPUT · {} image · {} newline · {} {} · {} palette · {} effort · {} clear · {} scroll · {} threads",
+                "MESSAGE · {} image · {} newline · {} {} · {} palette · {} effort · {} clear · {} scroll · {} repositories",
                 keybindings.label("chat_input.paste_image"),
                 keybindings.label("chat_input.newline"),
                 keybindings.label("chat_input.submit"),
@@ -3738,7 +3741,7 @@ fn chat_help(
                 keybindings.label("chat_input.focus_tree"),
             ),
             (ChatMode::Scroll, true) => format!(
-                "SCROLL · {} / {} line · {} / {} msg · {} editor cmd · {} copy · {} input · {} threads",
+                "MESSAGES · {} / {} line · {} / {} msg · {} editor cmd · {} copy · {} input · {} repositories",
                 keybindings.label("chat_scroll.line_up"),
                 keybindings.label("chat_scroll.line_down"),
                 keybindings.label("chat_scroll.previous_message"),
@@ -3749,7 +3752,7 @@ fn chat_help(
                 keybindings.label("chat_scroll.focus_tree"),
             ),
             (ChatMode::Scroll, false) => format!(
-                "SCROLL · {} / {} line · {} / {} msg · {} editor cmd · {} / {} copy · {} / {} half · {} input · {} threads",
+                "MESSAGES · {} / {} line · {} / {} msg · {} editor cmd · {} / {} copy · {} / {} half · {} input · {} repositories",
                 keybindings.label("chat_scroll.line_up"),
                 keybindings.label("chat_scroll.line_down"),
                 keybindings.label("chat_scroll.previous_message"),
@@ -3766,7 +3769,7 @@ fn chat_help(
     };
     if active_turn {
         format!(
-            "{} stop · {controls}",
+            "{controls} · {} stop",
             keybindings.label("chat_input.interrupt")
         )
     } else {
@@ -5877,10 +5880,28 @@ mod tests {
         let active = chat_help(false, ChatMode::Input, false, true, &keybindings);
         let idle = chat_help(false, ChatMode::Input, false, false, &keybindings);
 
-        assert!(active.starts_with("ctrl+c stop · "));
+        assert!(active.starts_with("MESSAGE · "));
+        assert!(active.ends_with("ctrl+c stop"));
         assert!(active.contains("enter steer"));
         assert!(!idle.contains("ctrl+c stop"));
         assert!(idle.contains("enter send"));
+    }
+
+    #[test]
+    fn chat_help_labels_the_active_shortcut_scope() {
+        let keybindings = KeyBindings::defaults();
+
+        assert!(
+            chat_help(false, ChatMode::Input, false, false, &keybindings).starts_with("MESSAGE · ")
+        );
+        assert!(
+            chat_help(false, ChatMode::Scroll, false, false, &keybindings)
+                .starts_with("MESSAGES · ")
+        );
+        assert!(
+            chat_help(true, ChatMode::Input, false, false, &keybindings)
+                .starts_with("MESSAGE · READ ONLY · ")
+        );
     }
 
     #[test]
