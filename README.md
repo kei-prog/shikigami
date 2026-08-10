@@ -159,9 +159,10 @@ Existing worktrees from `git worktree list` are offered as locations when a new
 thread is created.
 
 Choosing `New worktree` creates an automatically named `shi/<id>` branch and
-worktree under Shikigami's local data directory, then immediately starts Codex. No
-branch or directory name input is required. `Existing worktree` only lists
-non-primary entries returned by `git worktree list`.
+worktree under Shikigami's local data directory. Codex starts when the first
+message is sent, so leaving the empty draft removes the clean managed worktree
+without creating a Codex thread. No branch or directory name input is required.
+`Existing worktree` only lists non-primary entries returned by `git worktree list`.
 
 ## Chat runtime
 
@@ -169,9 +170,9 @@ Shikigami allows one interactive `shi` process at a time. It holds an OS file
 lock while running, so a second process exits with a clear already-running error.
 The active process starts a dedicated Codex App Server over stdio and stops that
 child process when Shikigami exits.
-New threads are registered immediately from `thread/start`; existing threads use
-`thread/resume` and `thread/read`. Each connection unsubscribes from its resumed
-threads on exit. Pressing `q` asks for confirmation when responses started by that
+On the first send, new threads are registered from `thread/start`; existing
+threads use `thread/resume` and `thread/read`. Each connection unsubscribes from
+its resumed threads on exit. Pressing `q` asks for confirmation when responses started by that
 Shikigami process are still running or temporary side chats remain. Confirming
 interrupts those responses and deletes the temporary chats before exit. Messages,
 streamed reasoning summaries, plans, command output
@@ -210,10 +211,11 @@ updates remain in the review screen and can be retried without reapplying succes
 renames. An animated progress dialog distinguishes conversation loading, waiting for
 Codex, and applying the selected names, with real item counts and elapsed time.
 
-Codex does not persist a new thread until its first turn. When an untitled chat
-has no messages, leaving it removes the temporary thread from Shikigami. A clean
-Shikigami-managed worktree created for that chat is removed too; a thread whose
-managed worktree has changes is kept. If an empty thread remains after an
+Shikigami keeps a new chat as an in-memory draft and does not create or register a
+Codex thread until its first turn. Leaving the draft removes it immediately. A clean
+Shikigami-managed worktree or empty General scratch directory created for that draft
+is removed in the background; a managed worktree whose files have changed is kept.
+If an empty thread remains after an
 interrupted session and its temporary App Server thread has expired, opening it
 starts a replacement in the same worktree and updates the stored thread id.
 

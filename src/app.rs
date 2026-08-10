@@ -1,13 +1,17 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
-    path::PathBuf,
-    sync::mpsc::{Receiver, TryRecvError},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{Receiver, TryRecvError},
+    },
     time::Instant,
 };
 
 const THREAD_NAME_MODEL: &str = "gpt-5.6-luna";
 const MAX_ARCHIVE_UNDOS: usize = 20;
+static NEXT_DRAFT_THREAD_ID: AtomicU64 = AtomicU64::new(1);
 
 use anyhow::{Context, Result};
 use directories::BaseDirs;
@@ -77,6 +81,21 @@ pub struct ThreadDeletionState {
     pub title: String,
     pub phase: ThreadDeletionPhase,
     pub started_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+pub struct DraftWorkspaceCleanup {
+    pub scope: ThreadScope,
+    pub repository_path: PathBuf,
+    pub workspace_path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct DraftThread {
+    scope: ThreadScope,
+    repository_path: PathBuf,
+    workspace_path: PathBuf,
+    cleanup_workspace_on_cancel: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -271,6 +290,7 @@ pub struct App {
     pub message: Option<String>,
     pub should_quit: bool,
     pub chats: HashMap<String, ChatState>,
+    draft_threads: HashMap<String, DraftThread>,
     preview_cache_order: VecDeque<String>,
     pub visible_chat_id: Option<String>,
     pub side_chat_id: Option<String>,
@@ -446,6 +466,7 @@ impl App {
             message: (!startup_message.is_empty()).then_some(startup_message),
             should_quit: false,
             chats: HashMap::new(),
+            draft_threads: HashMap::new(),
             preview_cache_order: VecDeque::new(),
             visible_chat_id: None,
             side_chat_id: None,
@@ -2410,6 +2431,96 @@ impl App {
         Ok(())
     }
 
+    pub fn begin_draft_thread(
+        &mut self,
+        workspace: &Workspace,
+        scope: ThreadScope,
+        cleanup_workspace_on_cancel: bool,
+    ) -> Result<String> {
+        let repository_path = match scope {
+            ThreadScope::Repository => self
+                .selected_repository()
+                .map(|repository| repository.path.clone())
+                .context("no repository selected")?,
+            ThreadScope::General => workspace.path.clone(),
+        };
+        let id = format!(
+            "draft-{}-{}",
+            std::process::id(),
+            NEXT_DRAFT_THREAD_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        self.draft_threads.insert(
+            id.clone(),
+            DraftThread {
+                scope,
+                repository_path,
+                workspace_path: workspace.path.clone(),
+                cleanup_workspace_on_cancel,
+            },
+        );
+        Ok(id)
+    }
+
+    pub fn is_draft_thread(&self, thread_id: &str) -> bool {
+        self.draft_threads.contains_key(thread_id)
+    }
+
+    pub fn materialize_draft_thread(&mut self, draft_id: &str, thread_id: String) -> Result<()> {
+        let draft = self
+            .draft_threads
+            .get(draft_id)
+            .cloned()
+            .context("draft thread not found")?;
+        anyhow::ensure!(self.chats.contains_key(draft_id), "draft chat not found");
+        match draft.scope {
+            ThreadScope::Repository => self.thread_registry.register_thread(
+                thread_id.clone(),
+                &draft.repository_path,
+                &draft.workspace_path,
+            )?,
+            ThreadScope::General => self
+                .thread_registry
+                .register_general_thread(thread_id.clone(), &draft.workspace_path)?,
+        }
+
+        self.draft_threads.remove(draft_id);
+        let mut chat = self
+            .chats
+            .remove(draft_id)
+            .expect("draft chat was checked above");
+        chat.thread_id.clone_from(&thread_id);
+        self.chats.insert(thread_id.clone(), chat);
+        if self.visible_chat_id.as_deref() == Some(draft_id) {
+            self.visible_chat_id = Some(thread_id.clone());
+        }
+        self.confirmed_thread_names.insert(thread_id.clone());
+        self.thread_names.insert(thread_id, None);
+        self.refresh_current();
+        Ok(())
+    }
+
+    pub fn cancel_visible_draft_thread(&mut self) -> Option<DraftWorkspaceCleanup> {
+        let draft_id = self.visible_chat_id.as_deref()?;
+        let draft = self.draft_threads.remove(draft_id)?;
+        let draft_id = draft_id.to_owned();
+        self.discard_chat(&draft_id);
+        draft
+            .cleanup_workspace_on_cancel
+            .then_some(DraftWorkspaceCleanup {
+                scope: draft.scope,
+                repository_path: draft.repository_path,
+                workspace_path: draft.workspace_path,
+            })
+    }
+
+    pub fn forget_workspace(&mut self, workspace_path: &Path) {
+        self.locations
+            .retain(|workspace| workspace.path != workspace_path);
+        for workspaces in self.workspaces_by_repository.values_mut() {
+            workspaces.retain(|workspace| workspace.path != workspace_path);
+        }
+    }
+
     pub fn unused_main_chat_cleanup_target(&self) -> Result<Option<String>> {
         let Some(thread_id) = self.visible_chat_id.as_deref() else {
             return Ok(None);
@@ -2459,14 +2570,6 @@ impl App {
         self.discard_chat(thread_id);
         self.refresh_current();
         Ok(())
-    }
-
-    pub fn register_app_server_thread(&mut self, thread_id: String, cwd: PathBuf) -> Result<()> {
-        let repository = self
-            .selected_repository()
-            .cloned()
-            .context("no repository selected")?;
-        self.register_app_server_thread_in_repository(thread_id, repository.path, cwd)
     }
 
     pub fn register_app_server_thread_in_repository(

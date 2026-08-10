@@ -43,9 +43,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{
-        App, AttentionKind, BulkRenamePhase, BulkRenameProgress, ChatPane, Focus, Mode,
-        RenameAction, ThreadDeletionPhase, ThreadNameApplyRequest, ThreadNameGenerationRequest,
-        TreeRow,
+        App, AttentionKind, BulkRenamePhase, BulkRenameProgress, ChatPane, DraftWorkspaceCleanup,
+        Focus, Mode, RenameAction, ThreadDeletionPhase, ThreadNameApplyRequest,
+        ThreadNameGenerationRequest, TreeRow,
     },
     app_server::{AppServer, AppServerRequest, TurnSettings},
     chat::{ChatMode, ChatState, CommandPalette, EditorTarget, PaletteCommand, PaletteEntry},
@@ -108,6 +108,7 @@ struct RenderCache {
 enum UiAction {
     CopyEditorCommand { cwd: PathBuf, target: EditorTarget },
     PasteClipboardImage { thread_id: String },
+    CleanupDraftWorkspace(DraftWorkspaceCleanup),
     DeleteThread(ThreadRecord),
     GenerateThreadNames(ThreadNameGenerationRequest),
     ApplyThreadNames(ThreadNameApplyRequest),
@@ -211,6 +212,7 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
     let (bulk_rename_sender, mut bulk_rename_receiver) = mpsc::unbounded_channel();
     let (thread_name_sender, mut thread_name_receiver) = mpsc::unbounded_channel();
     let (clipboard_image_sender, mut clipboard_image_receiver) = mpsc::unbounded_channel();
+    let (draft_cleanup_sender, mut draft_cleanup_receiver) = mpsc::unbounded_channel();
     spawn_thread_name_refresh(app, Arc::clone(&server), thread_name_sender);
     let mut thread_name_refresh_pending = true;
     let mut clipboard_image_paste_pending = false;
@@ -272,6 +274,12 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                                 spawn_clipboard_image_paste(
                                     thread_id,
                                     clipboard_image_sender.clone(),
+                                );
+                            }
+                            Some(UiAction::CleanupDraftWorkspace(cleanup)) => {
+                                spawn_draft_workspace_cleanup(
+                                    cleanup,
+                                    draft_cleanup_sender.clone(),
                                 );
                             }
                             Some(UiAction::DeleteThread(record)) => {
@@ -344,6 +352,17 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                 if let Some(paste) = paste {
                     clipboard_image_paste_pending = false;
                     apply_clipboard_image_paste(app, paste);
+                    needs_draw = true;
+                }
+            }
+            cleanup = draft_cleanup_receiver.recv() => {
+                if let Some((workspace_path, result)) = cleanup {
+                    match result {
+                        Ok(()) => app.forget_workspace(&workspace_path),
+                        Err(error) => {
+                            app.message = Some(format!("Could not remove unused workspace: {error}"));
+                        }
+                    }
                     needs_draw = true;
                 }
             }
@@ -499,7 +518,7 @@ async fn handle_key(
                         }
                     }
                     ChatNavigationTarget::RepositoryTree => {
-                        return_to_repository_tree(app, server).await;
+                        return Ok(return_to_repository_tree(app, server).await);
                     }
                 }
                 return Ok(None);
@@ -602,7 +621,7 @@ async fn handle_key(
                 }
             }
             KeyCode::Esc => {
-                return_to_repository_tree(app, server).await;
+                action = return_to_repository_tree(app, server).await;
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 interrupt_chat(app, server).await?;
@@ -802,6 +821,11 @@ async fn handle_key(
                 }
             }
             KeyCode::Enter => {
+                if app.selected_thread_picker().is_some() {
+                    action = app
+                        .cancel_visible_draft_thread()
+                        .map(UiAction::CleanupDraftWorkspace);
+                }
                 if app.activate_selected_thread_picker() {
                     cancel_chat_preview(preview_generation, preview_task);
                     if let Err(error) = focus_selected_chat(app, server).await {
@@ -1056,12 +1080,12 @@ async fn handle_key(
             KeyCode::Enter => match app.thread_target_index {
                 0 => {
                     if let Some(workspace) = app.primary_location().cloned() {
-                        open_new_chat(app, server, workspace, ThreadScope::Repository).await?;
+                        open_new_chat(app, workspace, ThreadScope::Repository, false)?;
                     }
                 }
                 1 => match app.create_generated_worktree() {
                     Ok(workspace) => {
-                        open_new_chat(app, server, workspace, ThreadScope::Repository).await?;
+                        open_new_chat(app, workspace, ThreadScope::Repository, true)?;
                     }
                     Err(error) => app.message = Some(error.to_string()),
                 },
@@ -1082,7 +1106,7 @@ async fn handle_key(
             KeyCode::Down | KeyCode::Char('j') => app.move_down(),
             KeyCode::Enter => {
                 if let Some(workspace) = app.selected_existing_worktree().cloned() {
-                    open_new_chat(app, server, workspace, ThreadScope::Repository).await?;
+                    open_new_chat(app, workspace, ThreadScope::Repository, false)?;
                 }
             }
             _ => {}
@@ -1181,7 +1205,7 @@ async fn handle_key(
                 if app.selected_tree_is_general() {
                     match app.create_general_workspace() {
                         Ok(workspace) => {
-                            open_new_chat(app, server, workspace, ThreadScope::General).await?;
+                            open_new_chat(app, workspace, ThreadScope::General, true)?;
                         }
                         Err(error) => app.message = Some(error.to_string()),
                     }
@@ -1342,12 +1366,18 @@ fn selected_thread_entry_mode(code: &KeyCode) -> Option<ChatMode> {
     }
 }
 
-async fn return_to_repository_tree(app: &mut App, server: &Arc<AppServer>) {
-    if let Err(error) = cleanup_unused_main_chat(app, server).await {
-        app.message = Some(format!("Could not remove unused thread: {error}"));
-    }
+async fn return_to_repository_tree(app: &mut App, server: &Arc<AppServer>) -> Option<UiAction> {
+    let action = if let Some(cleanup) = app.cancel_visible_draft_thread() {
+        Some(UiAction::CleanupDraftWorkspace(cleanup))
+    } else {
+        if let Err(error) = cleanup_unused_main_chat(app, server).await {
+            app.message = Some(format!("Could not remove unused thread: {error}"));
+        }
+        None
+    };
     app.mode = Mode::Normal;
     app.focus = Focus::Navigation;
+    action
 }
 
 fn handle_paste(app: &mut App, pasted: String) {
@@ -2419,6 +2449,38 @@ async fn cleanup_unused_main_chat(app: &mut App, server: &Arc<AppServer>) -> Res
     app.remove_unused_main_chat(&thread_id)
 }
 
+fn spawn_draft_workspace_cleanup(
+    cleanup: DraftWorkspaceCleanup,
+    sender: mpsc::UnboundedSender<(PathBuf, Result<(), String>)>,
+) {
+    let workspace_path = cleanup.workspace_path.clone();
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || cleanup_draft_workspace(cleanup))
+            .await
+            .map_err(|error| format!("workspace cleanup task failed: {error}"))
+            .and_then(|result| result.map_err(|error| error.to_string()));
+        let _ = sender.send((workspace_path, result));
+    });
+}
+
+fn cleanup_draft_workspace(cleanup: DraftWorkspaceCleanup) -> Result<()> {
+    if !cleanup.workspace_path.is_dir() {
+        return Ok(());
+    }
+    match cleanup.scope {
+        ThreadScope::Repository => {
+            let branch = git_workspace::current_branch(&cleanup.workspace_path)?;
+            git_workspace::remove_managed_workspace(
+                &cleanup.repository_path,
+                &cleanup.workspace_path,
+                branch.as_deref(),
+            )
+        }
+        ThreadScope::General => fs::remove_dir(&cleanup.workspace_path)
+            .with_context(|| format!("remove {}", cleanup.workspace_path.display())),
+    }
+}
+
 fn is_missing_thread_error(error: &anyhow::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("no rollout found for thread id")
@@ -2477,29 +2539,14 @@ async fn interrupt_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     Ok(())
 }
 
-async fn open_new_chat(
+fn open_new_chat(
     app: &mut App,
-    server: &Arc<AppServer>,
     workspace: Workspace,
     scope: ThreadScope,
+    cleanup_workspace_on_cancel: bool,
 ) -> Result<()> {
     let model_settings = app.default_model_settings();
-    let thread_id = server
-        .start_thread(
-            &workspace.path,
-            model_settings.as_ref().map(|(model, _, _)| model.as_str()),
-            app.execution_mode,
-        )
-        .await?;
-    match scope {
-        ThreadScope::Repository => {
-            app.register_app_server_thread(thread_id.clone(), workspace.path.clone())?
-        }
-        ThreadScope::General => {
-            app.register_app_server_general_thread(thread_id.clone(), workspace.path.clone())?
-        }
-    }
-    app.mark_thread_opened(thread_id.clone());
+    let thread_id = app.begin_draft_thread(&workspace, scope, cleanup_workspace_on_cancel)?;
     let mut chat = ChatState::new(thread_id, workspace.path, "Untitled thread".into());
     if let Some((model, display_name, effort)) = model_settings {
         chat.set_model(model, display_name, effort);
@@ -2899,7 +2946,7 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     }
     let prompt = chat.composer.clone();
     let local_images = chat.composer_local_images().to_vec();
-    let thread_id = chat.thread_id.clone();
+    let mut thread_id = chat.thread_id.clone();
     let active_turn_id = chat.active_turn_id.clone();
     let cwd = chat.cwd.clone();
     let model = chat.model.clone();
@@ -2908,6 +2955,30 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     if !local_images.is_empty() && !app.active_model_supports_images() {
         app.message = Some(image_not_supported_message(app));
         return Ok(());
+    }
+    if app.is_draft_thread(&thread_id) {
+        let persistent_thread_id = match server
+            .start_thread(&cwd, model.as_deref(), app.execution_mode)
+            .await
+        {
+            Ok(thread_id) => thread_id,
+            Err(error) => {
+                app.message = Some(format!("Could not create thread: {error}"));
+                return Ok(());
+            }
+        };
+        if let Err(error) = app.materialize_draft_thread(&thread_id, persistent_thread_id.clone()) {
+            let cleanup = delete_temporary_thread(server, &persistent_thread_id).await;
+            app.message = Some(match cleanup {
+                Ok(()) => format!("Could not register thread: {error}"),
+                Err(cleanup_error) => format!(
+                    "Could not register thread: {error}; Codex cleanup also failed: {cleanup_error}"
+                ),
+            });
+            return Ok(());
+        }
+        app.mark_thread_opened(persistent_thread_id.clone());
+        thread_id = persistent_thread_id;
     }
     if let Some(turn_id) = active_turn_id {
         if let Err(error) = server
@@ -5363,6 +5434,7 @@ mod tests {
     use std::time::Instant;
 
     use crate::app_server::AppServerEvent;
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -5400,6 +5472,34 @@ mod tests {
             assert_eq!(selected_thread_entry_mode(&code), Some(ChatMode::Input));
         }
         assert_eq!(selected_thread_entry_mode(&KeyCode::Char('j')), None);
+    }
+
+    #[test]
+    fn draft_general_workspace_cleanup_removes_only_an_empty_directory() {
+        let temp = tempdir().unwrap();
+        let empty = temp.path().join("empty-draft");
+        fs::create_dir(&empty).unwrap();
+
+        cleanup_draft_workspace(DraftWorkspaceCleanup {
+            scope: ThreadScope::General,
+            repository_path: empty.clone(),
+            workspace_path: empty.clone(),
+        })
+        .unwrap();
+        assert!(!empty.exists());
+
+        let nonempty = temp.path().join("nonempty-draft");
+        fs::create_dir(&nonempty).unwrap();
+        fs::write(nonempty.join("keep.txt"), "keep").unwrap();
+        assert!(
+            cleanup_draft_workspace(DraftWorkspaceCleanup {
+                scope: ThreadScope::General,
+                repository_path: nonempty.clone(),
+                workspace_path: nonempty.clone(),
+            })
+            .is_err()
+        );
+        assert!(nonempty.join("keep.txt").is_file());
     }
 
     #[tokio::test]
