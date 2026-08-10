@@ -10,14 +10,31 @@ mod repository;
 mod settings;
 mod ui;
 
-use anyhow::Result;
+use std::{
+    env,
+    ffi::OsString,
+    io::{self, Write},
+    path::Path,
+    process::Command as ProcessCommand,
+};
+
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::app::App;
 
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(version, about, args_conflicts_with_subcommands = true)]
 struct Cli {
+    /// Create the keybindings config if needed and open it in an editor
+    #[arg(long, conflicts_with_all = ["config_path", "reset_config"])]
+    config: bool,
+    /// Print the keybindings configuration path
+    #[arg(long, conflicts_with_all = ["config", "reset_config"])]
+    config_path: bool,
+    /// Back up the current keybindings config and restore all defaults
+    #[arg(long, conflicts_with_all = ["config", "config_path"])]
+    reset_config: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -51,13 +68,17 @@ enum ConfigCommand {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command {
-        None => {
+    match (cli.config, cli.config_path, cli.reset_config, cli.command) {
+        (true, false, false, None) => open_config()?,
+        (false, true, false, None) => print_config_path()?,
+        (false, false, true, None) => reset_config()?,
+        (false, false, false, None) => {
             let _instance_lock = app_server::InstanceLock::acquire()?;
             ui::run(App::load()?).await?
         }
-        Some(Command::Repo { command }) => run_repo_command(command)?,
-        Some(Command::Config { command }) => run_config_command(command)?,
+        (false, false, false, Some(Command::Repo { command })) => run_repo_command(command)?,
+        (false, false, false, Some(Command::Config { command })) => run_config_command(command)?,
+        _ => unreachable!("clap rejects conflicting config options"),
     }
 
     Ok(())
@@ -65,9 +86,90 @@ async fn main() -> Result<()> {
 
 fn run_config_command(command: ConfigCommand) -> Result<()> {
     match command {
-        ConfigCommand::Path => println!("{}", keybindings::KeyBindings::config_path()?.display()),
+        ConfigCommand::Path => print_config_path()?,
     }
     Ok(())
+}
+
+fn print_config_path() -> Result<()> {
+    println!("{}", keybindings::KeyBindings::config_path()?.display());
+    Ok(())
+}
+
+fn open_config() -> Result<()> {
+    let path = keybindings::KeyBindings::ensure_config_file()?;
+    let visual = env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let editor = env::var("EDITOR")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let (program, args) = editor_invocation(visual.as_deref(), editor.as_deref(), &path)?;
+    let status = ProcessCommand::new(&program)
+        .args(&args)
+        .status()
+        .with_context(|| format!("open config {} with {program}", path.display()))?;
+    if !status.success() {
+        bail!("config editor `{program}` exited with {status}");
+    }
+    Ok(())
+}
+
+fn reset_config() -> Result<()> {
+    let path = keybindings::KeyBindings::config_path()?;
+    if path.exists() {
+        print!("Reset keybindings to defaults? [y/N] ");
+        io::stdout().flush().context("show reset confirmation")?;
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .context("read reset confirmation")?;
+        if !reset_confirmed(&answer) {
+            println!("Config was not changed");
+            return Ok(());
+        }
+    }
+
+    let (path, backup) = keybindings::KeyBindings::reset_config_file()?;
+    println!("Reset config to defaults: {}", path.display());
+    if let Some(backup) = backup {
+        println!("Previous config backup: {}", backup.display());
+    }
+    Ok(())
+}
+
+fn reset_confirmed(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn editor_invocation(
+    visual: Option<&str>,
+    editor: Option<&str>,
+    path: &Path,
+) -> Result<(String, Vec<OsString>)> {
+    if let Some(specification) = visual
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| editor.filter(|value| !value.trim().is_empty()))
+    {
+        let mut parts = shlex::split(specification)
+            .with_context(|| format!("parse editor command `{specification}`"))?;
+        if parts.is_empty() {
+            bail!("editor command is empty");
+        }
+        let program = parts.remove(0);
+        let mut args = parts.into_iter().map(OsString::from).collect::<Vec<_>>();
+        args.push(path.as_os_str().to_owned());
+        return Ok((program, args));
+    }
+
+    #[cfg(target_os = "macos")]
+    return Ok((
+        "open".into(),
+        vec![OsString::from("-e"), path.as_os_str().to_owned()],
+    ));
+
+    #[cfg(not(target_os = "macos"))]
+    Ok(("xdg-open".into(), vec![path.as_os_str().to_owned()]))
 }
 
 fn run_repo_command(command: RepoCommand) -> Result<()> {
@@ -80,4 +182,57 @@ fn run_repo_command(command: RepoCommand) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_options_are_top_level_flags() {
+        let edit = Cli::try_parse_from(["shi", "--config"]).unwrap();
+        let path = Cli::try_parse_from(["shi", "--config-path"]).unwrap();
+        let reset = Cli::try_parse_from(["shi", "--reset-config"]).unwrap();
+
+        assert!(edit.config);
+        assert!(path.config_path);
+        assert!(reset.reset_config);
+    }
+
+    #[test]
+    fn config_flags_conflict_with_subcommands() {
+        assert!(Cli::try_parse_from(["shi", "--config", "repo", "list"]).is_err());
+        assert!(Cli::try_parse_from(["shi", "--config", "--config-path"]).is_err());
+        assert!(Cli::try_parse_from(["shi", "--config", "--reset-config"]).is_err());
+    }
+
+    #[test]
+    fn visual_precedes_editor_and_preserves_the_config_path() {
+        let path = Path::new("/tmp/config with spaces.json");
+
+        let (program, args) = editor_invocation(Some("code --wait"), Some("vim"), path).unwrap();
+
+        assert_eq!(program, "code");
+        assert_eq!(
+            args,
+            [OsString::from("--wait"), path.as_os_str().to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_empty_visual_setting_falls_through_to_editor() {
+        let (program, args) =
+            editor_invocation(Some(""), Some("vim"), Path::new("config.json")).unwrap();
+
+        assert_eq!(program, "vim");
+        assert_eq!(args, [OsString::from("config.json")]);
+    }
+
+    #[test]
+    fn reset_confirmation_accepts_only_explicit_yes() {
+        assert!(reset_confirmed("y\n"));
+        assert!(reset_confirmed("YES"));
+        assert!(!reset_confirmed(""));
+        assert!(!reset_confirmed("n"));
+    }
 }

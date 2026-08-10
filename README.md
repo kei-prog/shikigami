@@ -37,11 +37,28 @@ shi
 ```
 
 On the first interactive launch, Shikigami creates an editable `config.json`
-containing every keybinding. Print its platform-specific location with:
+containing every keybinding. Create it immediately and open it in `$VISUAL`,
+`$EDITOR`, or the platform's default text editor with:
 
 ```bash
-shi config path
+shi --config
 ```
+
+Print its platform-specific location without opening it with:
+
+```bash
+shi --config-path
+```
+
+Restore every binding to its default with:
+
+```bash
+shi --reset-config
+```
+
+When a config already exists, Shikigami asks for confirmation and preserves it
+as `config.json.backup` before resetting. Existing backups are never replaced;
+later resets use suffixes such as `.backup.2`.
 
 Bindings are grouped by stable action names and accept multiple keys:
 

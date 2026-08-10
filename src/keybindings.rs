@@ -738,8 +738,20 @@ pub struct KeyBindings {
 
 impl KeyBindings {
     pub fn load_or_create() -> Result<Self> {
-        let path = Self::config_path()?;
+        let path = Self::ensure_config_file()?;
         Self::load_or_create_at(path)
+    }
+
+    pub fn ensure_config_file() -> Result<PathBuf> {
+        let path = Self::config_path()?;
+        ensure_config_file_at(&path)?;
+        Ok(path)
+    }
+
+    pub fn reset_config_file() -> Result<(PathBuf, Option<PathBuf>)> {
+        let path = Self::config_path()?;
+        let backup = reset_config_file_at(&path)?;
+        Ok((path, backup))
     }
 
     pub fn defaults() -> Self {
@@ -786,16 +798,7 @@ impl KeyBindings {
     }
 
     fn load_or_create_at(path: PathBuf) -> Result<Self> {
-        if !path.exists() {
-            let parent = path
-                .parent()
-                .context("keybindings config path has no parent")?;
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create config directory {}", parent.display()))?;
-            let data = serde_json::to_vec_pretty(&default_config())?;
-            fs::write(&path, data)
-                .with_context(|| format!("create keybindings config {}", path.display()))?;
-        }
+        ensure_config_file_at(&path)?;
         let bytes = fs::read(&path)
             .with_context(|| format!("read keybindings config {}", path.display()))?;
         let config: ConfigFile = serde_json::from_slice(&bytes)
@@ -883,6 +886,68 @@ impl KeyBindings {
             labels,
         })
     }
+}
+
+fn ensure_config_file_at(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .context("keybindings config path has no parent")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create config directory {}", parent.display()))?;
+    let data = serde_json::to_vec_pretty(&default_config())?;
+    fs::write(path, data)
+        .with_context(|| format!("create keybindings config {}", path.display()))?;
+    Ok(())
+}
+
+fn reset_config_file_at(path: &Path) -> Result<Option<PathBuf>> {
+    let backup = if path.exists() {
+        let backup = available_backup_path(path);
+        fs::copy(path, &backup).with_context(|| {
+            format!(
+                "back up keybindings config {} to {}",
+                path.display(),
+                backup.display()
+            )
+        })?;
+        Some(backup)
+    } else {
+        None
+    };
+
+    let parent = path
+        .parent()
+        .context("keybindings config path has no parent")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create config directory {}", parent.display()))?;
+    let temporary = path.with_extension("json.tmp");
+    let data = serde_json::to_vec_pretty(&default_config())?;
+    fs::write(&temporary, data)
+        .with_context(|| format!("write default config {}", temporary.display()))?;
+    fs::rename(&temporary, path)
+        .with_context(|| format!("replace keybindings config {}", path.display()))?;
+    Ok(backup)
+}
+
+fn available_backup_path(path: &Path) -> PathBuf {
+    let mut base = path.as_os_str().to_owned();
+    base.push(".backup");
+    let base = PathBuf::from(base);
+    if !base.exists() {
+        return base;
+    }
+    for suffix in 2.. {
+        let mut candidate = base.as_os_str().to_owned();
+        candidate.push(format!(".{suffix}"));
+        let candidate = PathBuf::from(candidate);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("backup suffix range is unbounded")
 }
 
 fn validate_combined_contexts(
@@ -1081,6 +1146,60 @@ mod tests {
                 .code,
             KeyCode::Char('q')
         );
+    }
+
+    #[test]
+    fn opening_an_invalid_existing_config_does_not_replace_it() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        fs::write(&path, "needs repair").unwrap();
+
+        ensure_config_file_at(&path).unwrap();
+
+        assert_eq!(fs::read_to_string(path).unwrap(), "needs repair");
+    }
+
+    #[test]
+    fn resetting_config_backs_up_the_existing_file_and_writes_defaults() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        fs::write(&path, "custom config").unwrap();
+
+        let backup = reset_config_file_at(&path).unwrap().unwrap();
+
+        assert_eq!(backup, temp.path().join("config.json.backup"));
+        assert_eq!(fs::read_to_string(backup).unwrap(), "custom config");
+        let reset: ConfigFile = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(reset.version, CONFIG_VERSION);
+        assert_eq!(reset.keybindings["normal.quit"], ["q"]);
+    }
+
+    #[test]
+    fn resetting_config_does_not_overwrite_an_older_backup() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        fs::write(&path, "current").unwrap();
+        fs::write(temp.path().join("config.json.backup"), "older").unwrap();
+
+        let backup = reset_config_file_at(&path).unwrap().unwrap();
+
+        assert_eq!(backup, temp.path().join("config.json.backup.2"));
+        assert_eq!(fs::read_to_string(backup).unwrap(), "current");
+        assert_eq!(
+            fs::read_to_string(temp.path().join("config.json.backup")).unwrap(),
+            "older"
+        );
+    }
+
+    #[test]
+    fn resetting_a_missing_config_creates_defaults_without_a_backup() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("nested/config.json");
+
+        let backup = reset_config_file_at(&path).unwrap();
+
+        assert!(backup.is_none());
+        assert!(path.is_file());
     }
 
     #[test]
