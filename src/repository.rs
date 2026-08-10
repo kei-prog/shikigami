@@ -396,15 +396,14 @@ fn max_depth(scope: &ScanScope) -> usize {
 }
 
 fn display_name(path: &Path) -> String {
-    let parts = path
+    let mut parts = path
         .components()
         .rev()
         .take(2)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<PathBuf>();
-    parts.to_string_lossy().into_owned()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    parts.reverse();
+    parts.join("/")
 }
 
 fn load(path: &Path) -> Result<Vec<Repository>> {

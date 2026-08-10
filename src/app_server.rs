@@ -674,7 +674,7 @@ impl InstanceLock {
             .with_context(|| format!("open Shikigami instance lock {}", path.display()))?;
         match FileExt::try_lock_exclusive(&file) {
             Ok(()) => Ok(Self { _file: file }),
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+            Err(error) if lock_is_contended(&error) => {
                 bail!("Shikigami is already running")
             }
             Err(error) => {
@@ -682,6 +682,11 @@ impl InstanceLock {
             }
         }
     }
+}
+
+fn lock_is_contended(error: &std::io::Error) -> bool {
+    error.kind() == ErrorKind::WouldBlock
+        || cfg!(target_os = "windows") && error.raw_os_error() == Some(33)
 }
 
 async fn finish_task(mut task: JoinHandle<()>) {

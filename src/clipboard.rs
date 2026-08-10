@@ -154,6 +154,13 @@ pub fn pasted_image_path(pasted: &str) -> Option<PathBuf> {
     if is_supported_image(&literal_path) {
         return Some(literal_path);
     }
+    #[cfg(target_os = "windows")]
+    if unquoted == pasted {
+        let path = PathBuf::from(pasted.replace("\\ ", " "));
+        if is_supported_image(&path) {
+            return Some(path);
+        }
+    }
     let path = if unquoted == pasted {
         let mut parts = shlex::Shlex::new(pasted);
         let path = parts.next()?;
