@@ -3336,11 +3336,7 @@ fn render_chat_pane(
     let message_area = chunks[message_index];
     let help_area = chunks[message_index + 1];
     let visible_height = chat_area.height.saturating_sub(2).max(1) as usize;
-    let chat_border = if pane_active && chat.mode == ChatMode::Scroll {
-        Color::Cyan
-    } else {
-        focus_style(chat_focused).fg.unwrap_or(Color::DarkGray)
-    };
+    let chat_border = chat_border_color(chat_focused, chat.mode);
     let chat_block = Block::default()
         .title(title.as_str())
         .borders(Borders::ALL)
@@ -4938,6 +4934,14 @@ fn focus_style(focused: bool) -> Style {
     }
 }
 
+fn chat_border_color(chat_focused: bool, mode: ChatMode) -> Color {
+    if chat_focused && mode == ChatMode::Scroll {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
@@ -4945,6 +4949,14 @@ mod tests {
     use crate::app_server::AppServerEvent;
 
     use super::*;
+
+    #[test]
+    fn chat_border_is_cyan_only_while_the_chat_history_is_focused() {
+        assert_eq!(chat_border_color(true, ChatMode::Scroll), Color::Cyan);
+        assert_eq!(chat_border_color(true, ChatMode::Input), Color::DarkGray);
+        assert_eq!(chat_border_color(false, ChatMode::Scroll), Color::DarkGray);
+        assert_eq!(chat_border_color(false, ChatMode::Input), Color::DarkGray);
+    }
 
     #[test]
     fn scroll_navigation_enters_input_or_returns_to_the_repository_tree() {
