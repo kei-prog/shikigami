@@ -112,6 +112,12 @@ enum UiAction {
     ApplyThreadNames(ThreadNameApplyRequest),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChatNavigationTarget {
+    Input,
+    RepositoryTree,
+}
+
 enum BulkRenameEvent {
     Progress(BulkRenameProgress),
     Generated(std::result::Result<Vec<(String, String)>, String>),
@@ -481,6 +487,19 @@ async fn handle_key(
             handle_palette_key(app, key, server).await?;
         }
         Mode::Chat if app.chat().map(|chat| chat.mode) == Some(ChatMode::Scroll) => {
+            if let Some(target) = scroll_navigation_target(&key.code) {
+                match target {
+                    ChatNavigationTarget::Input => {
+                        if let Some(chat) = app.chat_mut() {
+                            chat.mode = ChatMode::Input;
+                        }
+                    }
+                    ChatNavigationTarget::RepositoryTree => {
+                        return_to_repository_tree(app, server).await;
+                    }
+                }
+                return Ok(None);
+            }
             match key.code {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     interrupt_chat(app, server).await?;
@@ -568,11 +587,6 @@ async fn handle_key(
                         chat.scroll_to_bottom();
                     }
                 }
-                KeyCode::Char('i') | KeyCode::Enter | KeyCode::Tab | KeyCode::Esc => {
-                    if let Some(chat) = app.chat_mut() {
-                        chat.mode = ChatMode::Input;
-                    }
-                }
                 _ => {}
             }
         }
@@ -583,11 +597,7 @@ async fn handle_key(
                 }
             }
             KeyCode::Esc => {
-                if let Err(error) = cleanup_unused_main_chat(app, server).await {
-                    app.message = Some(format!("Could not remove unused thread: {error}"));
-                }
-                app.mode = Mode::Normal;
-                app.focus = Focus::Navigation;
+                return_to_repository_tree(app, server).await;
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 interrupt_chat(app, server).await?;
@@ -1097,7 +1107,19 @@ async fn handle_key(
             KeyCode::Char('/') => app.open_thread_picker(),
             KeyCode::Esc if app.selected_tree_is_thread() => app.select_parent_repository(),
             KeyCode::Char('h') | KeyCode::Left => app.collapse_selected_repository(),
-            KeyCode::Char('l') | KeyCode::Right => app.expand_selected_repository(),
+            KeyCode::Char('l') | KeyCode::Right if app.selected_tree_is_repository() => {
+                app.expand_selected_repository();
+            }
+            _ if app.selected_tree_is_thread()
+                && !app.show_archived
+                && selected_thread_entry_mode(&key.code).is_some() =>
+            {
+                cancel_chat_preview(preview_generation, preview_task);
+                let mode = selected_thread_entry_mode(&key.code).expect("guarded above");
+                if let Err(error) = focus_selected_chat_in_mode(app, server, mode).await {
+                    app.message = Some(format!("Could not open thread: {error}"));
+                }
+            }
             KeyCode::Char('H') => app.collapse_all_repositories(),
             KeyCode::Char('L') => app.expand_all_repositories(),
             KeyCode::Tab if app.chat().is_some() => {
@@ -1190,16 +1212,36 @@ async fn handle_key(
             KeyCode::Enter if app.selected_tree_is_repository() => {
                 app.toggle_selected_repository();
             }
-            KeyCode::Enter if app.selected_tree_is_thread() && !app.show_archived => {
-                cancel_chat_preview(preview_generation, preview_task);
-                if let Err(error) = focus_selected_chat(app, server).await {
-                    app.message = Some(format!("Could not open thread: {error}"));
-                }
-            }
             _ => {}
         },
     }
     Ok(action)
+}
+
+fn scroll_navigation_target(code: &KeyCode) -> Option<ChatNavigationTarget> {
+    match code {
+        KeyCode::Char('i') | KeyCode::Enter | KeyCode::Tab => Some(ChatNavigationTarget::Input),
+        KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => {
+            Some(ChatNavigationTarget::RepositoryTree)
+        }
+        _ => None,
+    }
+}
+
+fn selected_thread_entry_mode(code: &KeyCode) -> Option<ChatMode> {
+    match code {
+        KeyCode::Char('l') | KeyCode::Right => Some(ChatMode::Scroll),
+        KeyCode::Char('i') | KeyCode::Enter => Some(ChatMode::Input),
+        _ => None,
+    }
+}
+
+async fn return_to_repository_tree(app: &mut App, server: &Arc<AppServer>) {
+    if let Err(error) = cleanup_unused_main_chat(app, server).await {
+        app.message = Some(format!("Could not remove unused thread: {error}"));
+    }
+    app.mode = Mode::Normal;
+    app.focus = Focus::Navigation;
 }
 
 fn handle_paste(app: &mut App, pasted: String) {
@@ -2700,6 +2742,21 @@ async fn focus_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result<(
     Ok(())
 }
 
+async fn focus_selected_chat_in_mode(
+    app: &mut App,
+    server: &Arc<AppServer>,
+    mode: ChatMode,
+) -> Result<()> {
+    focus_selected_chat(app, server).await?;
+    if let Some(chat) = app.chat_mut() {
+        match mode {
+            ChatMode::Input => chat.mode = ChatMode::Input,
+            ChatMode::Scroll => chat.enter_scroll_mode(),
+        }
+    }
+    Ok(())
+}
+
 async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     let Some(chat) = app.chat() else {
         return Ok(());
@@ -3117,11 +3174,11 @@ fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
 
     let default_status = if app.attention_count() > 0 {
         format!(
-            "! attention ({}) · j/k move/preview · Enter focus · / search · n new · q quit",
+            "! attention ({}) · j/k move/preview · l messages · i input · / search · n new · q quit",
             app.attention_count()
         )
     } else {
-        "? help · j/k move/preview · h/l one · H/L all · Enter focus · / search · n new · q quit"
+        "? help · j/k move/preview · h/l tree/messages · i input · H/L all · / search · n new · q quit"
             .into()
     };
     let status = app.message.as_deref().unwrap_or(&default_status);
@@ -3422,10 +3479,12 @@ fn chat_help(read_only: bool, mode: ChatMode, has_side_chat: bool, active_turn: 
                 if active_turn { "steer" } else { "send" }
             ),
             (ChatMode::Scroll, true) => {
-                "SCROLL · j/k line · J/K msg · e editor cmd · y copy · i input".into()
+                "SCROLL · j/k line · J/K msg · e editor cmd · y copy · i input · h/Esc threads"
+                    .into()
             }
             (ChatMode::Scroll, false) => {
-                "SCROLL · j/k line · J/K msg · e editor cmd · y/Y copy · u/d half · i input".into()
+                "SCROLL · j/k line · J/K msg · e editor cmd · y/Y copy · u/d half · i input · h/Esc threads"
+                    .into()
             }
         }
     };
@@ -4811,9 +4870,9 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect, app: &App) {
-    let popup = centered_rect(72, 34, area);
+    let popup = centered_rect(72, 35, area);
     let help = format!(
-        "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nH / L        collapse / expand all repositories\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n/permissions choose Auto or Dangerous execution\nR            open thread-name actions\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / delete archived thread\nr            reload repositories and names\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {}\nPress any key to close",
+        "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / return from messages\nl / →        expand repository / focus selected thread messages\ni            focus selected thread input / switch from messages to input\nH / L        collapse / expand all repositories\nEnter        expand/focus input / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n/permissions choose Auto or Dangerous execution\nR            open thread-name actions\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / delete archived thread\nr            reload repositories and names\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {}\nPress any key to close",
         execution_status(app.execution_mode)
     );
     frame.render_widget(Clear, popup);
@@ -4880,6 +4939,34 @@ mod tests {
     use crate::app_server::AppServerEvent;
 
     use super::*;
+
+    #[test]
+    fn scroll_navigation_enters_input_or_returns_to_the_repository_tree() {
+        for code in [KeyCode::Char('i'), KeyCode::Enter, KeyCode::Tab] {
+            assert_eq!(
+                scroll_navigation_target(&code),
+                Some(ChatNavigationTarget::Input)
+            );
+        }
+        for code in [KeyCode::Esc, KeyCode::Char('h'), KeyCode::Left] {
+            assert_eq!(
+                scroll_navigation_target(&code),
+                Some(ChatNavigationTarget::RepositoryTree)
+            );
+        }
+        assert_eq!(scroll_navigation_target(&KeyCode::Char('j')), None);
+    }
+
+    #[test]
+    fn selected_thread_keys_choose_messages_or_input() {
+        for code in [KeyCode::Char('l'), KeyCode::Right] {
+            assert_eq!(selected_thread_entry_mode(&code), Some(ChatMode::Scroll));
+        }
+        for code in [KeyCode::Char('i'), KeyCode::Enter] {
+            assert_eq!(selected_thread_entry_mode(&code), Some(ChatMode::Input));
+        }
+        assert_eq!(selected_thread_entry_mode(&KeyCode::Char('j')), None);
+    }
 
     #[tokio::test]
     async fn clipboard_image_paste_does_not_wait_for_image_extraction() {

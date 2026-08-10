@@ -43,9 +43,10 @@ home-directory scan, or `b` to choose another folder or repository. The main
 screen only shows repositories you register.
 
 - `j` / `k`: move through the repository tree and preview the selected thread
-- `h` / `l`: collapse or expand the selected repository
+- `h` / `l`: collapse or expand a repository; `l` focuses a selected thread's messages
 - `H` / `L`: collapse or expand all repositories
 - `Enter`: expand a repository or focus the selected thread's chat input
+- `i`: focus the selected thread's chat input directly
 - `Tab`: focus the open chat
 - `Esc`: select the parent repository or return from chat to the tree
 - `/`: fuzzy-search active threads from the repository tree
@@ -188,9 +189,10 @@ turn, including periods without incoming App Server events.
 
 Chat starts in input mode. Press `Tab` for scroll mode, then use `j` / `k` for
 one line, `u` / `d` for half a page, `PageUp` / `PageDown` for a full
-page, and `g` / `G` for the beginning or latest message. `i`, `Enter`, `Tab`, or
-`Esc` returns to input mode. In input mode, `Ctrl-u` clears the composer and
-`Esc` returns focus to the repository tree. `Shift-Enter` inserts a newline;
+page, and `g` / `G` for the beginning or latest message. `i`, `Enter`, or `Tab`
+return to input mode. Press `h`, `Left`, or `Esc` in scroll mode to return to
+the repository tree. In input mode, `Ctrl-u` clears the composer and `Esc`
+returns focus to the repository tree. `Shift-Enter` inserts a newline;
 the arrow keys move the input cursor, while `Home` / `End` and `Ctrl-a` /
 `Ctrl-e` move to the start or end of the current input line. Press `Ctrl-c` in
 either mode to stop the current response. While a response is streaming, type
