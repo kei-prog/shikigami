@@ -12,7 +12,13 @@ uses Codex App Server, and only lists threads created through Shikigami.
 
 ## Install
 
-Install directly from GitHub:
+Install the latest stable release from GitHub:
+
+```bash
+cargo install --git https://github.com/kei-prog/shikigami --tag v0.1.0
+```
+
+To try the latest development version from `main` instead:
 
 ```bash
 cargo install --git https://github.com/kei-prog/shikigami
