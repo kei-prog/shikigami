@@ -83,12 +83,13 @@ chat focus and interrupt bindings are fully replaceable.
 The `?` help screen displays the active bindings and config path.
 
 Shikigami opens with a `General` area for one-off chats. On the first launch it
-opens the repository picker and scans the home directory in the background;
-results are cached for later launches. Whenever no Git repository is registered,
-the picker opens automatically. Add more repositories with `a`, use `r` to
-rescan saved projects folders, `s` to scan the home directory again, or `b` to
-choose another folder or repository. The main screen only shows repositories
-you register.
+opens the repository picker and discovers repositories from `ghq` and saved
+projects folders in the background; if neither is available, it falls back to a
+home-directory scan. Results are cached for later launches. Whenever no Git
+repository is registered, the picker opens automatically. Add more repositories
+with `a`, use `r` to rescan `ghq` and saved projects folders, `s` to explicitly
+scan the home directory, or `b` to choose another folder or repository. The main
+screen only shows repositories you register.
 
 - `j` / `k`: move through the thread tree and preview the selected thread
 - `h` / `l`: collapse or expand a repository; `l` focuses a selected thread's messages

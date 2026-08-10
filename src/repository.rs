@@ -222,7 +222,13 @@ pub fn start_scan(scope: ScanScope) -> Receiver<ScanEvent> {
     thread::spawn(move || {
         let mut seen = HashSet::new();
         let max_depth = max_depth(&scope);
+        let ghq_root = ghq_root();
         for root in scan_roots(scope) {
+            if ghq_root.as_ref().is_some_and(|ghq_root| ghq_root == &root)
+                && scan_ghq(&sender, &mut seen)
+            {
+                continue;
+            }
             walk(&root, 0, max_depth, &sender, &mut seen);
         }
         let _ = sender.send(ScanEvent::Finished);
@@ -255,17 +261,67 @@ pub fn repository_at(path: &Path) -> Result<Repository> {
 }
 
 pub fn detected_search_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
+    ghq_root().into_iter().collect()
+}
+
+fn ghq_root() -> Option<PathBuf> {
     if let Ok(output) = Command::new("ghq").arg("root").output()
         && output.status.success()
         && let Ok(root) = String::from_utf8(output.stdout)
     {
         let root = PathBuf::from(root.trim());
         if root.is_dir() {
-            roots.push(root);
+            return Some(root);
         }
     }
-    roots
+    None
+}
+
+fn scan_ghq(sender: &Sender<ScanEvent>, seen: &mut HashSet<PathBuf>) -> bool {
+    let Ok(output) = Command::new("ghq").args(["list", "--full-path"]).output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        return false;
+    };
+    let paths = stdout.lines().map(PathBuf::from).collect::<Vec<_>>();
+
+    // Primary repositories require no Git subprocess and become visible first.
+    for path in paths.iter().filter(|path| path.join(".git").is_dir()) {
+        if let Ok(repository) = primary_repository(path) {
+            send_repository(repository, sender, seen);
+        }
+    }
+    // Resolve linked worktrees afterward; their primary repositories are usually already seen.
+    for path in paths.iter().filter(|path| path.join(".git").is_file()) {
+        if let Ok(repository) = repository_at(path) {
+            send_repository(repository, sender, seen);
+        }
+    }
+    true
+}
+
+fn primary_repository(path: &Path) -> Result<Repository> {
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("resolve repository path {}", path.display()))?;
+    Ok(Repository {
+        name: display_name(&path),
+        path,
+    })
+}
+
+fn send_repository(
+    repository: Repository,
+    sender: &Sender<ScanEvent>,
+    seen: &mut HashSet<PathBuf>,
+) {
+    if seen.insert(repository.path.clone()) {
+        let _ = sender.send(ScanEvent::Found(repository));
+    }
 }
 
 fn scan_roots(scope: ScanScope) -> Vec<PathBuf> {
@@ -289,10 +345,8 @@ fn walk(
         return;
     }
     if path.join(".git").exists() {
-        if let Ok(repository) = repository_at(path)
-            && seen.insert(repository.path.clone())
-        {
-            let _ = sender.send(ScanEvent::Found(repository));
+        if let Ok(repository) = repository_at(path) {
+            send_repository(repository, sender, seen);
         }
         return;
     }
@@ -533,5 +587,17 @@ mod tests {
         assert!(should_skip(Path::new("/tmp/project/node_modules")));
         assert!(should_skip(Path::new("/Users/someone/Library")));
         assert!(!should_skip(Path::new("/Users/someone/Projects")));
+    }
+
+    #[test]
+    fn recognizes_primary_ghq_repository_without_running_git() {
+        let temp = tempdir().unwrap();
+        let repository_path = temp.path().join("owner").join("repo");
+        fs::create_dir_all(repository_path.join(".git")).unwrap();
+
+        let repository = primary_repository(&repository_path).unwrap();
+
+        assert_eq!(repository.name, "owner/repo");
+        assert_eq!(repository.path, repository_path.canonicalize().unwrap());
     }
 }

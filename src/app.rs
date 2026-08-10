@@ -538,7 +538,9 @@ impl App {
         if app.repositories.is_empty() {
             app.open_repository_add();
             if initial_home_scan_is_pending {
-                app.start_home_scan();
+                if app.start_root_scan().is_err() {
+                    app.start_home_scan();
+                }
                 app.initial_home_scan_in_progress = true;
             }
         }
