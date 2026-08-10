@@ -407,6 +407,8 @@ mod tests {
         let second = temp.path().join("second");
         fs::create_dir(&first).unwrap();
         fs::create_dir(&second).unwrap();
+        let first = first.canonicalize().unwrap();
+        let second = second.canonicalize().unwrap();
         let store = RepositoryStore::at(temp.path());
 
         assert!(store.load_search_roots().unwrap().is_empty());

@@ -114,12 +114,13 @@ written over the terminal interface.
 Thread names are owned by Codex App Server, not Shikigami's local registry.
 Renaming uses `thread/name/set`; `thread/name/updated` refreshes the repository
 tree, thread picker and search, visible or side chat titles, attention entries,
-and archived/restored views from one in-memory value. Names are also read from
-Codex on startup and reload by merging independently paginated active and archived
-workspace-filtered `thread/list` results, and from `thread/read` when a thread is
-fully opened, so changes made by another client cannot leave the local registry
-as a competing source. Both lists use the state database without rollout scans.
-The rename dialog
+and archived/restored views from one in-memory value. Shikigami caches the last
+observed display titles separately so they appear immediately on the next launch,
+then reconciles only its registered thread IDs with bounded concurrent
+`thread/read` requests. Live App Server values always replace cached values, and
+the cache is never written back to Codex. Opening a thread also reads its current
+name, so changes made by another client cannot leave the cache as a competing
+source. The rename dialog
 trims outer whitespace, rejects empty names, and limits input to 100 displayed
 characters to keep the TUI compact. A failed App Server request leaves the old
 name and the rename input intact. Archived threads must be restored before they
