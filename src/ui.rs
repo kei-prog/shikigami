@@ -728,11 +728,9 @@ async fn handle_key(
                     app.message = Some(image_not_supported_message(app));
                 } else if clipboard_image_paste_pending {
                     app.message = Some(CLIPBOARD_IMAGE_ALREADY_PASTING_MESSAGE.into());
-                } else {
-                    if let Some(thread_id) = app.chat().map(|chat| chat.thread_id.clone()) {
-                        app.message = Some(PASTING_CLIPBOARD_IMAGE_MESSAGE.into());
-                        action = Some(UiAction::PasteClipboardImage { thread_id });
-                    }
+                } else if let Some(thread_id) = app.chat().map(|chat| chat.thread_id.clone()) {
+                    app.message = Some(PASTING_CLIPBOARD_IMAGE_MESSAGE.into());
+                    action = Some(UiAction::PasteClipboardImage { thread_id });
                 }
             }
             KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
