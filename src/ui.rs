@@ -917,11 +917,13 @@ async fn handle_key(
                         Ok(request) => action = Some(UiAction::GenerateThreadNames(request)),
                         Err(error) => app.message = Some(error.to_string()),
                     },
-                    KeyCode::Enter => {
-                        if let Err(error) = app.confirm_bulk_thread_rename() {
-                            app.message = Some(error.to_string());
+                    KeyCode::Enter => match app.submit_bulk_thread_rename() {
+                        Ok(Some(request)) => {
+                            action = Some(UiAction::ApplyThreadNames(request));
                         }
-                    }
+                        Ok(None) => {}
+                        Err(error) => app.message = Some(error.to_string()),
+                    },
                     _ => {}
                 },
                 Some(BulkRenamePhase::Editing) => match key.code {

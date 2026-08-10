@@ -201,9 +201,10 @@ Pressing `R` in the repository tree or thread picker always opens the same expli
 action menu: manually rename the selected thread, suggest a name for that thread,
 suggest names in its repository, or suggest names for all active threads. Unavailable
 actions remain visible but disabled. A selected-thread suggestion starts immediately
-and opens a one-item review; the two broader suggestion actions first open a
-multi-select list of active threads. The all-threads scope includes each group name in
-its rows. After
+and opens a one-item review, where applying the reviewed name renames it without a
+second confirmation. The two broader suggestion actions first open a multi-select
+list of active threads and retain an apply confirmation. The all-threads scope
+includes each group name in its rows. After
 choosing the target threads, Shikigami reads only their recent conversation content
 and asks a temporary read-only Codex thread to propose concise names. Each proposal
 follows the natural language used by the user in that conversation while preserving

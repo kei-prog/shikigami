@@ -215,6 +215,7 @@ pub struct BulkRenameState {
     pub scope_name: String,
     pub repository_path: PathBuf,
     pub show_repository_names: bool,
+    pub requires_apply_confirmation: bool,
     pub return_mode: Mode,
     pub candidates: Vec<BulkRenameCandidate>,
     pub index: usize,
@@ -2916,6 +2917,7 @@ impl App {
             scope_name: "Selected thread".into(),
             repository_path: workspace_path,
             show_repository_names: false,
+            requires_apply_confirmation: false,
             return_mode: action_state.return_mode,
             candidates: vec![candidate],
             index: 0,
@@ -3002,6 +3004,7 @@ impl App {
             scope_name,
             repository_path: workspace_path,
             show_repository_names: all_repositories,
+            requires_apply_confirmation: true,
             return_mode: action_state.return_mode,
             candidates,
             index: 0,
@@ -3222,6 +3225,20 @@ impl App {
         );
         state.phase = BulkRenamePhase::ConfirmApply;
         Ok(())
+    }
+
+    pub fn submit_bulk_thread_rename(&mut self) -> Result<Option<ThreadNameApplyRequest>> {
+        let requires_confirmation = self
+            .bulk_rename
+            .as_ref()
+            .context("bulk rename is not open")?
+            .requires_apply_confirmation;
+        if requires_confirmation {
+            self.confirm_bulk_thread_rename()?;
+            Ok(None)
+        } else {
+            self.begin_bulk_thread_rename_apply().map(Some)
+        }
     }
 
     pub fn begin_bulk_thread_rename_apply(&mut self) -> Result<ThreadNameApplyRequest> {
