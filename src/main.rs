@@ -3,6 +3,7 @@ pub mod app_server;
 mod chat;
 mod clipboard;
 mod git_workspace;
+mod keybindings;
 mod paths;
 mod registry;
 mod repository;
@@ -28,12 +29,23 @@ enum Command {
         #[command(subcommand)]
         command: RepoCommand,
     },
+    /// Inspect user-editable configuration
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum RepoCommand {
     /// List repositories registered with Shikigami
     List,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Print the keybindings configuration path
+    Path,
 }
 
 #[tokio::main]
@@ -45,8 +57,16 @@ async fn main() -> Result<()> {
             ui::run(App::load()?).await?
         }
         Some(Command::Repo { command }) => run_repo_command(command)?,
+        Some(Command::Config { command }) => run_config_command(command)?,
     }
 
+    Ok(())
+}
+
+fn run_config_command(command: ConfigCommand) -> Result<()> {
+    match command {
+        ConfigCommand::Path => println!("{}", keybindings::KeyBindings::config_path()?.display()),
+    }
     Ok(())
 }
 

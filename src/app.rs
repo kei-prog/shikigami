@@ -16,6 +16,7 @@ use crate::{
     app_server::{AppServerEvent, AppServerRequest, ModelMetadata},
     chat::{ChatState, CommandPalette, fuzzy_score},
     git_workspace::{self, Workspace},
+    keybindings::KeyBindings,
     paths,
     registry::{
         AttentionRegistry, PersistentAttentionKind, Registry, SideChatRegistry, ThreadRecord,
@@ -302,6 +303,7 @@ pub struct App {
     pub reasoning_effort_index: usize,
     pub reasoning_effort_returns_to_model: bool,
     pub execution_mode: ExecutionMode,
+    pub keybindings: KeyBindings,
     pub permission_index: usize,
     thread_names: HashMap<String, Option<String>>,
     // Cached titles are displayed immediately but do not become authoritative until observed live.
@@ -325,6 +327,15 @@ impl App {
             Err(error) => (
                 ExecutionMode::Auto,
                 Some(format!("Could not load settings; using Auto: {error}")),
+            ),
+        };
+        let (keybindings, keybindings_error) = match KeyBindings::load_or_create() {
+            Ok(keybindings) => (keybindings, None),
+            Err(error) => (
+                KeyBindings::defaults(),
+                Some(format!(
+                    "Could not load keybindings; using defaults: {error}"
+                )),
             ),
         };
         let thread_registry = Registry::discover()?;
@@ -379,11 +390,16 @@ impl App {
                     Some(format!("Could not load repository view state: {error}")),
                 ),
             };
-        let startup_message = [ui_state_error, settings_error, thread_title_cache_error]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join("; ");
+        let startup_message = [
+            ui_state_error,
+            settings_error,
+            keybindings_error,
+            thread_title_cache_error,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("; ");
         let mut app = Self {
             repositories,
             threads: Vec::new(),
@@ -443,6 +459,7 @@ impl App {
             reasoning_effort_index: 0,
             reasoning_effort_returns_to_model: false,
             execution_mode,
+            keybindings,
             permission_index: usize::from(execution_mode == ExecutionMode::Dangerous),
             thread_names,
             confirmed_thread_names: HashSet::new(),

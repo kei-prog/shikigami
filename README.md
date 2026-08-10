@@ -36,6 +36,35 @@ cargo install --path .
 shi
 ```
 
+On the first interactive launch, Shikigami creates an editable `config.json`
+containing every keybinding. Print its platform-specific location with:
+
+```bash
+shi config path
+```
+
+Bindings are grouped by stable action names and accept multiple keys:
+
+```json
+{
+  "version": 1,
+  "keybindings": {
+    "normal.quit": ["ctrl+q"],
+    "normal.up": ["up", "k"],
+    "chat_input.submit": ["enter"]
+  }
+}
+```
+
+Named keys such as `enter`, `esc`, `space`, `backspace`, arrows, `pageup`,
+`pagedown`, and `f1` can be combined with `ctrl`, `alt`, or `shift`. Restart
+Shikigami after editing the file. Missing actions keep their built-in defaults,
+so older configs remain compatible when new commands are added. An invalid file
+or conflicting key in the same mode falls back to the full default keymap and
+shows the error in the TUI. `Esc` remains an emergency way out of dialogs and
+`Ctrl-c` remains an interrupt fallback even when extra bindings are configured.
+The `?` help screen displays the active bindings and config path.
+
 Shikigami opens with a `General` area for one-off chats, even when no Git
 repository is registered. Add repositories with `a`. Projects folders are saved
 and scanned only when you request it, and scan results are cached. Use `r` to

@@ -51,6 +51,7 @@ use crate::{
     chat::{ChatMode, ChatState, CommandPalette, EditorTarget, PaletteCommand, PaletteEntry},
     clipboard,
     git_workspace::{self, Workspace},
+    keybindings::{KeyBindings, KeyContext},
     registry::{ThreadRecord, ThreadScope},
     settings::ExecutionMode,
 };
@@ -442,6 +443,8 @@ async fn handle_key(
     if app.thread_deletion.is_some() {
         return Ok(None);
     }
+    let contexts = key_contexts(app);
+    let key = app.keybindings.resolve(&contexts, key);
     if app.mode == Mode::Chat && app.focus == Focus::Chat && app.active_chat_has_pending_approval()
     {
         match key.code {
@@ -1099,9 +1102,14 @@ async fn handle_key(
                     Err(error) => error.to_string(),
                 });
             }
-            _ => app.mode = Mode::Normal,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.mode = Mode::Normal,
+            _ => {}
         },
-        Mode::Help => app.mode = Mode::Normal,
+        Mode::Help => {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | '?')) {
+                app.mode = Mode::Normal;
+            }
+        }
         Mode::Normal => match key.code {
             KeyCode::Char('q') => request_quit(app),
             KeyCode::Char('?') => app.mode = Mode::Help,
@@ -1240,6 +1248,79 @@ async fn handle_key(
         },
     }
     Ok(action)
+}
+
+fn key_contexts(app: &App) -> [KeyContext; 2] {
+    if app.mode == Mode::Chat && app.focus == Focus::Chat && app.active_chat_has_pending_approval()
+    {
+        return [KeyContext::ApprovalChat, KeyContext::Inactive];
+    }
+    if let Some(palette) = app.command_palette.as_ref() {
+        return [
+            if palette.query.is_empty() {
+                KeyContext::ChatPaletteEmpty
+            } else {
+                KeyContext::ChatPaletteQuery
+            },
+            KeyContext::Inactive,
+        ];
+    }
+    let context = match app.mode {
+        Mode::Chat if app.chat().map(|chat| chat.mode) == Some(ChatMode::Scroll) => {
+            KeyContext::ChatScroll
+        }
+        Mode::Chat => {
+            if app.chat().is_some_and(|chat| chat.composer.is_empty()) {
+                KeyContext::ChatInputEmpty
+            } else {
+                KeyContext::ChatInput
+            }
+        }
+        Mode::ChooseModel => KeyContext::ChooseModel,
+        Mode::ChooseReasoningEffort => KeyContext::ChooseReasoning,
+        Mode::ChoosePermissions => KeyContext::ChoosePermissions,
+        Mode::ConfirmDangerous => KeyContext::ConfirmDangerous,
+        Mode::ChooseSideChat => KeyContext::ChooseSideChat,
+        Mode::ChooseThread => {
+            if app.thread_picker_query.is_empty() {
+                KeyContext::ChooseThreadEmpty
+            } else {
+                KeyContext::ChooseThreadQuery
+            }
+        }
+        Mode::ChooseRenameAction => KeyContext::ChooseRenameAction,
+        Mode::RenameThread => KeyContext::RenameThread,
+        Mode::BulkRenameThreads => match app.bulk_rename.as_ref().map(|state| state.phase) {
+            Some(BulkRenamePhase::Select) => KeyContext::BulkRenameSelect,
+            Some(BulkRenamePhase::Review) => KeyContext::BulkRenameReview,
+            Some(BulkRenamePhase::Editing) => KeyContext::BulkRenameEdit,
+            Some(BulkRenamePhase::ConfirmApply) => KeyContext::BulkRenameConfirm,
+            _ => KeyContext::Inactive,
+        },
+        Mode::Attention => KeyContext::Attention,
+        Mode::ConfirmQuit => KeyContext::ConfirmQuit,
+        Mode::Approval => KeyContext::Approval,
+        Mode::AddRepositories => KeyContext::AddRepositories,
+        Mode::FilterRepositories => KeyContext::FilterRepositories,
+        Mode::BrowseDirectory => KeyContext::BrowseDirectory,
+        Mode::ChooseThreadTarget => KeyContext::ChooseThreadTarget,
+        Mode::ChooseExistingWorktree => KeyContext::ChooseExistingWorktree,
+        Mode::ConfirmDeleteThread => KeyContext::ConfirmDeleteThread,
+        Mode::ConfirmRemoveRepository => KeyContext::ConfirmRemoveRepository,
+        Mode::Help => KeyContext::Help,
+        Mode::Normal => {
+            let specific = if app.selected_tree_is_repository() {
+                KeyContext::NormalRepository
+            } else if app.selected_tree_is_thread() {
+                KeyContext::NormalThread
+            } else {
+                KeyContext::Inactive
+            };
+            return [specific, KeyContext::Normal];
+        }
+        Mode::DeletingThread => KeyContext::Inactive,
+    };
+    [context, KeyContext::Inactive]
 }
 
 fn scroll_navigation_target(code: &KeyCode) -> Option<ChatNavigationTarget> {
@@ -3220,12 +3301,34 @@ fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
 
     let default_status = if app.attention_count() > 0 {
         format!(
-            "! attention ({}) · j/k move/preview · l messages · i input · f filter · / commands · n new · q quit",
-            app.attention_count()
+            "{} attention ({}) · {} / {} move · {} messages · {} input · {} filter · {} commands · {} new · {} quit",
+            app.keybindings.label("normal.attention"),
+            app.attention_count(),
+            app.keybindings.label("normal.up"),
+            app.keybindings.label("normal.down"),
+            app.keybindings.label("normal.thread.open_scroll"),
+            app.keybindings.label("normal.thread.open_input"),
+            app.keybindings.label("normal.find_thread"),
+            app.keybindings.label("normal.palette"),
+            app.keybindings.label("normal.new_thread"),
+            app.keybindings.label("normal.quit"),
         )
     } else {
-        "? help · j/k move/preview · h/l tree/messages · i input · H/L all · f filter · / commands · n new · q quit"
-            .into()
+        format!(
+            "{} help · {} / {} move · {} / {} tree · {} input · {} / {} all · {} filter · {} commands · {} new · {} quit",
+            app.keybindings.label("normal.help"),
+            app.keybindings.label("normal.up"),
+            app.keybindings.label("normal.down"),
+            app.keybindings.label("normal.repository.collapse"),
+            app.keybindings.label("normal.thread.open_scroll"),
+            app.keybindings.label("normal.thread.open_input"),
+            app.keybindings.label("normal.collapse_all"),
+            app.keybindings.label("normal.expand_all"),
+            app.keybindings.label("normal.find_thread"),
+            app.keybindings.label("normal.palette"),
+            app.keybindings.label("normal.new_thread"),
+            app.keybindings.label("normal.quit"),
+        )
     };
     let status = app.message.as_deref().unwrap_or(&default_status);
     frame.render_widget(
@@ -3244,7 +3347,7 @@ fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
         Mode::ChooseModel => render_model_picker(frame, area, app),
         Mode::ChooseReasoningEffort => render_reasoning_effort_picker(frame, area, app),
         Mode::ChoosePermissions => render_permissions_picker(frame, area, app),
-        Mode::ConfirmDangerous => render_dangerous_confirm(frame, area),
+        Mode::ConfirmDangerous => render_dangerous_confirm(frame, area, app),
         Mode::ChooseSideChat => render_side_chat_picker(frame, area, app),
         Mode::ChooseThread => render_thread_picker(frame, area, app),
         Mode::ChooseRenameAction => render_rename_actions(frame, area, app),
@@ -3259,7 +3362,15 @@ fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
         && let Some(request) = app.unscoped_pending_approval()
     {
         let prompt = approval_prompt("Codex", request);
-        render_approval(frame, area, &prompt, app.approval_index, true);
+        render_approval(
+            frame,
+            area,
+            &prompt,
+            app.approval_index,
+            true,
+            app,
+            "approval",
+        );
     } else if let Some(prompt) = active_approval_prompt(app) {
         let popup_area = active_chat_pane_area(panes[1], app);
         render_approval(
@@ -3268,13 +3379,15 @@ fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
             &prompt,
             app.approval_index,
             app.mode == Mode::Chat && app.focus == Focus::Chat,
+            app,
+            "approval_chat",
         );
     }
     if app.thread_deletion.is_some() && app.mode != Mode::DeletingThread {
         render_thread_deletion_progress(frame, area, app);
     }
     if let Some(palette) = &app.command_palette {
-        render_command_palette(frame, area, palette);
+        render_command_palette(frame, area, palette, app);
     }
 }
 
@@ -3443,6 +3556,7 @@ fn render_chat_pane(
             pending_steers,
             stopping,
             attachment_count,
+            &app.keybindings,
         ))
         .borders(Borders::ALL)
         .padding(Padding::right(1))
@@ -3499,6 +3613,7 @@ fn render_chat_pane(
         chat.mode,
         has_side_chat,
         chat.active_turn_id.is_some(),
+        &app.keybindings,
     );
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
@@ -3506,31 +3621,76 @@ fn render_chat_pane(
     );
 }
 
-fn chat_help(read_only: bool, mode: ChatMode, has_side_chat: bool, active_turn: bool) -> String {
+fn chat_help(
+    read_only: bool,
+    mode: ChatMode,
+    has_side_chat: bool,
+    active_turn: bool,
+    keybindings: &KeyBindings,
+) -> String {
     let controls = if read_only {
-        "READ ONLY · / palette · /threads retry · Tab scroll · Esc threads".into()
+        format!(
+            "READ ONLY · {} palette · /threads retry · {} scroll · {} threads",
+            keybindings.label("chat_input.palette"),
+            keybindings.label("chat_input.scroll"),
+            keybindings.label("chat_input.focus_tree"),
+        )
     } else {
         match (mode, has_side_chat) {
             (ChatMode::Input, true) => format!(
-                "INPUT · Ctrl-V image · Shift-Enter newline · Ctrl-G pane · Ctrl-N/P side · Enter {}",
+                "INPUT · {} image · {} newline · {} pane · {} / {} side · {} {}",
+                keybindings.label("chat_input.paste_image"),
+                keybindings.label("chat_input.newline"),
+                keybindings.label("chat_input.toggle_pane"),
+                keybindings.label("chat_input.next_chat"),
+                keybindings.label("chat_input.previous_chat"),
+                keybindings.label("chat_input.submit"),
                 if active_turn { "steer" } else { "send" }
             ),
             (ChatMode::Input, false) => format!(
-                "INPUT · Ctrl-V image · Shift-Enter newline · Enter {} · / palette · Ctrl-R effort · Ctrl-U clear · Tab scroll · Esc threads",
-                if active_turn { "steer" } else { "send" }
+                "INPUT · {} image · {} newline · {} {} · {} palette · {} effort · {} clear · {} scroll · {} threads",
+                keybindings.label("chat_input.paste_image"),
+                keybindings.label("chat_input.newline"),
+                keybindings.label("chat_input.submit"),
+                if active_turn { "steer" } else { "send" },
+                keybindings.label("chat_input.palette"),
+                keybindings.label("chat_input.reasoning"),
+                keybindings.label("chat_input.clear"),
+                keybindings.label("chat_input.scroll"),
+                keybindings.label("chat_input.focus_tree"),
             ),
-            (ChatMode::Scroll, true) => {
-                "SCROLL · j/k line · J/K msg · e editor cmd · y copy · i input · h/Esc threads"
-                    .into()
-            }
-            (ChatMode::Scroll, false) => {
-                "SCROLL · j/k line · J/K msg · e editor cmd · y/Y copy · u/d half · i input · h/Esc threads"
-                    .into()
-            }
+            (ChatMode::Scroll, true) => format!(
+                "SCROLL · {} / {} line · {} / {} msg · {} editor cmd · {} copy · {} input · {} threads",
+                keybindings.label("chat_scroll.line_up"),
+                keybindings.label("chat_scroll.line_down"),
+                keybindings.label("chat_scroll.previous_message"),
+                keybindings.label("chat_scroll.next_message"),
+                keybindings.label("chat_scroll.copy_editor_command"),
+                keybindings.label("chat_scroll.copy_message"),
+                keybindings.label("chat_scroll.focus_input"),
+                keybindings.label("chat_scroll.focus_tree"),
+            ),
+            (ChatMode::Scroll, false) => format!(
+                "SCROLL · {} / {} line · {} / {} msg · {} editor cmd · {} / {} copy · {} / {} half · {} input · {} threads",
+                keybindings.label("chat_scroll.line_up"),
+                keybindings.label("chat_scroll.line_down"),
+                keybindings.label("chat_scroll.previous_message"),
+                keybindings.label("chat_scroll.next_message"),
+                keybindings.label("chat_scroll.copy_editor_command"),
+                keybindings.label("chat_scroll.copy_message"),
+                keybindings.label("chat_scroll.copy_conversation"),
+                keybindings.label("chat_scroll.half_page_up"),
+                keybindings.label("chat_scroll.half_page_down"),
+                keybindings.label("chat_scroll.focus_input"),
+                keybindings.label("chat_scroll.focus_tree"),
+            ),
         }
     };
     if active_turn {
-        format!("Ctrl-C stop · {controls}")
+        format!(
+            "{} stop · {controls}",
+            keybindings.label("chat_input.interrupt")
+        )
     } else {
         controls
     }
@@ -3541,6 +3701,7 @@ fn composer_title(
     pending_steers: usize,
     stopping: bool,
     attachments: usize,
+    keybindings: &KeyBindings,
 ) -> String {
     if read_only {
         return " Read only ".into();
@@ -3550,8 +3711,14 @@ fn composer_title(
     }
     let attachment_status = match attachments {
         0 => String::new(),
-        1 => " · 1 image · Ctrl-x remove".into(),
-        count => format!(" · {count} images · Ctrl-x remove last"),
+        1 => format!(
+            " · 1 image · {} remove",
+            keybindings.label("chat_input.remove_image")
+        ),
+        count => format!(
+            " · {count} images · {} remove last",
+            keybindings.label("chat_input.remove_image")
+        ),
     };
     match pending_steers {
         0 => format!(" Message{attachment_status} "),
@@ -3589,7 +3756,7 @@ fn pending_follow_up_lines(prompts: &[String], max_width: usize) -> Vec<String> 
     lines
 }
 
-fn render_command_palette(frame: &mut Frame, area: Rect, palette: &CommandPalette) {
+fn render_command_palette(frame: &mut Frame, area: Rect, palette: &CommandPalette, app: &App) {
     let entries = palette.visible_entries();
     let height = u16::try_from(entries.len().saturating_mul(2).saturating_add(2))
         .unwrap_or(u16::MAX)
@@ -3620,9 +3787,13 @@ fn render_command_palette(frame: &mut Frame, area: Rect, palette: &CommandPalett
         .block(
             Block::default()
                 .title(title)
-                .title_bottom(Line::from(
-                    " type to filter · ↑/↓ select · Enter choose · Esc close ",
-                ))
+                .title_bottom(Line::from(format!(
+                    " type to filter · {} / {} select · {} choose · {} close ",
+                    app.keybindings.label("palette.up"),
+                    app.keybindings.label("palette.down"),
+                    app.keybindings.label("palette.select"),
+                    app.keybindings.label("palette.cancel"),
+                )))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -3656,7 +3827,13 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &App) {
         .block(
             Block::default()
                 .title(" Model ")
-                .title_bottom(Line::from(" j/k select · Enter effort · Esc close "))
+                .title_bottom(Line::from(format!(
+                    " {} / {} select · {} effort · {} close ",
+                    app.keybindings.label("model.up"),
+                    app.keybindings.label("model.down"),
+                    app.keybindings.label("model.select"),
+                    app.keybindings.label("model.cancel"),
+                )))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -3687,7 +3864,13 @@ fn render_reasoning_effort_picker(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(78, reasoning_effort_picker_height(efforts.len()), area);
     let block = Block::default()
         .title(format!(" {} · reasoning effort ", model.display_name))
-        .title_bottom(Line::from(" j/k change · Enter apply · Esc cancel "))
+        .title_bottom(Line::from(format!(
+            " {} / {} change · {} apply · {} cancel ",
+            app.keybindings.label("reasoning.up"),
+            app.keybindings.label("reasoning.down"),
+            app.keybindings.label("reasoning.select"),
+            app.keybindings.label("reasoning.cancel"),
+        )))
         .borders(Borders::ALL)
         .padding(Padding::horizontal(2))
         .border_style(Style::default().fg(Color::Green));
@@ -3751,7 +3934,13 @@ fn render_permissions_picker(frame: &mut Frame, area: Rect, app: &App) {
         .block(
             Block::default()
                 .title(" Permissions ")
-                .title_bottom(Line::from(" j/k select · Enter apply · Esc close "))
+                .title_bottom(Line::from(format!(
+                    " {} / {} select · {} apply · {} close ",
+                    app.keybindings.label("permissions.up"),
+                    app.keybindings.label("permissions.down"),
+                    app.keybindings.label("permissions.select"),
+                    app.keybindings.label("permissions.cancel"),
+                )))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -3762,12 +3951,16 @@ fn render_permissions_picker(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(list, popup, &mut state);
 }
 
-fn render_dangerous_confirm(frame: &mut Frame, area: Rect) {
+fn render_dangerous_confirm(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(76, 10, area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(
-            "Dangerous mode grants Codex full system access and disables approval prompts.\n\nEnable Dangerous mode? [y/N]",
+            format!(
+                "Dangerous mode grants Codex full system access and disables approval prompts.\n\n{} enable · {} cancel",
+                app.keybindings.label("dangerous.confirm"),
+                app.keybindings.label("dangerous.cancel"),
+            ),
         )
         .wrap(Wrap { trim: false })
         .block(
@@ -3812,7 +4005,13 @@ fn render_side_chat_picker(frame: &mut Frame, area: Rect, app: &App) {
         .block(
             Block::default()
                 .title(" Side chats ")
-                .title_bottom(Line::from(" j/k select · Enter open · Esc close "))
+                .title_bottom(Line::from(format!(
+                    " {} / {} select · {} open · {} close ",
+                    app.keybindings.label("side_chat.up"),
+                    app.keybindings.label("side_chat.down"),
+                    app.keybindings.label("side_chat.select"),
+                    app.keybindings.label("side_chat.cancel"),
+                )))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -3860,10 +4059,31 @@ fn render_thread_picker(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         format!(" Threads · {} · {thread_count} ", app.thread_picker_query)
     };
-    let controls = if app.show_archived {
-        " type filter · ↑/↓ · R names · y ID · Esc "
+    let up = if app.thread_picker_query.is_empty() {
+        app.keybindings.label("thread_picker.up")
     } else {
-        " type filter · ↑/↓ · Enter open · R names · y ID · Esc "
+        app.keybindings.label("thread_picker.query_up")
+    };
+    let down = if app.thread_picker_query.is_empty() {
+        app.keybindings.label("thread_picker.down")
+    } else {
+        app.keybindings.label("thread_picker.query_down")
+    };
+    let controls = if app.show_archived {
+        format!(
+            " type filter · {up} / {down} · {} names · {} ID · {} close ",
+            app.keybindings.label("thread_picker.rename"),
+            app.keybindings.label("thread_picker.copy_id"),
+            app.keybindings.label("thread_picker.cancel"),
+        )
+    } else {
+        format!(
+            " type filter · {up} / {down} · {} open · {} names · {} ID · {} close ",
+            app.keybindings.label("thread_picker.select"),
+            app.keybindings.label("thread_picker.rename"),
+            app.keybindings.label("thread_picker.copy_id"),
+            app.keybindings.label("thread_picker.cancel"),
+        )
     };
     let list = List::new(items)
         .block(
@@ -3890,7 +4110,9 @@ fn render_thread_rename(frame: &mut Frame, area: Rect, app: &App) {
             Block::default()
                 .title(" Rename thread ")
                 .title_bottom(Line::from(format!(
-                    " {count}/{MAX_THREAD_NAME_CHARS} · Enter save · Esc cancel "
+                    " {count}/{MAX_THREAD_NAME_CHARS} · {} save · {} cancel ",
+                    app.keybindings.label("rename.save"),
+                    app.keybindings.label("rename.cancel"),
                 )))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
@@ -3919,7 +4141,13 @@ fn render_rename_actions(frame: &mut Frame, area: Rect, app: &App) {
         .block(
             Block::default()
                 .title(" Thread names ")
-                .title_bottom(Line::from(" j/k select · Enter open · Esc cancel "))
+                .title_bottom(Line::from(format!(
+                    " {} / {} select · {} open · {} cancel ",
+                    app.keybindings.label("rename_action.up"),
+                    app.keybindings.label("rename_action.down"),
+                    app.keybindings.label("rename_action.select"),
+                    app.keybindings.label("rename_action.cancel"),
+                )))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -4029,11 +4257,28 @@ fn render_bulk_thread_rename(frame: &mut Frame, area: Rect, app: &App) {
         }
     });
     let controls = if editing {
-        " editing selected suggestion below "
+        " editing selected suggestion below ".to_owned()
     } else if review {
-        " j/k move · Space include · e edit · r re-suggest · Enter apply · Esc cancel "
+        format!(
+            " {} / {} move · {} include · {} edit · {} re-suggest · {} apply · {} cancel ",
+            app.keybindings.label("bulk_review.up"),
+            app.keybindings.label("bulk_review.down"),
+            app.keybindings.label("bulk_review.toggle"),
+            app.keybindings.label("bulk_review.edit"),
+            app.keybindings.label("bulk_review.regenerate"),
+            app.keybindings.label("bulk_review.apply"),
+            app.keybindings.label("bulk_review.cancel"),
+        )
     } else {
-        " j/k move · Space select · a all/none · Enter suggest · Esc cancel "
+        format!(
+            " {} / {} move · {} select · {} all/none · {} suggest · {} cancel ",
+            app.keybindings.label("bulk_select.up"),
+            app.keybindings.label("bulk_select.down"),
+            app.keybindings.label("bulk_select.toggle"),
+            app.keybindings.label("bulk_select.toggle_all"),
+            app.keybindings.label("bulk_select.generate"),
+            app.keybindings.label("bulk_select.cancel"),
+        )
     };
     let selected = state
         .candidates
@@ -4069,7 +4314,9 @@ fn render_bulk_thread_rename(frame: &mut Frame, area: Rect, app: &App) {
                     Block::default()
                         .title(" Edit suggested name ")
                         .title_bottom(Line::from(format!(
-                            " {count}/{MAX_THREAD_NAME_CHARS} · Enter save · Esc cancel "
+                            " {count}/{MAX_THREAD_NAME_CHARS} · {} save · {} cancel ",
+                            app.keybindings.label("bulk_edit.save"),
+                            app.keybindings.label("bulk_edit.cancel"),
                         )))
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(Color::Cyan)),
@@ -4088,7 +4335,12 @@ fn render_bulk_thread_rename(frame: &mut Frame, area: Rect, app: &App) {
         let confirm_popup = centered_rect(54, 5, area);
         frame.render_widget(Clear, confirm_popup);
         frame.render_widget(
-            Paragraph::new(format!("Rename {count} thread(s)? [y/N]")).block(
+            Paragraph::new(format!(
+                "Rename {count} thread(s)?\n\n{} apply · {} cancel",
+                app.keybindings.label("bulk_confirm.apply"),
+                app.keybindings.label("bulk_confirm.cancel"),
+            ))
+            .block(
                 Block::default()
                     .title(" Apply suggested names ")
                     .borders(Borders::ALL)
@@ -4156,14 +4408,19 @@ fn render_quit_confirm(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(68, u16::try_from(warnings.len()).unwrap_or(2) + 6, area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(format!("{}\n\nStop and quit? [y/N]", warnings.join("\n")))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(" Quit Shikigami ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow)),
-            ),
+        Paragraph::new(format!(
+            "{}\n\n{} quit · {} cancel",
+            warnings.join("\n"),
+            app.keybindings.label("quit.confirm"),
+            app.keybindings.label("quit.cancel"),
+        ))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title(" Quit Shikigami ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        ),
         popup,
     );
 }
@@ -4414,6 +4671,8 @@ fn render_approval(
     prompt: &ApprovalPrompt,
     selected_index: usize,
     interactive: bool,
+    app: &App,
+    action_prefix: &str,
 ) {
     let desired_height = 9usize
         .saturating_add(prompt.details.len().saturating_mul(2))
@@ -4423,9 +4682,17 @@ fn render_approval(
         .min(area.height.saturating_sub(2).max(1));
     let popup = centered_rect(90, height, area);
     let instruction = if interactive {
-        "↑/↓ select · Enter confirm · y allow once · n deny · Esc switch threads"
+        format!(
+            "{} / {} select · {} confirm · {} allow once · {} deny · {} switch threads",
+            app.keybindings.label(&format!("{action_prefix}.up")),
+            app.keybindings.label(&format!("{action_prefix}.down")),
+            app.keybindings.label(&format!("{action_prefix}.confirm")),
+            app.keybindings.label(&format!("{action_prefix}.allow")),
+            app.keybindings.label(&format!("{action_prefix}.deny")),
+            app.keybindings.label(&format!("{action_prefix}.cancel")),
+        )
     } else {
-        "Focus this chat to approve or decline"
+        "Focus this chat to approve or decline".to_owned()
     };
     let mut lines = vec![
         Line::styled(&prompt.explanation, Style::default().fg(Color::Yellow)),
@@ -4605,9 +4872,19 @@ fn render_navigation_tree(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(focus_style(app.focus == Focus::Navigation));
     if app.show_archived {
-        block = block.title_bottom(Line::from(" x restore · d delete · A active threads "));
+        block = block.title_bottom(Line::from(format!(
+            " {} restore · {} delete · {} active threads ",
+            app.keybindings.label("normal.thread.archive_or_restore"),
+            app.keybindings.label("normal.thread.delete"),
+            app.keybindings.label("normal.toggle_archived"),
+        )));
     } else {
-        block = block.title_bottom(Line::from(" R rename · x archive · A archived threads "));
+        block = block.title_bottom(Line::from(format!(
+            " {} rename · {} archive · {} archived threads ",
+            app.keybindings.label("normal.rename"),
+            app.keybindings.label("normal.thread.archive_or_restore"),
+            app.keybindings.label("normal.toggle_archived"),
+        )));
     }
     let list = List::new(items)
         .block(block)
@@ -4728,9 +5005,17 @@ fn render_repository_add(frame: &mut Frame, area: Rect, app: &App) {
         .block(
             Block::default()
                 .title(title)
-                .title_bottom(Line::from(
-                    " Space select · Enter register · f filter · / commands · b choose · r rescan · s scan home · Esc back ",
-                ))
+                .title_bottom(Line::from(format!(
+                    " {} select · {} register · {} filter · {} commands · {} choose · {} rescan · {} scan home · {} back ",
+                    app.keybindings.label("repositories.toggle"),
+                    app.keybindings.label("repositories.add"),
+                    app.keybindings.label("repositories.filter"),
+                    app.keybindings.label("repositories.palette"),
+                    app.keybindings.label("repositories.browse"),
+                    app.keybindings.label("repositories.rescan"),
+                    app.keybindings.label("repositories.scan_home"),
+                    app.keybindings.label("repositories.cancel"),
+                )))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -4762,9 +5047,14 @@ fn render_browser(frame: &mut Frame, area: Rect, app: &App) {
                     " Choose projects folder or repository · {} ",
                     app.browse_path.display()
                 ))
-                .title_bottom(Line::from(
-                    " Enter open · h parent · s scan folder · a register repository · Esc back ",
-                ))
+                .title_bottom(Line::from(format!(
+                    " {} open · {} parent · {} scan folder · {} register repository · {} back ",
+                    app.keybindings.label("directory.open"),
+                    app.keybindings.label("directory.parent"),
+                    app.keybindings.label("directory.scan"),
+                    app.keybindings.label("directory.add"),
+                    app.keybindings.label("directory.cancel"),
+                )))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -4789,7 +5079,9 @@ fn render_repository_remove_confirm(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(format!(
-            "Remove '{name}' from Shikigami?\n\nFiles and Codex threads are not deleted. [y/N]"
+            "Remove '{name}' from Shikigami?\n\nFiles and Codex threads are not deleted.\n\n{} remove · {} cancel",
+            app.keybindings.label("remove_repository.confirm"),
+            app.keybindings.label("remove_repository.cancel"),
         ))
         .wrap(Wrap { trim: false })
         .block(
@@ -4811,7 +5103,9 @@ fn render_thread_delete_confirm(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(format!(
-            "Permanently delete thread '{title}'?\n\nCodex history cannot be recovered.\nA clean Shikigami worktree is removed; other worktrees are kept. [y/N]"
+            "Permanently delete thread '{title}'?\n\nCodex history cannot be recovered.\nA clean Shikigami worktree is removed; other worktrees are kept.\n\n{} delete · {} cancel",
+            app.keybindings.label("delete_thread.confirm"),
+            app.keybindings.label("delete_thread.cancel"),
         ))
         .wrap(Wrap { trim: false })
         .block(
@@ -4915,9 +5209,14 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
         .block(
             Block::default()
                 .title(format!(" Attention · {} ", app.attention_count()))
-                .title_bottom(Line::from(
-                    " j/k select · Enter open · d dismiss · Esc close ",
-                ))
+                .title_bottom(Line::from(format!(
+                    " {} / {} select · {} open · {} dismiss · {} close ",
+                    app.keybindings.label("attention.up"),
+                    app.keybindings.label("attention.down"),
+                    app.keybindings.label("attention.open"),
+                    app.keybindings.label("attention.dismiss"),
+                    app.keybindings.label("attention.cancel"),
+                )))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
         )
@@ -4934,10 +5233,54 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect, app: &App) {
-    let popup = centered_rect(72, 35, area);
+    let popup = centered_rect(78, 37, area);
     let help = format!(
-        "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / return from messages\nl / →        expand repository / focus selected thread messages\ni            focus selected thread input / switch from messages to input\nH / L        collapse / expand all repositories\nEnter        expand/focus input / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            open the command palette\nf            filter threads / repository candidates\n/permissions choose Auto or Dangerous execution\nR            open thread-name actions\n!            show threads that need attention\nEsc          return to thread tree / cancel\na            add repositories\nn            create General chat or repository thread\nx            archive / restore thread\nu            undo the last archive\nA            active / archived threads\nd            unregister repository / delete archived thread\nr            reload repositories and names\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {}\nPress any key to close",
-        execution_status(app.execution_mode)
+        "{up} / {down}  move and preview selected thread\n{collapse} / {expand}  collapse or expand a repository\n{open_scroll}  focus selected thread messages\n{open_input}  focus selected thread input\n{collapse_all} / {expand_all}  collapse / expand all repositories\n{submit}  send or steer in chat\n{newline}  insert a newline in chat input\n{left}/{right}/{input_up}/{input_down}  move the chat input cursor\n{line_start}/{line_end}  move to start/end of the current input line\n{focus_chat}  focus chat / enter scroll mode\n{previous_message} / {next_message}  select messages in scroll mode\n{copy_editor}  copy an editor command for the visible diff hunk\n{copy_id} / {copy_resume}  copy thread ID / resume command\n{copy_message} / {copy_chat}  copy selected message / full chat\n{interrupt}  stop the current response\n{toggle_pane}  switch main / side chat focus\n{next_chat} / {previous_chat}  next / previous side chat\n{palette}  open the command palette\n{find_thread}  filter threads\n/permissions  choose Auto or Dangerous execution\n{rename}  open thread-name actions\n{attention}  show threads that need attention\n{cancel}  return to thread tree / cancel\n{add_repository}  add repositories\n{new_thread}  create General chat or repository thread\n{archive}  archive / restore thread\n{undo}  undo the last archive\n{archived}  active / archived threads\n{delete}  unregister repository / delete archived thread\n{refresh}  reload repositories and names\n{show_help}  help\n{quit}  quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {permissions}\nConfig: {config}\n{close_help} closes this screen",
+        up = app.keybindings.label("normal.up"),
+        down = app.keybindings.label("normal.down"),
+        collapse = app.keybindings.label("normal.repository.collapse"),
+        expand = app.keybindings.label("normal.repository.expand"),
+        open_scroll = app.keybindings.label("normal.thread.open_scroll"),
+        open_input = app.keybindings.label("normal.thread.open_input"),
+        collapse_all = app.keybindings.label("normal.collapse_all"),
+        expand_all = app.keybindings.label("normal.expand_all"),
+        submit = app.keybindings.label("chat_input.submit"),
+        newline = app.keybindings.label("chat_input.newline"),
+        left = app.keybindings.label("chat_input.left"),
+        right = app.keybindings.label("chat_input.right"),
+        input_up = app.keybindings.label("chat_input.up"),
+        input_down = app.keybindings.label("chat_input.down"),
+        line_start = app.keybindings.label("chat_input.line_start"),
+        line_end = app.keybindings.label("chat_input.line_end"),
+        focus_chat = app.keybindings.label("normal.focus_chat"),
+        previous_message = app.keybindings.label("chat_scroll.previous_message"),
+        next_message = app.keybindings.label("chat_scroll.next_message"),
+        copy_editor = app.keybindings.label("chat_scroll.copy_editor_command"),
+        copy_id = app.keybindings.label("normal.thread.copy_id"),
+        copy_resume = app.keybindings.label("normal.thread.copy_resume"),
+        copy_message = app.keybindings.label("chat_scroll.copy_message"),
+        copy_chat = app.keybindings.label("chat_scroll.copy_conversation"),
+        interrupt = app.keybindings.label("chat_input.interrupt"),
+        toggle_pane = app.keybindings.label("chat_input.toggle_pane"),
+        next_chat = app.keybindings.label("chat_input.next_chat"),
+        previous_chat = app.keybindings.label("chat_input.previous_chat"),
+        palette = app.keybindings.label("normal.palette"),
+        find_thread = app.keybindings.label("normal.find_thread"),
+        rename = app.keybindings.label("normal.rename"),
+        attention = app.keybindings.label("normal.attention"),
+        cancel = app.keybindings.label("normal.thread.parent"),
+        add_repository = app.keybindings.label("normal.add_repository"),
+        new_thread = app.keybindings.label("normal.new_thread"),
+        archive = app.keybindings.label("normal.thread.archive_or_restore"),
+        undo = app.keybindings.label("normal.undo_archive"),
+        archived = app.keybindings.label("normal.toggle_archived"),
+        delete = app.keybindings.label("normal.thread.delete"),
+        refresh = app.keybindings.label("normal.refresh"),
+        show_help = app.keybindings.label("normal.help"),
+        quit = app.keybindings.label("normal.quit"),
+        permissions = execution_status(app.execution_mode),
+        config = app.keybindings.path().display(),
+        close_help = app.keybindings.label("help.close"),
     );
     frame.render_widget(Clear, popup);
     frame.render_widget(
@@ -5384,26 +5727,28 @@ mod tests {
 
     #[test]
     fn active_chat_help_shows_steer_and_interrupt_shortcuts() {
-        let active = chat_help(false, ChatMode::Input, false, true);
-        let idle = chat_help(false, ChatMode::Input, false, false);
+        let keybindings = KeyBindings::defaults();
+        let active = chat_help(false, ChatMode::Input, false, true, &keybindings);
+        let idle = chat_help(false, ChatMode::Input, false, false, &keybindings);
 
-        assert!(active.starts_with("Ctrl-C stop · "));
-        assert!(active.contains("Enter steer"));
-        assert!(!idle.contains("Ctrl-C stop"));
-        assert!(idle.contains("Enter send"));
+        assert!(active.starts_with("ctrl+c stop · "));
+        assert!(active.contains("enter steer"));
+        assert!(!idle.contains("ctrl+c stop"));
+        assert!(idle.contains("enter send"));
     }
 
     #[test]
     fn composer_title_shows_live_chat_status() {
-        let one = composer_title(false, 1, false, 0);
-        let multiple = composer_title(false, 2, false, 0);
-        let stopping = composer_title(false, 2, true, 0);
-        let attachments = composer_title(false, 0, false, 2);
+        let keybindings = KeyBindings::defaults();
+        let one = composer_title(false, 1, false, 0, &keybindings);
+        let multiple = composer_title(false, 2, false, 0, &keybindings);
+        let stopping = composer_title(false, 2, true, 0, &keybindings);
+        let attachments = composer_title(false, 0, false, 2, &keybindings);
 
         assert!(one.contains("Follow-up sent · waiting for Codex…"));
         assert!(multiple.contains("2 follow-ups sent · waiting for Codex…"));
         assert!(stopping.contains("Stopping response…"));
-        assert!(attachments.contains("2 images · Ctrl-x remove last"));
+        assert!(attachments.contains("2 images · ctrl+x remove last"));
         assert!(!stopping.contains("follow-ups"));
     }
 
