@@ -165,6 +165,7 @@ pub async fn run(mut app: App) -> Result<()> {
         }
     };
     let result = run_loop(&mut terminal, &mut app, Arc::clone(&server)).await;
+    app.persist_repository_ui_state();
     unsubscribe_all_threads(&mut app, &server).await;
     let restore_result = restore_terminal(&mut terminal);
     let shutdown_result = server.shutdown().await;

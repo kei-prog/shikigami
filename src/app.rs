@@ -372,11 +372,23 @@ impl App {
             .iter()
             .map(|repository| repository.path.clone())
             .collect::<HashSet<_>>();
-        let (expanded_repositories, ui_state_error) =
-            match repository_store.load_expanded_repositories() {
-                Ok(Some(mut expanded)) => {
+        let (expanded_repositories, startup_thread_id, startup_repository, ui_state_error) =
+            match repository_store.load_ui_state() {
+                Ok(Some(state)) => {
+                    let mut expanded = state
+                        .expanded_repositories
+                        .into_iter()
+                        .collect::<HashSet<_>>();
                     expanded.retain(|path| registered_paths.contains(path));
-                    (expanded, None)
+                    let selected_repository = state
+                        .selected_repository
+                        .filter(|path| registered_paths.contains(path));
+                    (
+                        expanded,
+                        state.selected_thread_id,
+                        selected_repository,
+                        None,
+                    )
                 }
                 Ok(None) => (
                     repositories
@@ -384,12 +396,16 @@ impl App {
                         .map(|repository| HashSet::from([repository.path.clone()]))
                         .unwrap_or_default(),
                     None,
+                    None,
+                    None,
                 ),
                 Err(error) => (
                     repositories
                         .first()
                         .map(|repository| HashSet::from([repository.path.clone()]))
                         .unwrap_or_default(),
+                    None,
+                    None,
                     Some(format!("Could not load repository view state: {error}")),
                 ),
             };
@@ -478,6 +494,24 @@ impl App {
             initial_home_scan_in_progress: false,
         };
         app.refresh_current();
+        if let Some(thread_id) = startup_thread_id {
+            app.restore_tree_selection(TreeSelection::Thread(thread_id.clone()));
+            let restored = match app.selected_tree_row() {
+                Some(TreeRow::GeneralThread { thread_index })
+                | Some(TreeRow::Thread { thread_index, .. }) => app
+                    .threads
+                    .get(thread_index)
+                    .is_some_and(|thread| thread.record.id == thread_id),
+                _ => false,
+            };
+            if !restored && let Some(repository) = startup_repository {
+                app.restore_tree_selection(TreeSelection::Repository(repository));
+            }
+            app.sync_selection_from_tree();
+        } else if let Some(repository) = startup_repository {
+            app.restore_tree_selection(TreeSelection::Repository(repository));
+            app.sync_selection_from_tree();
+        }
         if app.repositories.is_empty() {
             app.open_repository_add();
             if initial_home_scan_is_pending {
@@ -2347,9 +2381,8 @@ impl App {
         {
             self.expanded_repositories.insert(repository.path.clone());
         }
-        self.repository_store
-            .save_expanded_repositories(&self.expanded_repositories)?;
         self.select_repository_row(self.repository_index);
+        self.save_repository_ui_state()?;
         self.location_index = 0;
         self.refresh_current();
         Ok(())
@@ -3094,13 +3127,48 @@ impl App {
         self.scanning = true;
     }
 
-    fn persist_expanded_repositories(&mut self) {
-        if let Err(error) = self
-            .repository_store
-            .save_expanded_repositories(&self.expanded_repositories)
-        {
+    pub fn persist_repository_ui_state(&mut self) {
+        if let Err(error) = self.save_repository_ui_state() {
             self.message = Some(format!("Could not save repository view state: {error}"));
         }
+    }
+
+    fn save_repository_ui_state(&self) -> Result<()> {
+        let (selected_repository, selected_thread_id) = match self.selected_tree_row() {
+            Some(TreeRow::Repository { repository_index }) => (
+                self.repositories
+                    .get(repository_index)
+                    .map(|repository| repository.path.as_path()),
+                None,
+            ),
+            Some(TreeRow::Thread {
+                repository_index,
+                thread_index,
+            }) => (
+                self.repositories
+                    .get(repository_index)
+                    .map(|repository| repository.path.as_path()),
+                self.threads
+                    .get(thread_index)
+                    .map(|thread| thread.record.id.as_str()),
+            ),
+            Some(TreeRow::GeneralThread { thread_index }) => (
+                None,
+                self.threads
+                    .get(thread_index)
+                    .map(|thread| thread.record.id.as_str()),
+            ),
+            Some(TreeRow::General) | None => (None, None),
+        };
+        self.repository_store.save_ui_state(
+            &self.expanded_repositories,
+            selected_repository,
+            selected_thread_id,
+        )
+    }
+
+    fn persist_expanded_repositories(&mut self) {
+        self.persist_repository_ui_state();
     }
 
     fn refresh_browser(&mut self) {

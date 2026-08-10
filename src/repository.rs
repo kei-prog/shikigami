@@ -25,8 +25,12 @@ struct RepositoryData {
 }
 
 #[derive(Default, Deserialize, Serialize)]
-struct RepositoryUiData {
-    expanded_repositories: Vec<PathBuf>,
+pub(crate) struct RepositoryUiData {
+    pub(crate) expanded_repositories: Vec<PathBuf>,
+    #[serde(default)]
+    pub(crate) selected_repository: Option<PathBuf>,
+    #[serde(default)]
+    pub(crate) selected_thread_id: Option<String>,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -107,7 +111,7 @@ impl RepositoryStore {
         save(&self.candidates_path, repositories)
     }
 
-    pub fn load_expanded_repositories(&self) -> Result<Option<HashSet<PathBuf>>> {
+    pub(crate) fn load_ui_state(&self) -> Result<Option<RepositoryUiData>> {
         if !self.ui_state_path.exists() {
             return Ok(None);
         }
@@ -115,10 +119,15 @@ impl RepositoryStore {
             .with_context(|| format!("read {}", self.ui_state_path.display()))?;
         let data: RepositoryUiData = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse {}", self.ui_state_path.display()))?;
-        Ok(Some(data.expanded_repositories.into_iter().collect()))
+        Ok(Some(data))
     }
 
-    pub fn save_expanded_repositories(&self, repositories: &HashSet<PathBuf>) -> Result<()> {
+    pub(crate) fn save_ui_state(
+        &self,
+        repositories: &HashSet<PathBuf>,
+        selected_repository: Option<&Path>,
+        selected_thread_id: Option<&str>,
+    ) -> Result<()> {
         let parent = self
             .ui_state_path
             .parent()
@@ -131,6 +140,8 @@ impl RepositoryStore {
             &temporary,
             serde_json::to_vec_pretty(&RepositoryUiData {
                 expanded_repositories,
+                selected_repository: selected_repository.map(Path::to_path_buf),
+                selected_thread_id: selected_thread_id.map(str::to_owned),
             })?,
         )
         .with_context(|| format!("write {}", temporary.display()))?;
@@ -426,17 +437,64 @@ mod tests {
     fn stores_repository_expansion_state_including_all_collapsed() {
         let temp = tempdir().unwrap();
         let store = RepositoryStore::at(temp.path());
-        assert_eq!(store.load_expanded_repositories().unwrap(), None);
+        assert!(store.load_ui_state().unwrap().is_none());
 
         let expanded = HashSet::from([PathBuf::from("/one"), PathBuf::from("/two")]);
-        store.save_expanded_repositories(&expanded).unwrap();
-        assert_eq!(store.load_expanded_repositories().unwrap(), Some(expanded));
-
-        store.save_expanded_repositories(&HashSet::new()).unwrap();
+        store.save_ui_state(&expanded, None, None).unwrap();
         assert_eq!(
-            store.load_expanded_repositories().unwrap(),
-            Some(HashSet::new())
+            store
+                .load_ui_state()
+                .unwrap()
+                .unwrap()
+                .expanded_repositories
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            expanded
         );
+
+        store.save_ui_state(&HashSet::new(), None, None).unwrap();
+        assert!(
+            store
+                .load_ui_state()
+                .unwrap()
+                .unwrap()
+                .expanded_repositories
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stores_selected_thread_and_repository_in_ui_state() {
+        let temp = tempdir().unwrap();
+        let store = RepositoryStore::at(temp.path());
+        let repository = Path::new("/owner/repo");
+
+        store
+            .save_ui_state(&HashSet::new(), Some(repository), Some("thread-123"))
+            .unwrap();
+
+        let state = store.load_ui_state().unwrap().unwrap();
+        assert_eq!(state.selected_repository.as_deref(), Some(repository));
+        assert_eq!(state.selected_thread_id.as_deref(), Some("thread-123"));
+    }
+
+    #[test]
+    fn loads_ui_state_saved_before_selection_was_persisted() {
+        let temp = tempdir().unwrap();
+        let store = RepositoryStore::at(temp.path());
+        fs::write(
+            &store.ui_state_path,
+            br#"{"expanded_repositories":["/owner/repo"]}"#,
+        )
+        .unwrap();
+
+        let state = store.load_ui_state().unwrap().unwrap();
+        assert_eq!(
+            state.expanded_repositories,
+            vec![PathBuf::from("/owner/repo")]
+        );
+        assert!(state.selected_repository.is_none());
+        assert!(state.selected_thread_id.is_none());
     }
 
     #[test]
