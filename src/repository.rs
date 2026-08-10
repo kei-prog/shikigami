@@ -391,7 +391,7 @@ fn should_skip(path: &Path) -> bool {
 fn max_depth(scope: &ScanScope) -> usize {
     match scope {
         ScanScope::Roots(_) => 6,
-        ScanScope::Home => 12,
+        ScanScope::Home => 6,
     }
 }
 
@@ -587,6 +587,11 @@ mod tests {
         assert!(should_skip(Path::new("/tmp/project/node_modules")));
         assert!(should_skip(Path::new("/Users/someone/Library")));
         assert!(!should_skip(Path::new("/Users/someone/Projects")));
+    }
+
+    #[test]
+    fn limits_home_scan_depth() {
+        assert_eq!(max_depth(&ScanScope::Home), 6);
     }
 
     #[test]
