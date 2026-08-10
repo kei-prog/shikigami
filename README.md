@@ -86,8 +86,11 @@ Shikigami opens with a `General` area for one-off chats. On a fresh installation
 it starts one welcome chat there after drawing the first screen. Codex explains
 the main workflow in the operating system's preferred locale; locale detection
 supports macOS, Windows, Linux, and other supported Unix systems, with English
-as the fallback. Repository discovery continues in the background while the
-welcome response runs. The welcome is versioned and shown only once.
+as the fallback. Only this welcome thread receives the bundled README as product
+context. Its first response prioritizes adding a repository and the essential
+navigation keys; later questions use the README as the source of truth.
+Repository discovery continues in the background while the welcome response
+runs. The welcome is versioned and shown only once.
 
 After onboarding, whenever no Git repository is registered, Shikigami opens the
 repository picker and discovers repositories from `ghq` and saved projects
