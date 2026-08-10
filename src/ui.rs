@@ -3596,16 +3596,25 @@ fn render_bulk_thread_rename(frame: &mut Frame, area: Rect, app: &App) {
         state.phase,
         BulkRenamePhase::Review | BulkRenamePhase::Editing | BulkRenamePhase::ConfirmApply
     );
+    let editing = state.phase == BulkRenamePhase::Editing;
+    let editor_height = usize::from(editing) * 5;
     let height = u16::try_from(
         state
             .candidates
             .len()
             .saturating_mul(if review { 2 } else { 1 })
-            .saturating_add(2),
+            .saturating_add(2)
+            .saturating_add(editor_height),
     )
     .unwrap_or(u16::MAX)
-    .clamp(8, area.height.saturating_sub(4).max(8));
+    .clamp(
+        if editing { 13 } else { 8 },
+        area.height
+            .saturating_sub(4)
+            .max(if editing { 13 } else { 8 }),
+    );
     let popup = centered_rect(90, height, area);
+    let (list_area, edit_area) = bulk_rename_panes(popup, editing);
     let items = state.candidates.iter().map(|candidate| {
         let checked = if candidate.selected { "[x]" } else { "[ ]" };
         if review {
@@ -3628,7 +3637,9 @@ fn render_bulk_thread_rename(frame: &mut Frame, area: Rect, app: &App) {
             ListItem::new(Line::from(format!("{checked} {}", candidate.current_name)))
         }
     });
-    let controls = if review {
+    let controls = if editing {
+        " editing selected suggestion below "
+    } else if review {
         " j/k move · Space include · e edit · r re-suggest · Enter apply · Esc cancel "
     } else {
         " j/k move · Space select · a all/none · Enter suggest · Esc cancel "
@@ -3656,12 +3667,10 @@ fn render_bulk_thread_rename(frame: &mut Frame, area: Rect, app: &App) {
         state.index.min(state.candidates.len().saturating_sub(1)),
     ));
     frame.render_widget(Clear, popup);
-    frame.render_stateful_widget(list, popup, &mut list_state);
+    frame.render_stateful_widget(list, list_area, &mut list_state);
 
-    if state.phase == BulkRenamePhase::Editing {
-        let edit_popup = centered_rect(68, 5, area);
+    if let Some(edit_area) = edit_area {
         let count = state.edit_input.graphemes(true).count();
-        frame.render_widget(Clear, edit_popup);
         frame.render_widget(
             Paragraph::new(state.edit_input.as_str())
                 .wrap(Wrap { trim: false })
@@ -3674,7 +3683,7 @@ fn render_bulk_thread_rename(frame: &mut Frame, area: Rect, app: &App) {
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(Color::Cyan)),
                 ),
-            edit_popup,
+            edit_area,
         );
     } else if state.phase == BulkRenamePhase::ConfirmApply {
         let count = state
@@ -3697,6 +3706,17 @@ fn render_bulk_thread_rename(frame: &mut Frame, area: Rect, app: &App) {
             confirm_popup,
         );
     }
+}
+
+fn bulk_rename_panes(popup: Rect, editing: bool) -> (Rect, Option<Rect>) {
+    if !editing {
+        return (popup, None);
+    }
+    let panes = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(5)])
+        .split(popup);
+    (panes[0], Some(panes[1]))
 }
 
 fn bulk_rename_progress_text(progress: Option<BulkRenameProgress>, elapsed: u64) -> String {
@@ -4329,6 +4349,26 @@ mod tests {
             ),
             "Applying names… 4/5 · 1s"
         );
+    }
+
+    #[test]
+    fn bulk_rename_editor_is_docked_below_the_visible_list() {
+        let popup = Rect::new(4, 2, 80, 20);
+
+        let (list, editor) = bulk_rename_panes(popup, true);
+        let editor = editor.unwrap();
+
+        assert_eq!(list, Rect::new(4, 2, 80, 15));
+        assert_eq!(editor, Rect::new(4, 17, 80, 5));
+        assert_eq!(list.bottom(), editor.y);
+        assert_eq!(editor.bottom(), popup.bottom());
+    }
+
+    #[test]
+    fn bulk_rename_review_uses_the_full_popup_without_an_editor() {
+        let popup = Rect::new(4, 2, 80, 20);
+
+        assert_eq!(bulk_rename_panes(popup, false), (popup, None));
     }
 
     #[test]

@@ -123,7 +123,9 @@ After choosing the target threads, Shikigami reads only their recent conversatio
 content and asks a temporary read-only Codex thread to propose concise names. Each
 proposal follows the natural language used by the user in that conversation while
 preserving conventional technical names. The review screen keeps every existing
-name unchanged until the user includes, edits, and confirms its proposal. Failed
+name unchanged until the user includes, edits, and confirms its proposal. Manual
+editing stays docked below the proposal list so the selected thread and nearby names
+remain visible for comparison. Failed
 updates remain in the review screen and can be retried without reapplying successful
 renames. An animated progress dialog distinguishes conversation loading, waiting for
 Codex, and applying the selected names, with real item counts and elapsed time.
