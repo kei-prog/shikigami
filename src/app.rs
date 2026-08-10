@@ -50,6 +50,7 @@ pub enum Mode {
     ConfirmDangerous,
     ChooseSideChat,
     ChooseThread,
+    ChooseRenameAction,
     RenameThread,
     BulkRenameThreads,
     Attention,
@@ -134,9 +135,41 @@ pub enum BulkRenameProgress {
     Applying { completed: usize, total: usize },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenameAction {
+    RenameThread,
+    SuggestRepository,
+    SuggestAll,
+}
+
+impl RenameAction {
+    pub const ALL: [Self; 3] = [
+        Self::RenameThread,
+        Self::SuggestRepository,
+        Self::SuggestAll,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RenameThread => "Rename selected thread",
+            Self::SuggestRepository => "Suggest names in this repository",
+            Self::SuggestAll => "Suggest names in all repositories",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RenameActionState {
+    pub index: usize,
+    pub return_mode: Mode,
+    pub thread_id: Option<String>,
+    pub repository_path: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BulkRenameCandidate {
     pub thread_id: String,
+    pub repository_name: String,
     pub current_name: String,
     pub proposed_name: String,
     pub selected: bool,
@@ -145,8 +178,10 @@ pub struct BulkRenameCandidate {
 
 #[derive(Clone, Debug)]
 pub struct BulkRenameState {
-    pub repository_name: String,
+    pub scope_name: String,
     pub repository_path: PathBuf,
+    pub show_repository_names: bool,
+    pub return_mode: Mode,
     pub candidates: Vec<BulkRenameCandidate>,
     pub index: usize,
     pub phase: BulkRenamePhase,
@@ -226,6 +261,7 @@ pub struct App {
     pub rename_thread_id: Option<String>,
     pub rename_input: String,
     pub rename_return_mode: Mode,
+    pub rename_actions: Option<RenameActionState>,
     pub bulk_rename: Option<BulkRenameState>,
     pub active_chat_pane: ChatPane,
     pub resumed_threads: HashSet<String>,
@@ -344,6 +380,7 @@ impl App {
             rename_thread_id: None,
             rename_input: String::new(),
             rename_return_mode: Mode::Normal,
+            rename_actions: None,
             bulk_rename: None,
             active_chat_pane: ChatPane::Main,
             resumed_threads: HashSet::new(),
@@ -2299,11 +2336,7 @@ impl App {
         Ok((ids, cwds))
     }
 
-    pub fn open_thread_rename(&mut self, from_picker: bool) {
-        if let Err(error) = ensure_thread_rename_context(self.show_archived) {
-            self.message = Some(error.to_string());
-            return;
-        }
+    pub fn open_rename_actions(&mut self, from_picker: bool) {
         let thread = if from_picker {
             self.selected_thread_picker()
         } else if self.selected_tree_is_thread() {
@@ -2311,7 +2344,91 @@ impl App {
         } else {
             None
         };
-        let Some(thread_id) = thread.map(|thread| thread.record.id.clone()) else {
+        let thread_id = thread.map(|thread| thread.record.id.clone());
+        let repository_path = thread
+            .map(|thread| thread.record.repository_path.clone())
+            .or_else(|| {
+                self.selected_repository()
+                    .map(|repository| repository.path.clone())
+            });
+        let return_mode = if from_picker {
+            Mode::ChooseThread
+        } else {
+            Mode::Normal
+        };
+        let mut state = RenameActionState {
+            index: 0,
+            return_mode,
+            thread_id,
+            repository_path,
+        };
+        state.index = RenameAction::ALL
+            .iter()
+            .position(|action| self.rename_action_is_available_for(&state, *action))
+            .unwrap_or(0);
+        self.rename_actions = Some(state);
+        self.mode = Mode::ChooseRenameAction;
+        self.message = None;
+    }
+
+    pub fn close_rename_actions(&mut self) {
+        if let Some(state) = self.rename_actions.take() {
+            self.mode = state.return_mode;
+        } else {
+            self.mode = Mode::Normal;
+        }
+    }
+
+    pub fn rename_action_is_available(&self, action: RenameAction) -> bool {
+        self.rename_actions
+            .as_ref()
+            .is_some_and(|state| self.rename_action_is_available_for(state, action))
+    }
+
+    fn rename_action_is_available_for(
+        &self,
+        state: &RenameActionState,
+        action: RenameAction,
+    ) -> bool {
+        if self.show_archived {
+            return false;
+        }
+        match action {
+            RenameAction::RenameThread => state.thread_id.is_some(),
+            RenameAction::SuggestRepository => state.repository_path.as_ref().is_some_and(|path| {
+                self.threads
+                    .iter()
+                    .any(|thread| &thread.record.repository_path == path)
+            }),
+            RenameAction::SuggestAll => !self.threads.is_empty(),
+        }
+    }
+
+    pub fn selected_rename_action(&self) -> Option<RenameAction> {
+        let state = self.rename_actions.as_ref()?;
+        let action = *RenameAction::ALL.get(state.index)?;
+        self.rename_action_is_available(action).then_some(action)
+    }
+
+    pub fn move_rename_action(&mut self, forward: bool) {
+        let Some(state) = self.rename_actions.as_ref() else {
+            return;
+        };
+        let available = RenameAction::ALL.map(|action| self.rename_action_is_available(action));
+        let current = state.index;
+        if let Some(next) = next_available_index(current, forward, &available) {
+            if let Some(state) = self.rename_actions.as_mut() {
+                state.index = next;
+            }
+        }
+    }
+
+    pub fn open_thread_rename_from_action(&mut self) {
+        let Some(state) = self.rename_actions.take() else {
+            return;
+        };
+        let Some(thread_id) = state.thread_id else {
+            self.rename_actions = Some(state);
             self.message = Some("No thread selected".into());
             return;
         };
@@ -2321,11 +2438,7 @@ impl App {
             .get(&thread_id)
             .and_then(|name| name.clone())
             .unwrap_or_default();
-        self.rename_return_mode = if from_picker {
-            Mode::ChooseThread
-        } else {
-            Mode::Normal
-        };
+        self.rename_return_mode = state.return_mode;
         self.mode = Mode::RenameThread;
         self.message = None;
     }
@@ -2339,21 +2452,40 @@ impl App {
         }
     }
 
-    pub fn open_bulk_thread_rename(&mut self) {
-        if self.show_archived {
-            self.message = Some("Restore archived threads before renaming them".into());
+    pub fn open_bulk_thread_rename_from_action(&mut self, all_repositories: bool) {
+        let Some(action_state) = self.rename_actions.as_ref() else {
+            return;
+        };
+        let action = if all_repositories {
+            RenameAction::SuggestAll
+        } else {
+            RenameAction::SuggestRepository
+        };
+        if !self.rename_action_is_available_for(action_state, action) {
+            self.message = Some("No active threads are available for that scope".into());
             return;
         }
-        let Some(repository) = self.selected_repository().cloned() else {
+        let action_state = action_state.clone();
+        let Some(repository_path) = action_state.repository_path.clone() else {
             self.message = Some("No repository selected".into());
             return;
+        };
+        let scope_name = if all_repositories {
+            "All repositories".into()
+        } else {
+            self.repositories
+                .iter()
+                .find(|repository| repository.path == repository_path)
+                .map(|repository| repository.name.clone())
+                .unwrap_or_else(|| "Selected repository".into())
         };
         let candidates = self
             .threads
             .iter()
-            .filter(|thread| thread.record.repository_path == repository.path)
+            .filter(|thread| all_repositories || thread.record.repository_path == repository_path)
             .map(|thread| BulkRenameCandidate {
                 thread_id: thread.record.id.clone(),
+                repository_name: self.repository_name_for_thread(thread).to_owned(),
                 current_name: thread.record.title.clone(),
                 proposed_name: thread.record.title.clone(),
                 selected: true,
@@ -2361,12 +2493,15 @@ impl App {
             })
             .collect::<Vec<_>>();
         if candidates.is_empty() {
-            self.message = Some("The selected repository has no active threads".into());
+            self.message = Some("No active threads are available for that scope".into());
             return;
         }
+        self.rename_actions = None;
         self.bulk_rename = Some(BulkRenameState {
-            repository_name: repository.name,
-            repository_path: repository.path,
+            scope_name,
+            repository_path,
+            show_repository_names: all_repositories,
+            return_mode: action_state.return_mode,
             candidates,
             index: 0,
             phase: BulkRenamePhase::Select,
@@ -2380,8 +2515,14 @@ impl App {
     }
 
     pub fn close_bulk_thread_rename(&mut self) {
-        self.bulk_rename = None;
-        self.mode = Mode::Normal;
+        if let Some(state) = self.bulk_rename.take() {
+            self.mode = state.return_mode;
+            if self.mode == Mode::ChooseThread {
+                self.refresh_thread_picker_matches();
+            }
+        } else {
+            self.mode = Mode::Normal;
+        }
     }
 
     pub fn move_bulk_rename_up(&mut self) {
@@ -2833,11 +2974,6 @@ fn ensure_thread_deletion_context(show_archived: bool, record: &ThreadRecord) ->
     Ok(())
 }
 
-fn ensure_thread_rename_context(show_archived: bool) -> Result<()> {
-    anyhow::ensure!(!show_archived, "restore the thread before renaming it");
-    Ok(())
-}
-
 fn take_pending_approval(
     approvals: &mut VecDeque<AppServerRequest>,
     thread_id: Option<&str>,
@@ -2931,6 +3067,14 @@ fn cycle_index(current: usize, count: usize, forward: bool) -> usize {
         (current + 1) % count
     } else {
         current.checked_sub(1).unwrap_or(count - 1)
+    }
+}
+
+fn next_available_index(current: usize, forward: bool, available: &[bool]) -> Option<usize> {
+    if forward {
+        ((current + 1)..available.len()).find(|index| available[*index])
+    } else {
+        (0..current).rev().find(|index| available[*index])
     }
 }
 
@@ -3333,12 +3477,13 @@ mod tests {
     }
 
     #[test]
-    fn archived_threads_must_be_restored_before_rename() {
-        assert!(ensure_thread_rename_context(false).is_ok());
-        assert_eq!(
-            ensure_thread_rename_context(true).unwrap_err().to_string(),
-            "restore the thread before renaming it"
-        );
+    fn rename_action_navigation_skips_unavailable_entries() {
+        let available = [false, true, true];
+
+        assert_eq!(next_available_index(0, true, &available), Some(1));
+        assert_eq!(next_available_index(1, true, &available), Some(2));
+        assert_eq!(next_available_index(2, false, &available), Some(1));
+        assert_eq!(next_available_index(1, false, &available), None);
     }
 
     #[test]

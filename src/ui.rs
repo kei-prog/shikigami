@@ -43,7 +43,8 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     app::{
         App, AttentionKind, BulkRenamePhase, BulkRenameProgress, ChatPane, Focus, Mode,
-        ThreadDeletionPhase, ThreadNameApplyRequest, ThreadNameGenerationRequest, TreeRow,
+        RenameAction, ThreadDeletionPhase, ThreadNameApplyRequest, ThreadNameGenerationRequest,
+        TreeRow,
     },
     app_server::{AppServer, AppServerRequest, TurnSettings},
     chat::{ChatMode, ChatState, CommandPalette, EditorTarget, PaletteCommand, PaletteEntry},
@@ -744,7 +745,7 @@ async fn handle_key(
             KeyCode::Char('Y') if app.thread_picker_query.is_empty() => {
                 copy_selected_thread_value(app, ThreadCopy::ResumeCommand);
             }
-            KeyCode::Char('R') => app.open_thread_rename(true),
+            KeyCode::Char('R') => app.open_rename_actions(true),
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -752,6 +753,20 @@ async fn handle_key(
             {
                 app.push_thread_picker_query(character);
             }
+            _ => {}
+        },
+        Mode::ChooseRenameAction => match key.code {
+            KeyCode::Esc => app.close_rename_actions(),
+            KeyCode::Up | KeyCode::Char('k') => app.move_rename_action(false),
+            KeyCode::Down | KeyCode::Char('j') => app.move_rename_action(true),
+            KeyCode::Enter => match app.selected_rename_action() {
+                Some(RenameAction::RenameThread) => app.open_thread_rename_from_action(),
+                Some(RenameAction::SuggestRepository) => {
+                    app.open_bulk_thread_rename_from_action(false)
+                }
+                Some(RenameAction::SuggestAll) => app.open_bulk_thread_rename_from_action(true),
+                None => app.message = Some("That rename action is not available".into()),
+            },
             _ => {}
         },
         Mode::RenameThread => match key.code {
@@ -1048,12 +1063,7 @@ async fn handle_key(
                     refresh_thread_names(app, server).await;
                 }
             }
-            KeyCode::Char('R') if app.selected_tree_is_thread() => {
-                app.open_thread_rename(false);
-            }
-            KeyCode::Char('R') if app.selected_tree_is_repository() => {
-                app.open_bulk_thread_rename();
-            }
+            KeyCode::Char('R') => app.open_rename_actions(false),
             KeyCode::Char('y') if app.selected_tree_is_thread() => {
                 copy_selected_thread_value(app, ThreadCopy::Id);
             }
@@ -2885,6 +2895,7 @@ fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
         Mode::ConfirmDangerous => render_dangerous_confirm(frame, area),
         Mode::ChooseSideChat => render_side_chat_picker(frame, area, app),
         Mode::ChooseThread => render_thread_picker(frame, area, app),
+        Mode::ChooseRenameAction => render_rename_actions(frame, area, app),
         Mode::RenameThread => render_thread_rename(frame, area, app),
         Mode::BulkRenameThreads => render_bulk_thread_rename(frame, area, app),
         Mode::Attention => render_attention(frame, area, app),
@@ -3507,9 +3518,9 @@ fn render_thread_picker(frame: &mut Frame, area: Rect, app: &App) {
         format!(" Threads · {} · {thread_count} ", app.thread_picker_query)
     };
     let controls = if app.show_archived {
-        " type filter · ↑/↓ · y ID · Esc "
+        " type filter · ↑/↓ · R names · y ID · Esc "
     } else {
-        " type filter · ↑/↓ · Enter open · R rename · y ID · Esc "
+        " type filter · ↑/↓ · Enter open · R names · y ID · Esc "
     };
     let list = List::new(items)
         .block(
@@ -3544,6 +3555,38 @@ fn render_thread_rename(frame: &mut Frame, area: Rect, app: &App) {
         .wrap(Wrap { trim: false });
     frame.render_widget(Clear, popup);
     frame.render_widget(input, popup);
+}
+
+fn render_rename_actions(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(state) = app.rename_actions.as_ref() else {
+        return;
+    };
+    let popup = centered_rect(62, 7, area);
+    let items = RenameAction::ALL.into_iter().map(|action| {
+        let available = app.rename_action_is_available(action);
+        let style = if available {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let suffix = if available { "" } else { " (unavailable)" };
+        ListItem::new(Line::styled(format!("{}{}", action.label(), suffix), style))
+    });
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(" Thread names ")
+                .title_bottom(Line::from(" j/k select · Enter open · Esc cancel "))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_symbol("› ")
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    let mut list_state = ListState::default().with_selected(Some(
+        state.index.min(RenameAction::ALL.len().saturating_sub(1)),
+    ));
+    frame.render_widget(Clear, popup);
+    frame.render_stateful_widget(list, popup, &mut list_state);
 }
 
 fn render_bulk_thread_rename(frame: &mut Frame, area: Rect, app: &App) {
@@ -3617,6 +3660,11 @@ fn render_bulk_thread_rename(frame: &mut Frame, area: Rect, app: &App) {
     let (list_area, edit_area) = bulk_rename_panes(popup, editing);
     let items = state.candidates.iter().map(|candidate| {
         let checked = if candidate.selected { "[x]" } else { "[ ]" };
+        let candidate_name = bulk_rename_candidate_label(
+            &candidate.repository_name,
+            &candidate.current_name,
+            state.show_repository_names,
+        );
         if review {
             let proposal_color = if candidate.error.is_some() {
                 Color::Red
@@ -3630,11 +3678,11 @@ fn render_bulk_thread_rename(frame: &mut Frame, area: Rect, app: &App) {
                 |error| format!("    ✗ {error}"),
             );
             ListItem::new(Text::from(vec![
-                Line::from(format!("{checked} {}", candidate.current_name)),
+                Line::from(format!("{checked} {candidate_name}")),
                 Line::styled(detail, Style::default().fg(proposal_color)),
             ]))
         } else {
-            ListItem::new(Line::from(format!("{checked} {}", candidate.current_name)))
+            ListItem::new(Line::from(format!("{checked} {candidate_name}")))
         }
     });
     let controls = if editing {
@@ -3654,7 +3702,7 @@ fn render_bulk_thread_rename(frame: &mut Frame, area: Rect, app: &App) {
             Block::default()
                 .title(format!(
                     " Rename threads · {} · {selected}/{} selected ",
-                    state.repository_name,
+                    state.scope_name,
                     state.candidates.len()
                 ))
                 .title_bottom(Line::from(controls))
@@ -3705,6 +3753,18 @@ fn render_bulk_thread_rename(frame: &mut Frame, area: Rect, app: &App) {
             ),
             confirm_popup,
         );
+    }
+}
+
+fn bulk_rename_candidate_label(
+    repository_name: &str,
+    thread_name: &str,
+    show_repository: bool,
+) -> String {
+    if show_repository {
+        format!("{repository_name} · {thread_name}")
+    } else {
+        thread_name.to_owned()
     }
 }
 
@@ -4255,7 +4315,7 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
 fn render_help(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(72, 34, area);
     let help = format!(
-        "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nH / L        collapse / expand all repositories\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n/permissions choose Auto or Dangerous execution\nR            rename thread / suggest repository thread names\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / delete archived thread\nr            reload repositories and names\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {}\nPress any key to close",
+        "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / select parent\nl / →        expand repository\nH / L        collapse / expand all repositories\nEnter        expand/focus / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n/permissions choose Auto or Dangerous execution\nR            open thread-name actions\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / delete archived thread\nr            reload repositories and names\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {}\nPress any key to close",
         execution_status(app.execution_mode)
     );
     frame.render_widget(Clear, popup);
@@ -4369,6 +4429,18 @@ mod tests {
         let popup = Rect::new(4, 2, 80, 20);
 
         assert_eq!(bulk_rename_panes(popup, false), (popup, None));
+    }
+
+    #[test]
+    fn all_repository_rename_rows_include_the_repository_name() {
+        assert_eq!(
+            bulk_rename_candidate_label("shikigami", "Improve thread names", true),
+            "shikigami · Improve thread names"
+        );
+        assert_eq!(
+            bulk_rename_candidate_label("shikigami", "Improve thread names", false),
+            "Improve thread names"
+        );
     }
 
     #[test]

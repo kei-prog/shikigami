@@ -37,7 +37,7 @@ results are cached, while the main screen only shows repositories you register.
 - `Tab`: focus the open chat
 - `Esc`: select the parent repository or return from chat to the tree
 - `/`: fuzzy-search active threads from the repository tree
-- `R`: rename the selected thread, or suggest names for selected threads in a repository
+- `R`: open thread-name actions for one thread, one repository, or all repositories
 - `y` / `Y`: copy the selected thread ID or its `codex resume` command
 - `a`: add repositories
 - `n`: create a thread in the primary repository, a new worktree, or an existing worktree
@@ -118,14 +118,18 @@ characters to keep the TUI compact. A failed App Server request leaves the old
 name and the rename input intact. Archived threads must be restored before they
 can be renamed.
 
-Pressing `R` on a repository row opens a multi-select list of its active threads.
-After choosing the target threads, Shikigami reads only their recent conversation
-content and asks a temporary read-only Codex thread to propose concise names. Each
-proposal follows the natural language used by the user in that conversation while
-preserving conventional technical names. The review screen keeps every existing
-name unchanged until the user includes, edits, and confirms its proposal. Manual
-editing stays docked below the proposal list so the selected thread and nearby names
-remain visible for comparison. Failed
+Pressing `R` in the repository tree or thread picker always opens the same explicit
+action menu: manually rename the selected thread, suggest names in its repository,
+or suggest names across all registered repositories. Unavailable actions remain
+visible but disabled. Both suggestion actions then open a multi-select list of active
+threads; the all-repositories scope includes each repository name in its rows. After
+choosing the target threads, Shikigami reads only their recent conversation content
+and asks a temporary read-only Codex thread to propose concise names. Each proposal
+follows the natural language used by the user in that conversation while preserving
+conventional technical names. The review screen keeps every existing name unchanged
+until the user includes, edits, and confirms its proposal. Manual editing stays
+docked below the proposal list so the selected thread and nearby names remain visible
+for comparison. Failed
 updates remain in the review screen and can be retried without reapplying successful
 renames. An animated progress dialog distinguishes conversation loading, waiting for
 Codex, and applying the selected names, with real item counts and elapsed time.
