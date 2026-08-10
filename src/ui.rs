@@ -23,7 +23,7 @@ use crossterm::{
         disable_raw_mode, enable_raw_mode,
     },
 };
-use futures::{StreamExt, future::join_all};
+use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -42,8 +42,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{
-        App, AttentionKind, BulkRenamePhase, ChatPane, Focus, Mode, ThreadDeletionPhase,
-        ThreadNameApplyRequest, ThreadNameGenerationRequest, TreeRow,
+        App, AttentionKind, BulkRenamePhase, BulkRenameProgress, ChatPane, Focus, Mode,
+        ThreadDeletionPhase, ThreadNameApplyRequest, ThreadNameGenerationRequest, TreeRow,
     },
     app_server::{AppServer, AppServerRequest, TurnSettings},
     chat::{ChatMode, ChatState, CommandPalette, EditorTarget, PaletteCommand, PaletteEntry},
@@ -101,6 +101,7 @@ enum UiAction {
 }
 
 enum BulkRenameEvent {
+    Progress(BulkRenameProgress),
     Generated(std::result::Result<Vec<(String, String)>, String>),
     Applied {
         successes: Vec<(String, String)>,
@@ -205,6 +206,9 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                     needs_draw = true;
                 }
                 if app.thread_deletion.is_some() {
+                    needs_draw = true;
+                }
+                if app.bulk_rename_is_busy() {
                     needs_draw = true;
                 }
             }
@@ -321,6 +325,9 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
             event = bulk_rename_receiver.recv() => {
                 if let Some(event) = event {
                     match event {
+                        BulkRenameEvent::Progress(progress) => {
+                            app.update_bulk_rename_progress(progress);
+                        }
                         BulkRenameEvent::Generated(result) => {
                             app.complete_bulk_name_generation(result);
                         }
@@ -1732,7 +1739,7 @@ fn spawn_thread_name_generation(
     sender: mpsc::UnboundedSender<BulkRenameEvent>,
 ) {
     tokio::spawn(async move {
-        let result = generate_thread_names(&server, request)
+        let result = generate_thread_names(&server, request, &sender)
             .await
             .map_err(|error| error.to_string());
         let _ = sender.send(BulkRenameEvent::Generated(result));
@@ -1745,23 +1752,31 @@ fn spawn_thread_name_apply(
     sender: mpsc::UnboundedSender<BulkRenameEvent>,
 ) {
     tokio::spawn(async move {
-        let results = join_all(request.names.into_iter().map(|(thread_id, name)| {
-            let server = Arc::clone(&server);
-            async move {
-                match server.set_thread_name(&thread_id, &name).await {
-                    Ok(()) => Ok((thread_id, name)),
-                    Err(error) => Err((thread_id, error.to_string())),
+        let total = request.names.len();
+        let mut requests = request
+            .names
+            .into_iter()
+            .map(|(thread_id, name)| {
+                let server = Arc::clone(&server);
+                async move {
+                    match server.set_thread_name(&thread_id, &name).await {
+                        Ok(()) => Ok((thread_id, name)),
+                        Err(error) => Err((thread_id, error.to_string())),
+                    }
                 }
-            }
-        }))
-        .await;
+            })
+            .collect::<FuturesUnordered<_>>();
         let mut successes = Vec::new();
         let mut failures = Vec::new();
-        for result in results {
+        while let Some(result) = requests.next().await {
             match result {
                 Ok(success) => successes.push(success),
                 Err(failure) => failures.push(failure),
             }
+            let _ = sender.send(BulkRenameEvent::Progress(BulkRenameProgress::Applying {
+                completed: successes.len() + failures.len(),
+                total,
+            }));
         }
         let _ = sender.send(BulkRenameEvent::Applied {
             successes,
@@ -1773,26 +1788,40 @@ fn spawn_thread_name_apply(
 async fn generate_thread_names(
     server: &Arc<AppServer>,
     request: ThreadNameGenerationRequest,
+    sender: &mpsc::UnboundedSender<BulkRenameEvent>,
 ) -> Result<Vec<(String, String)>> {
-    let histories = join_all(request.threads.iter().map(|(thread_id, current_name)| {
-        let server = Arc::clone(server);
-        let thread_id = thread_id.clone();
-        let current_name = current_name.clone();
-        async move {
-            let history = server
-                .read_thread_preview(&thread_id, 8)
-                .await
-                .with_context(|| format!("read thread '{current_name}'"))?;
-            Ok::<_, anyhow::Error>(json!({
-                "thread_id": thread_id,
-                "current_name": current_name,
-                "conversation": thread_naming_context(&history),
-            }))
-        }
-    }))
-    .await
-    .into_iter()
-    .collect::<Result<Vec<_>>>()?;
+    let total = request.threads.len();
+    let mut reads = request
+        .threads
+        .iter()
+        .map(|(thread_id, current_name)| {
+            let server = Arc::clone(server);
+            let thread_id = thread_id.clone();
+            let current_name = current_name.clone();
+            async move {
+                let history = server
+                    .read_thread_preview(&thread_id, 8)
+                    .await
+                    .with_context(|| format!("read thread '{current_name}'"))?;
+                Ok::<_, anyhow::Error>(json!({
+                    "thread_id": thread_id,
+                    "current_name": current_name,
+                    "conversation": thread_naming_context(&history),
+                }))
+            }
+        })
+        .collect::<FuturesUnordered<_>>();
+    let mut histories = Vec::with_capacity(total);
+    while let Some(history) = reads.next().await {
+        histories.push(history?);
+        let _ = sender.send(BulkRenameEvent::Progress(BulkRenameProgress::Reading {
+            completed: histories.len(),
+            total,
+        }));
+    }
+    let _ = sender.send(BulkRenameEvent::Progress(
+        BulkRenameProgress::WaitingForCodex,
+    ));
     let prompt = thread_name_prompt(&histories);
     let mut events = server.subscribe();
     let temporary_thread_id = server
@@ -3524,9 +3553,13 @@ fn render_bulk_thread_rename(frame: &mut Frame, area: Rect, app: &App) {
     match state.phase {
         BulkRenamePhase::Generating { .. } => {
             let popup = centered_rect(68, 5, area);
+            let progress = bulk_rename_progress_text(
+                state.progress,
+                state.progress_started_at.elapsed().as_secs(),
+            );
             frame.render_widget(Clear, popup);
             frame.render_widget(
-                Paragraph::new("Reading selected conversations and asking Codex for names…")
+                Paragraph::new(format!("{} {progress}", thinking_frame()))
                     .wrap(Wrap { trim: false })
                     .block(
                         Block::default()
@@ -3540,9 +3573,13 @@ fn render_bulk_thread_rename(frame: &mut Frame, area: Rect, app: &App) {
         }
         BulkRenamePhase::Applying => {
             let popup = centered_rect(60, 5, area);
+            let progress = bulk_rename_progress_text(
+                state.progress,
+                state.progress_started_at.elapsed().as_secs(),
+            );
             frame.render_widget(Clear, popup);
             frame.render_widget(
-                Paragraph::new("Applying selected thread names…").block(
+                Paragraph::new(format!("{} {progress}", thinking_frame())).block(
                     Block::default()
                         .title(" Renaming threads ")
                         .borders(Borders::ALL)
@@ -3659,6 +3696,21 @@ fn render_bulk_thread_rename(frame: &mut Frame, area: Rect, app: &App) {
             ),
             confirm_popup,
         );
+    }
+}
+
+fn bulk_rename_progress_text(progress: Option<BulkRenameProgress>, elapsed: u64) -> String {
+    match progress {
+        Some(BulkRenameProgress::Reading { completed, total }) => {
+            format!("Reading conversations… {completed}/{total} · {elapsed}s")
+        }
+        Some(BulkRenameProgress::WaitingForCodex) => {
+            format!("Asking Codex for name suggestions… {elapsed}s")
+        }
+        Some(BulkRenameProgress::Applying { completed, total }) => {
+            format!("Applying names… {completed}/{total} · {elapsed}s")
+        }
+        None => format!("Working… {elapsed}s"),
     }
 }
 
@@ -4250,6 +4302,34 @@ mod tests {
     use crate::app_server::AppServerEvent;
 
     use super::*;
+
+    #[test]
+    fn bulk_rename_progress_describes_real_stages_and_counts() {
+        assert_eq!(
+            bulk_rename_progress_text(
+                Some(BulkRenameProgress::Reading {
+                    completed: 2,
+                    total: 5,
+                }),
+                3,
+            ),
+            "Reading conversations… 2/5 · 3s"
+        );
+        assert_eq!(
+            bulk_rename_progress_text(Some(BulkRenameProgress::WaitingForCodex), 8),
+            "Asking Codex for name suggestions… 8s"
+        );
+        assert_eq!(
+            bulk_rename_progress_text(
+                Some(BulkRenameProgress::Applying {
+                    completed: 4,
+                    total: 5,
+                }),
+                1,
+            ),
+            "Applying names… 4/5 · 1s"
+        );
+    }
 
     #[test]
     fn naming_context_keeps_user_and_assistant_text_but_not_activity() {

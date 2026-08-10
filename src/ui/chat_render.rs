@@ -449,7 +449,7 @@ pub(super) fn rendered_chat_cached(
     }
 }
 
-fn thinking_frame() -> &'static str {
+pub(super) fn thinking_frame() -> &'static str {
     const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)

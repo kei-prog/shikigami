@@ -125,7 +125,8 @@ proposal follows the natural language used by the user in that conversation whil
 preserving conventional technical names. The review screen keeps every existing
 name unchanged until the user includes, edits, and confirms its proposal. Failed
 updates remain in the review screen and can be retried without reapplying successful
-renames.
+renames. An animated progress dialog distinguishes conversation loading, waiting for
+Codex, and applying the selected names, with real item counts and elapsed time.
 
 Codex does not persist a new thread until its first turn. When an untitled chat
 has no messages, leaving it removes the temporary thread from Shikigami. A clean

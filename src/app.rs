@@ -127,6 +127,13 @@ pub enum BulkRenamePhase {
     Applying,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BulkRenameProgress {
+    Reading { completed: usize, total: usize },
+    WaitingForCodex,
+    Applying { completed: usize, total: usize },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BulkRenameCandidate {
     pub thread_id: String,
@@ -143,6 +150,8 @@ pub struct BulkRenameState {
     pub candidates: Vec<BulkRenameCandidate>,
     pub index: usize,
     pub phase: BulkRenamePhase,
+    pub progress: Option<BulkRenameProgress>,
+    pub progress_started_at: Instant,
     pub edit_input: String,
     generating_ids: HashSet<String>,
 }
@@ -2361,6 +2370,8 @@ impl App {
             candidates,
             index: 0,
             phase: BulkRenamePhase::Select,
+            progress: None,
+            progress_started_at: Instant::now(),
             edit_input: String::new(),
             generating_ids: HashSet::new(),
         });
@@ -2438,6 +2449,11 @@ impl App {
         anyhow::ensure!(!threads.is_empty(), "Select at least one thread");
         state.generating_ids = threads.iter().map(|(id, _)| id.clone()).collect();
         state.phase = BulkRenamePhase::Generating { return_to_review };
+        state.progress = Some(BulkRenameProgress::Reading {
+            completed: 0,
+            total: threads.len(),
+        });
+        state.progress_started_at = Instant::now();
         let (model, effort) = model_settings
             .map(|(model, _, effort)| (Some(model), effort))
             .unwrap_or_default();
@@ -2491,6 +2507,29 @@ impl App {
             }
         }
         state.generating_ids.clear();
+        state.progress = None;
+    }
+
+    pub fn update_bulk_rename_progress(&mut self, progress: BulkRenameProgress) {
+        let Some(state) = self.bulk_rename.as_mut() else {
+            return;
+        };
+        let stage_changed = state.progress.is_none_or(|current| {
+            std::mem::discriminant(&current) != std::mem::discriminant(&progress)
+        });
+        state.progress = Some(progress);
+        if stage_changed {
+            state.progress_started_at = Instant::now();
+        }
+    }
+
+    pub fn bulk_rename_is_busy(&self) -> bool {
+        self.bulk_rename.as_ref().is_some_and(|state| {
+            matches!(
+                state.phase,
+                BulkRenamePhase::Generating { .. } | BulkRenamePhase::Applying
+            )
+        })
     }
 
     pub fn begin_bulk_rename_edit(&mut self) {
@@ -2559,6 +2598,11 @@ impl App {
             .collect::<Vec<_>>();
         anyhow::ensure!(!names.is_empty(), "Select at least one changed name");
         state.phase = BulkRenamePhase::Applying;
+        state.progress = Some(BulkRenameProgress::Applying {
+            completed: 0,
+            total: names.len(),
+        });
+        state.progress_started_at = Instant::now();
         Ok(ThreadNameApplyRequest { names })
     }
 
@@ -2592,6 +2636,7 @@ impl App {
                 }
             }
             state.phase = BulkRenamePhase::Review;
+            state.progress = None;
         }
         self.message = Some(format!(
             "{} thread rename{} failed; review the highlighted rows",
