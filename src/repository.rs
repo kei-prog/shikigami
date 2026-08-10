@@ -82,7 +82,7 @@ impl RepositoryStore {
     }
 
     pub fn initial_home_scan_is_pending(&self) -> bool {
-        !self.registered_path.exists() && !self.initial_home_scan_path.exists()
+        !self.initial_home_scan_path.exists()
     }
 
     pub fn mark_initial_home_scan_complete(&self) -> Result<()> {
@@ -412,14 +412,14 @@ mod tests {
     }
 
     #[test]
-    fn existing_repository_data_skips_initial_home_scan() {
+    fn empty_repository_data_does_not_skip_initial_home_scan() {
         let temp = tempdir().unwrap();
         let store = RepositoryStore::at(temp.path());
         store.save_candidates(&[]).unwrap();
         assert!(store.initial_home_scan_is_pending());
 
         save(&store.registered_path, &[]).unwrap();
-        assert!(!store.initial_home_scan_is_pending());
+        assert!(store.initial_home_scan_is_pending());
     }
 
     #[test]
