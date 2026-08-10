@@ -88,9 +88,11 @@ the main workflow in the operating system's preferred locale; locale detection
 supports macOS, Windows, Linux, and other supported Unix systems, with English
 as the fallback. Only this welcome thread receives the bundled README as product
 context. Its first response prioritizes adding a repository and the essential
-navigation keys; later questions use the README as the source of truth.
-Repository discovery continues in the background while the welcome response
-runs. The welcome is versioned and shown only once.
+navigation keys. The welcome remains visible in the right pane while focus stays
+on `General`, so `a` opens the repository picker immediately without an extra
+`Esc`. Later questions use the README as the source of truth. Repository
+discovery continues in the background while the welcome response runs. The
+welcome is versioned and shown only once.
 
 After onboarding, whenever no Git repository is registered, Shikigami opens the
 repository picker and discovers repositories from `ghq` and saved projects

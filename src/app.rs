@@ -569,8 +569,8 @@ impl App {
                     chat.set_model(model, display_name, effort);
                 }
                 app.show_chat(chat);
-                app.focus = Focus::Chat;
-                app.mode = Mode::Chat;
+                app.focus = Focus::Navigation;
+                app.mode = Mode::Normal;
                 app.pending_onboarding = Some(PendingOnboarding {
                     draft_id,
                     locale: onboarding::preferred_locale(),
