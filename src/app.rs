@@ -337,6 +337,7 @@ pub struct App {
     workspaces_by_repository: HashMap<PathBuf, Vec<Workspace>>,
     scan_receiver: Option<Receiver<ScanEvent>>,
     scan_label: Option<&'static str>,
+    scan_animation_tick: usize,
     initial_home_scan_in_progress: bool,
 }
 
@@ -512,6 +513,7 @@ impl App {
             workspaces_by_repository: HashMap::new(),
             scan_receiver: None,
             scan_label: None,
+            scan_animation_tick: 0,
             initial_home_scan_in_progress: false,
         };
         app.refresh_current();
@@ -2146,12 +2148,18 @@ impl App {
         self.scan_label
     }
 
+    pub fn scan_spinner(&self) -> &'static str {
+        const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+        FRAMES[self.scan_animation_tick % FRAMES.len()]
+    }
+
     pub fn poll_scan(&mut self) {
         let mut finished = false;
         let mut completed = false;
         let Some(receiver) = &self.scan_receiver else {
             return;
         };
+        self.scan_animation_tick = self.scan_animation_tick.wrapping_add(1);
         loop {
             match receiver.try_recv() {
                 Ok(ScanEvent::Found(repository)) => {
@@ -3227,6 +3235,7 @@ impl App {
             ScanScope::Home => "home directory",
         });
         self.scan_receiver = Some(start_scan(scope));
+        self.scan_animation_tick = 0;
         self.scanning = true;
     }
 

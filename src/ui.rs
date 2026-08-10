@@ -5070,34 +5070,63 @@ fn render_repository_add(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         Color::Cyan
     };
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .title(title)
-                .title_bottom(Line::from(format!(
-                    " {} select · {} register · {} filter · {} commands · {} choose · {} rescan · {} scan home · {} back ",
-                    app.keybindings.label("repositories.toggle"),
-                    app.keybindings.label("repositories.add"),
-                    app.keybindings.label("repositories.filter"),
-                    app.keybindings.label("repositories.palette"),
-                    app.keybindings.label("repositories.browse"),
-                    app.keybindings.label("repositories.rescan"),
-                    app.keybindings.label("repositories.scan_home"),
-                    app.keybindings.label("repositories.cancel"),
-                )))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color)),
-        )
-        .highlight_symbol("› ")
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+    let container = Block::default()
+        .title(title)
+        .title_bottom(Line::from(format!(
+            " {} select · {} register · {} filter · {} commands · {} choose · {} rescan · {} scan home · {} back ",
+            app.keybindings.label("repositories.toggle"),
+            app.keybindings.label("repositories.add"),
+            app.keybindings.label("repositories.filter"),
+            app.keybindings.label("repositories.palette"),
+            app.keybindings.label("repositories.browse"),
+            app.keybindings.label("repositories.rescan"),
+            app.keybindings.label("repositories.scan_home"),
+            app.keybindings.label("repositories.cancel"),
+        )))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+    let content = container.inner(popup);
+    let list = List::new(items).highlight_symbol("› ").highlight_style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
     let mut state =
         ListState::default().with_selected((!candidates.is_empty()).then_some(app.candidate_index));
     frame.render_widget(Clear, popup);
-    frame.render_stateful_widget(list, popup, &mut state);
+    frame.render_widget(container, popup);
+    let list_area = if let Some(label) = scan_label {
+        let [status_area, list_area] =
+            Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(content);
+        let [heading, progress] =
+            repository_scan_status(app.scan_spinner(), label, candidates.len());
+        let status = Paragraph::new(vec![
+            Line::styled(
+                heading,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(progress, Style::default().fg(Color::DarkGray)),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
+        frame.render_widget(status, status_area);
+        list_area
+    } else {
+        content
+    };
+    frame.render_stateful_widget(list, list_area, &mut state);
+}
+
+fn repository_scan_status(spinner: &str, label: &str, candidate_count: usize) -> [String; 2] {
+    [
+        format!(" {spinner} Scanning {label}…"),
+        format!("   {candidate_count} repositories found so far"),
+    ]
 }
 
 fn repository_add_title(candidate_count: usize, scan_label: Option<&str>, query: &str) -> String {
@@ -6025,6 +6054,13 @@ mod tests {
         assert_eq!(
             repository_add_title(55, None, ""),
             " Add repositories · 55 found "
+        );
+        assert_eq!(
+            repository_scan_status("⠋", "home directory", 12),
+            [
+                " ⠋ Scanning home directory…".to_owned(),
+                "   12 repositories found so far".to_owned(),
+            ]
         );
     }
 
