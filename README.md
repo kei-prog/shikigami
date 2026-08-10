@@ -49,7 +49,8 @@ screen only shows repositories you register.
 - `i`: focus the selected thread's chat input directly
 - `Tab`: focus the open chat
 - `Esc`: select the parent repository or return from chat to the tree
-- `/`: fuzzy-search active threads from the repository tree
+- `/`: open the command palette
+- `f`: fuzzy-search active threads from the repository tree
 - `R`: open thread-name actions for one thread, one repository, or all repositories
 - `y` / `Y`: copy the selected thread ID or its `codex resume` command
 - `a`: add repositories
@@ -94,7 +95,7 @@ or the arrow keys and `Enter` to choose from the decisions offered by Codex,
 including one-time approval and a proposed persistent command rule when
 available. The list is updated directly from App Server events without polling.
 
-In the repository picker, `/` filters candidates, `Space` selects multiple
+In the repository picker, `f` filters candidates, `Space` selects multiple
 repositories, and `Enter` registers them. Opening the picker shows cached
 candidates immediately without starting a scan. Repository discovery is read-only.
 Existing worktrees from `git worktree list` are offered as locations when a new
@@ -233,8 +234,9 @@ falls back to opening the file without a line number for unknown editors. Paths
 are resolved inside the thread workspace; deleted files and paths outside that
 workspace are rejected.
 
-Press `/` in the repository tree to open the thread search directly. Press `/`
-in an empty composer to open the command palette. Built-in Shikigami
+Press `/` in the repository tree or an empty composer to open the same command
+palette. Press `f` in the repository tree to open thread search directly.
+Built-in Shikigami
 commands and enabled Codex skills for the current workspace appear in one
 fuzzy-searchable list, ranked by name and description matches. Selecting a
 skill inserts its `$skill-name` mention and sends the corresponding App Server

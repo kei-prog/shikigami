@@ -13,7 +13,7 @@ use directories::BaseDirs;
 
 use crate::{
     app_server::{AppServerEvent, AppServerRequest, ModelMetadata},
-    chat::{ChatState, fuzzy_score},
+    chat::{ChatState, CommandPalette, fuzzy_score},
     git_workspace::{self, Workspace},
     registry::{
         AttentionRegistry, PersistentAttentionKind, Registry, SideChatRegistry, ThreadRecord,
@@ -242,6 +242,7 @@ pub struct App {
     pub browse_index: usize,
     pub focus: Focus,
     pub mode: Mode,
+    pub command_palette: Option<CommandPalette>,
     pub thread_deletion: Option<ThreadDeletionState>,
     pub scanning: bool,
     pub show_archived: bool,
@@ -386,6 +387,7 @@ impl App {
             } else {
                 Mode::Normal
             },
+            command_palette: None,
             thread_deletion: None,
             scanning: false,
             show_archived: false,

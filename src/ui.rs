@@ -483,7 +483,7 @@ async fn handle_key(
     }
     let mut action = None;
     match app.mode {
-        Mode::Chat if app.chat().is_some_and(|chat| chat.palette.is_some()) => {
+        _ if app.command_palette.is_some() => {
             handle_palette_key(app, key, server).await?;
         }
         Mode::Chat if app.chat().map(|chat| chat.mode) == Some(ChatMode::Scroll) => {
@@ -504,6 +504,7 @@ async fn handle_key(
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     interrupt_chat(app, server).await?;
                 }
+                KeyCode::Char('/') => open_command_palette(app, server).await?,
                 KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.toggle_chat_pane();
                 }
@@ -991,7 +992,8 @@ async fn handle_key(
             KeyCode::Up | KeyCode::Char('k') => app.move_up(),
             KeyCode::Down | KeyCode::Char('j') => app.move_down(),
             KeyCode::Char(' ') => app.toggle_selected_candidate(),
-            KeyCode::Char('/') => app.mode = Mode::FilterRepositories,
+            KeyCode::Char('/') => open_command_palette(app, server).await?,
+            KeyCode::Char('f') => app.mode = Mode::FilterRepositories,
             KeyCode::Char('r') => {
                 app.message = Some(match app.start_root_scan() {
                     Ok(()) => "scanning projects folders".into(),
@@ -1104,7 +1106,8 @@ async fn handle_key(
             KeyCode::Char('q') => request_quit(app),
             KeyCode::Char('?') => app.mode = Mode::Help,
             KeyCode::Char('!') => app.open_attention(),
-            KeyCode::Char('/') => app.open_thread_picker(),
+            KeyCode::Char('/') => open_command_palette(app, server).await?,
+            KeyCode::Char('f') => app.open_thread_picker(),
             KeyCode::Esc if app.selected_tree_is_thread() => app.select_parent_repository(),
             KeyCode::Char('h') | KeyCode::Left => app.collapse_selected_repository(),
             KeyCode::Char('l') | KeyCode::Right if app.selected_tree_is_repository() => {
@@ -1248,10 +1251,7 @@ fn handle_paste(app: &mut App, pasted: String) {
     if app.mode != Mode::Chat || app.focus != Focus::Chat || app.active_chat_is_read_only() {
         return;
     }
-    if app
-        .chat()
-        .is_none_or(|chat| chat.mode != ChatMode::Input || chat.palette.is_some())
-    {
+    if app.command_palette.is_some() || app.chat().is_none_or(|chat| chat.mode != ChatMode::Input) {
         return;
     }
     if app.active_model_supports_images()
@@ -1425,31 +1425,33 @@ fn shell_quote(value: &str) -> String {
 }
 
 async fn open_command_palette(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
-    let Some(chat) = app.chat() else {
-        return Ok(());
-    };
-    let should_load = !chat.skills_loaded || chat.skills_stale;
-    let cwd = chat.cwd.clone();
-    let force_reload = chat.skills_stale;
-    if should_load {
-        match server.list_skills(&cwd, force_reload).await {
-            Ok(skills) => {
-                if let Some(chat) = app.chat_mut() {
-                    chat.available_skills = skills;
-                    chat.skills_loaded = true;
-                    chat.skills_stale = false;
+    if let Some(chat) = app.chat() {
+        let should_load = !chat.skills_loaded || chat.skills_stale;
+        let cwd = chat.cwd.clone();
+        let force_reload = chat.skills_stale;
+        if should_load {
+            match server.list_skills(&cwd, force_reload).await {
+                Ok(skills) => {
+                    if let Some(chat) = app.chat_mut() {
+                        chat.available_skills = skills;
+                        chat.skills_loaded = true;
+                        chat.skills_stale = false;
+                    }
                 }
-            }
-            Err(error) => {
-                if let Some(chat) = app.chat_mut() {
-                    chat.push_notice(format!("Could not load skills: {error}"));
+                Err(error) => {
+                    if let Some(chat) = app.chat_mut() {
+                        chat.push_notice(format!("Could not load skills: {error}"));
+                    }
                 }
             }
         }
     }
-    if let Some(chat) = app.chat_mut() {
-        chat.open_palette();
-    }
+    let include_chat_entries = app.chat().is_some();
+    let skills = app
+        .chat()
+        .map(|chat| chat.available_skills.as_slice())
+        .unwrap_or_default();
+    app.command_palette = Some(CommandPalette::new(skills, include_chat_entries));
     Ok(())
 }
 
@@ -1630,45 +1632,42 @@ fn apply_thread_name_refresh(
 }
 
 async fn handle_palette_key(app: &mut App, key: KeyEvent, server: &Arc<AppServer>) -> Result<()> {
-    let Some(chat) = app.chat_mut() else {
-        return Ok(());
-    };
     match key.code {
-        KeyCode::Esc => chat.palette = None,
+        KeyCode::Esc => app.command_palette = None,
         KeyCode::Up => {
-            if let Some(palette) = &mut chat.palette {
+            if let Some(palette) = &mut app.command_palette {
                 palette.move_up();
             }
         }
         KeyCode::Down => {
-            if let Some(palette) = &mut chat.palette {
+            if let Some(palette) = &mut app.command_palette {
                 palette.move_down();
             }
         }
         KeyCode::Char('k')
-            if chat
-                .palette
+            if app
+                .command_palette
                 .as_ref()
                 .is_some_and(|palette| palette.query.is_empty()) =>
         {
-            if let Some(palette) = &mut chat.palette {
+            if let Some(palette) = &mut app.command_palette {
                 palette.move_up();
             }
         }
         KeyCode::Char('j')
-            if chat
-                .palette
+            if app
+                .command_palette
                 .as_ref()
                 .is_some_and(|palette| palette.query.is_empty()) =>
         {
-            if let Some(palette) = &mut chat.palette {
+            if let Some(palette) = &mut app.command_palette {
                 palette.move_down();
             }
         }
         KeyCode::Backspace => {
-            if let Some(palette) = &mut chat.palette {
+            if let Some(palette) = &mut app.command_palette {
                 if palette.query.is_empty() {
-                    chat.palette = None;
+                    app.command_palette = None;
                 } else {
                     palette.pop_query();
                 }
@@ -1680,7 +1679,7 @@ async fn handle_palette_key(app: &mut App, key: KeyEvent, server: &Arc<AppServer
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
         {
-            if let Some(palette) = &mut chat.palette {
+            if let Some(palette) = &mut app.command_palette {
                 palette.push_query(character);
             }
         }
@@ -1690,18 +1689,17 @@ async fn handle_palette_key(app: &mut App, key: KeyEvent, server: &Arc<AppServer
 }
 
 async fn select_palette_entry(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
-    let entry = app.chat_mut().and_then(|chat| {
-        let entry = chat
-            .palette
-            .as_ref()
-            .and_then(CommandPalette::selected_entry);
-        chat.palette = None;
-        entry
-    });
+    let entry = app
+        .command_palette
+        .as_ref()
+        .and_then(CommandPalette::selected_entry);
+    app.command_palette = None;
     match entry {
         Some(PaletteEntry::Skill(skill)) => {
             if let Some(chat) = app.chat_mut() {
                 chat.select_skill(skill);
+                app.mode = Mode::Chat;
+                app.focus = Focus::Chat;
             }
         }
         Some(PaletteEntry::Command(PaletteCommand::Threads)) => {
@@ -1710,6 +1708,8 @@ async fn select_palette_entry(app: &mut App, server: &Arc<AppServer>) -> Result<
         Some(PaletteEntry::Command(PaletteCommand::Scroll)) => {
             if let Some(chat) = app.chat_mut() {
                 chat.enter_scroll_mode();
+                app.mode = Mode::Chat;
+                app.focus = Focus::Chat;
             }
         }
         Some(PaletteEntry::Command(PaletteCommand::Model)) => {
@@ -3174,11 +3174,11 @@ fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
 
     let default_status = if app.attention_count() > 0 {
         format!(
-            "! attention ({}) · j/k move/preview · l messages · i input · / search · n new · q quit",
+            "! attention ({}) · j/k move/preview · l messages · i input · f filter · / commands · n new · q quit",
             app.attention_count()
         )
     } else {
-        "? help · j/k move/preview · h/l tree/messages · i input · H/L all · / search · n new · q quit"
+        "? help · j/k move/preview · h/l tree/messages · i input · H/L all · f filter · / commands · n new · q quit"
             .into()
     };
     let status = app.message.as_deref().unwrap_or(&default_status);
@@ -3227,6 +3227,9 @@ fn render(frame: &mut Frame, app: &mut App, render_cache: &mut RenderCache) {
     if app.thread_deletion.is_some() && app.mode != Mode::DeletingThread {
         render_thread_deletion_progress(frame, area, app);
     }
+    if let Some(palette) = &app.command_palette {
+        render_command_palette(frame, area, palette);
+    }
 }
 
 fn render_chat_area(frame: &mut Frame, area: Rect, app: &mut App, render_cache: &mut RenderCache) {
@@ -3260,8 +3263,11 @@ fn render_chat_pane(
     let read_only = chat_id
         .as_deref()
         .is_some_and(|thread_id| app.read_only_threads.contains(thread_id));
-    let show_composer_cursor =
-        app.mode == Mode::Chat && app.focus == Focus::Chat && pane_active && !read_only;
+    let show_composer_cursor = app.mode == Mode::Chat
+        && app.focus == Focus::Chat
+        && pane_active
+        && !read_only
+        && app.command_palette.is_none();
     let message_position = chat_id
         .as_ref()
         .and_then(|thread_id| app.chats.get(thread_id))
@@ -3434,11 +3440,7 @@ fn render_chat_pane(
         .block(message_block),
         message_area,
     );
-    if show_composer_cursor
-        && chat.mode == ChatMode::Input
-        && chat.palette.is_none()
-        && !message_inner.is_empty()
-    {
+    if show_composer_cursor && chat.mode == ChatMode::Input && !message_inner.is_empty() {
         let x = message_inner
             .x
             .saturating_add(u16::try_from(cursor_column).unwrap_or(u16::MAX))
@@ -3460,9 +3462,6 @@ fn render_chat_pane(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
         help_area,
     );
-    if pane_active && let Some(palette) = &chat.palette {
-        render_command_palette(frame, area, palette);
-    }
 }
 
 fn chat_help(read_only: bool, mode: ChatMode, has_side_chat: bool, active_turn: bool) -> String {
@@ -4654,7 +4653,7 @@ fn render_repository_add(frame: &mut Frame, area: Rect, app: &App) {
     let filter = if app.repository_query.is_empty() {
         String::new()
     } else {
-        format!(" · /{}", app.repository_query)
+        format!(" · filter: {}", app.repository_query)
     };
     let title = format!(
         " Add repositories · {} found{scan}{filter} ",
@@ -4665,7 +4664,7 @@ fn render_repository_add(frame: &mut Frame, area: Rect, app: &App) {
             Block::default()
                 .title(title)
                 .title_bottom(Line::from(
-                    " Space select · Enter register · / filter · b choose · r rescan · s scan home · Esc back ",
+                    " Space select · Enter register · f filter · / commands · b choose · r rescan · s scan home · Esc back ",
                 ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
@@ -4872,7 +4871,7 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
 fn render_help(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(72, 35, area);
     let help = format!(
-        "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / return from messages\nl / →        expand repository / focus selected thread messages\ni            focus selected thread input / switch from messages to input\nH / L        collapse / expand all repositories\nEnter        expand/focus input / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            search threads (tree) / commands (chat)\n/permissions choose Auto or Dangerous execution\nR            open thread-name actions\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / delete archived thread\nr            reload repositories and names\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {}\nPress any key to close",
+        "j / k / ↑↓  move and preview selected thread\nh / ←        collapse repository / return from messages\nl / →        expand repository / focus selected thread messages\ni            focus selected thread input / switch from messages to input\nH / L        collapse / expand all repositories\nEnter        expand/focus input / send or steer in chat\nShift-Enter  insert a newline in chat input\n←/→/↑/↓     move the chat input cursor\nCtrl-A/E     move to start/end of the current input line\nTab          focus chat / enter scroll mode\nJ / K        next / previous message in scroll mode\ne            copy an editor command for the visible diff hunk\ny / Y        copy thread ID / resume command in thread lists\ny / Y        copy selected message / full chat in scroll mode\nCtrl-C       stop the current response\nCtrl-g       switch main / side chat focus\nCtrl-n / p   next / previous side chat\n/            open the command palette\nf            filter threads / repository candidates\n/permissions choose Auto or Dangerous execution\nR            open thread-name actions\n!            show threads that need attention\nEsc          return to repository tree / cancel\na            add repositories\nn            create thread in selected repository\nx            archive / restore thread\nA            active / archived threads\nd            unregister repository / delete archived thread\nr            reload repositories and names\n?            help\nq            quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {}\nPress any key to close",
         execution_status(app.execution_mode)
     );
     frame.render_widget(Clear, popup);

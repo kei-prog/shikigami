@@ -109,20 +109,24 @@ pub struct CommandPalette {
 }
 
 impl CommandPalette {
-    pub fn new(skills: &[SkillMetadata]) -> Self {
-        let mut entries = vec![
-            PaletteEntry::Command(PaletteCommand::Threads),
-            PaletteEntry::Command(PaletteCommand::Scroll),
-            PaletteEntry::Command(PaletteCommand::Model),
-            PaletteEntry::Command(PaletteCommand::Permissions),
-            PaletteEntry::Command(PaletteCommand::SideChat),
-            PaletteEntry::Command(PaletteCommand::Sides),
-            PaletteEntry::Command(PaletteCommand::SideClose),
-            PaletteEntry::Command(PaletteCommand::SidePromote),
-            PaletteEntry::Command(PaletteCommand::Attention),
-            PaletteEntry::Command(PaletteCommand::Status),
-        ];
-        entries.extend(skills.iter().cloned().map(PaletteEntry::Skill));
+    pub fn new(skills: &[SkillMetadata], include_chat_entries: bool) -> Self {
+        let mut entries = vec![PaletteEntry::Command(PaletteCommand::Threads)];
+        if include_chat_entries {
+            entries.extend([
+                PaletteEntry::Command(PaletteCommand::Scroll),
+                PaletteEntry::Command(PaletteCommand::Model),
+                PaletteEntry::Command(PaletteCommand::Permissions),
+                PaletteEntry::Command(PaletteCommand::SideChat),
+                PaletteEntry::Command(PaletteCommand::Sides),
+                PaletteEntry::Command(PaletteCommand::SideClose),
+                PaletteEntry::Command(PaletteCommand::SidePromote),
+            ]);
+        }
+        entries.push(PaletteEntry::Command(PaletteCommand::Attention));
+        if include_chat_entries {
+            entries.push(PaletteEntry::Command(PaletteCommand::Status));
+            entries.extend(skills.iter().cloned().map(PaletteEntry::Skill));
+        }
         Self {
             query: String::new(),
             selected: 0,
@@ -287,7 +291,6 @@ pub struct ChatState {
     pub max_scroll: usize,
     pub viewport_height: usize,
     pub follow_tail: bool,
-    pub palette: Option<CommandPalette>,
     pub available_skills: Vec<SkillMetadata>,
     pub selected_skills: Vec<SkillMetadata>,
     pub skills_loaded: bool,
@@ -327,7 +330,6 @@ impl ChatState {
             max_scroll: 0,
             viewport_height: 1,
             follow_tail: true,
-            palette: None,
             available_skills: Vec::new(),
             selected_skills: Vec::new(),
             skills_loaded: false,
@@ -504,10 +506,6 @@ impl ChatState {
         self.active_turn_id.is_some() && self.waiting_for_activity
     }
 
-    pub fn open_palette(&mut self) {
-        self.palette = Some(CommandPalette::new(&self.available_skills));
-    }
-
     pub fn select_skill(&mut self, skill: SkillMetadata) {
         self.composer = format!("${} ", skill.name);
         self.composer_cursor = self.composer.len();
@@ -519,7 +517,6 @@ impl ChatState {
         {
             self.selected_skills.push(skill);
         }
-        self.palette = None;
     }
 
     pub fn set_composer_width(&mut self, width: usize) {
@@ -1972,7 +1969,7 @@ mod tests {
                 scope: "user".into(),
             },
         ];
-        let mut palette = CommandPalette::new(&skills);
+        let mut palette = CommandPalette::new(&skills, true);
         palette.push_query('r');
         palette.push_query('e');
         palette.push_query('v');
@@ -1996,7 +1993,7 @@ mod tests {
 
     #[test]
     fn command_palette_exposes_side_chat_actions() {
-        let mut palette = CommandPalette::new(&[]);
+        let mut palette = CommandPalette::new(&[], true);
         palette.query = "sidechat".into();
         assert_eq!(palette.visible_entries()[0].label(), "/sidechat");
 
@@ -2011,6 +2008,18 @@ mod tests {
 
         palette.query = "attention".into();
         assert_eq!(palette.visible_entries()[0].label(), "/attention");
+    }
+
+    #[test]
+    fn command_palette_without_chat_exposes_only_global_actions() {
+        let palette = CommandPalette::new(&[], false);
+        let labels = palette
+            .visible_entries()
+            .into_iter()
+            .map(PaletteEntry::label)
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels, ["/threads", "/attention"]);
     }
 
     #[test]
