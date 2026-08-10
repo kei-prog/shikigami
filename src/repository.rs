@@ -39,6 +39,7 @@ pub struct RepositoryStore {
     candidates_path: PathBuf,
     ui_state_path: PathBuf,
     roots_path: PathBuf,
+    initial_home_scan_path: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -59,11 +60,13 @@ impl RepositoryStore {
         let candidates_path = dirs.cache_dir().join("repository-candidates.json");
         let ui_state_path = dirs.data_local_dir().join("repository-ui.json");
         let roots_path = dirs.data_local_dir().join("repository-roots.json");
+        let initial_home_scan_path = dirs.data_local_dir().join("initial-home-scan-complete");
         Ok(Self {
             registered_path,
             candidates_path,
             ui_state_path,
             roots_path,
+            initial_home_scan_path,
         })
     }
 
@@ -74,7 +77,22 @@ impl RepositoryStore {
             candidates_path: root.join("candidates.json"),
             ui_state_path: root.join("repository-ui.json"),
             roots_path: root.join("roots.json"),
+            initial_home_scan_path: root.join("initial-home-scan-complete"),
         }
+    }
+
+    pub fn initial_home_scan_is_pending(&self) -> bool {
+        !self.registered_path.exists() && !self.initial_home_scan_path.exists()
+    }
+
+    pub fn mark_initial_home_scan_complete(&self) -> Result<()> {
+        let parent = self
+            .initial_home_scan_path
+            .parent()
+            .context("initial home scan path has no parent")?;
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        fs::write(&self.initial_home_scan_path, b"")
+            .with_context(|| format!("write {}", self.initial_home_scan_path.display()))
     }
 
     pub fn load_registered(&self) -> Result<Vec<Repository>> {
@@ -381,6 +399,27 @@ mod tests {
 
         store.unregister(&repository_path).unwrap();
         assert!(store.load_registered().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tracks_initial_home_scan_without_repeating_after_completion() {
+        let temp = tempdir().unwrap();
+        let store = RepositoryStore::at(temp.path());
+
+        assert!(store.initial_home_scan_is_pending());
+        store.mark_initial_home_scan_complete().unwrap();
+        assert!(!store.initial_home_scan_is_pending());
+    }
+
+    #[test]
+    fn existing_repository_data_skips_initial_home_scan() {
+        let temp = tempdir().unwrap();
+        let store = RepositoryStore::at(temp.path());
+        store.save_candidates(&[]).unwrap();
+        assert!(store.initial_home_scan_is_pending());
+
+        save(&store.registered_path, &[]).unwrap();
+        assert!(!store.initial_home_scan_is_pending());
     }
 
     #[test]

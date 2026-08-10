@@ -82,12 +82,13 @@ shows the error in the TUI. `Esc` remains an emergency way out of dialogs and
 `Ctrl-c` remains an interrupt fallback even when extra bindings are configured.
 The `?` help screen displays the active bindings and config path.
 
-Shikigami opens with a `General` area for one-off chats, even when no Git
-repository is registered. Add repositories with `a`. Projects folders are saved
-and scanned only when you request it, and scan results are cached. Use `r` to
-rescan saved folders, `s` for an explicit home-directory scan, or `b` to choose
-another folder or repository. The main screen only shows repositories you
-register.
+Shikigami opens with a `General` area for one-off chats. On the first launch it
+opens the repository picker and scans the home directory in the background;
+results are cached for later launches. Whenever no Git repository is registered,
+the picker opens automatically. Add more repositories with `a`, use `r` to
+rescan saved projects folders, `s` to scan the home directory again, or `b` to
+choose another folder or repository. The main screen only shows repositories
+you register.
 
 - `j` / `k`: move through the thread tree and preview the selected thread
 - `h` / `l`: collapse or expand a repository; `l` focuses a selected thread's messages

@@ -316,6 +316,7 @@ pub struct App {
     settings_store: SettingsStore,
     workspaces_by_repository: HashMap<PathBuf, Vec<Workspace>>,
     scan_receiver: Option<Receiver<ScanEvent>>,
+    initial_home_scan_in_progress: bool,
 }
 
 impl App {
@@ -361,6 +362,7 @@ impl App {
             thread_names.retain(|thread_id, _| registered.contains(thread_id));
         }
         let repositories = repository_store.load_registered()?;
+        let initial_home_scan_is_pending = repository_store.initial_home_scan_is_pending();
         let candidates = repository_store.load_candidates().unwrap_or_default();
         let browse_path = BaseDirs::new()
             .map(|dirs| dirs.home_dir().to_path_buf())
@@ -471,8 +473,16 @@ impl App {
             settings_store,
             workspaces_by_repository: HashMap::new(),
             scan_receiver: None,
+            initial_home_scan_in_progress: false,
         };
         app.refresh_current();
+        if app.repositories.is_empty() {
+            app.open_repository_add();
+            if initial_home_scan_is_pending {
+                app.start_home_scan();
+                app.initial_home_scan_in_progress = true;
+            }
+        }
         if let Err(error) = app.restore_attention() {
             app.message = Some(format!("Could not restore attention list: {error}"));
         }
@@ -2077,6 +2087,7 @@ impl App {
 
     pub fn poll_scan(&mut self) {
         let mut finished = false;
+        let mut completed = false;
         let Some(receiver) = &self.scan_receiver else {
             return;
         };
@@ -2093,7 +2104,12 @@ impl App {
                             .sort_by(|left, right| left.name.cmp(&right.name));
                     }
                 }
-                Ok(ScanEvent::Finished) | Err(TryRecvError::Disconnected) => {
+                Ok(ScanEvent::Finished) => {
+                    finished = true;
+                    completed = true;
+                    break;
+                }
+                Err(TryRecvError::Disconnected) => {
                     finished = true;
                     break;
                 }
@@ -2103,8 +2119,19 @@ impl App {
         if finished {
             self.scanning = false;
             self.scan_receiver = None;
+            let mut errors = Vec::new();
             if let Err(error) = self.repository_store.save_candidates(&self.candidates) {
-                self.message = Some(error.to_string());
+                errors.push(error.to_string());
+            }
+            if self.initial_home_scan_in_progress
+                && completed
+                && let Err(error) = self.repository_store.mark_initial_home_scan_complete()
+            {
+                errors.push(error.to_string());
+            }
+            self.initial_home_scan_in_progress = false;
+            if !errors.is_empty() {
+                self.message = Some(errors.join("; "));
             }
             self.candidate_index = self
                 .candidate_index
