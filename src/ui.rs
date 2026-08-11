@@ -164,7 +164,7 @@ struct ApprovalOption {
 }
 
 pub async fn run(mut app: App) -> Result<()> {
-    let server_started = Instant::now();
+    let server_started = app.performance.start_timer();
     let server = AppServer::spawn_measured(
         "codex",
         Duration::from_secs(30),
@@ -178,11 +178,11 @@ pub async fn run(mut app: App) -> Result<()> {
         &[],
     );
     let server = server?;
-    let cleanup_started = Instant::now();
+    let cleanup_started = app.performance.start_timer();
     cleanup_abandoned_side_chats(&mut app, &server).await;
     app.performance
         .record_duration("startup.side_chat_cleanup", cleanup_started, "success", &[]);
-    let models_started = Instant::now();
+    let models_started = app.performance.start_timer();
     let models = server.list_models().await;
     app.performance.record_duration(
         "startup.models",
@@ -194,7 +194,7 @@ pub async fn run(mut app: App) -> Result<()> {
         Ok(models) => app.set_models(models),
         Err(error) => app.message = Some(format!("Could not load models: {error}")),
     }
-    let terminal_started = Instant::now();
+    let terminal_started = app.performance.start_timer();
     let terminal = init_terminal();
     app.performance.record_duration(
         "startup.terminal",
@@ -272,15 +272,19 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
         tokio::select! {
             _ = redraw_ticker.tick() => {
                 if needs_draw {
-                    let draw_started = Instant::now();
-                    let mut render_duration = Duration::ZERO;
-                    terminal.draw(|frame| {
-                        let render_started = Instant::now();
-                        render(frame, app, &mut render_cache);
-                        render_duration = render_started.elapsed();
-                    })?;
-                    app.performance
-                        .record_frame(render_duration, draw_started.elapsed());
+                    if app.performance.is_enabled() {
+                        let draw_started = Instant::now();
+                        let mut render_duration = Duration::ZERO;
+                        terminal.draw(|frame| {
+                            let render_started = Instant::now();
+                            render(frame, app, &mut render_cache);
+                            render_duration = render_started.elapsed();
+                        })?;
+                        app.performance
+                            .record_frame(render_duration, draw_started.elapsed());
+                    } else {
+                        terminal.draw(|frame| render(frame, app, &mut render_cache))?;
+                    }
                     if !first_frame_drawn {
                         app.performance.record_elapsed("startup.first_frame");
                         first_frame_drawn = true;
@@ -291,7 +295,7 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                     {
                         app.performance.record_duration(
                             "thread.visible",
-                            pending.started,
+                            Some(pending.started),
                             "success",
                             &[("kind", pending.kind)],
                         );
@@ -978,32 +982,26 @@ async fn handle_key(
                 }
                 if app.activate_selected_thread_picker() {
                     cancel_chat_preview(preview_generation, preview_task);
-                    let thread_id = app.selected_thread().map(|thread| thread.record.id.clone());
-                    let history_is_complete = thread_id
-                        .as_ref()
-                        .and_then(|thread_id| app.chats.get(thread_id))
-                        .is_some_and(ChatState::history_is_complete);
-                    let kind = if history_is_complete {
-                        "cached"
-                    } else {
-                        "full"
-                    };
-                    let started = Instant::now();
+                    let timing = start_thread_open_timing(app);
                     match focus_selected_chat(app, server).await {
                         Ok(()) => {
-                            *pending.thread_paint = thread_id.map(|thread_id| PendingThreadPaint {
-                                thread_id,
-                                kind,
-                                started,
+                            *pending.thread_paint = timing.and_then(|(started, kind)| {
+                                app.chat().map(|chat| PendingThreadPaint {
+                                    thread_id: chat.thread_id.clone(),
+                                    kind,
+                                    started,
+                                })
                             });
                         }
                         Err(error) => {
-                            app.performance.record_duration(
-                                "thread.visible",
-                                started,
-                                "error",
-                                &[("kind", kind)],
-                            );
+                            if let Some((started, kind)) = timing {
+                                app.performance.record_duration(
+                                    "thread.visible",
+                                    Some(started),
+                                    "error",
+                                    &[("kind", kind)],
+                                );
+                            }
                             app.message = Some(format!("Could not open thread: {error}"));
                         }
                     }
@@ -1341,32 +1339,26 @@ async fn handle_key(
             {
                 cancel_chat_preview(preview_generation, preview_task);
                 let mode = selected_thread_entry_mode(&key.code).expect("guarded above");
-                let thread_id = app.selected_thread().map(|thread| thread.record.id.clone());
-                let history_is_complete = thread_id
-                    .as_ref()
-                    .and_then(|thread_id| app.chats.get(thread_id))
-                    .is_some_and(ChatState::history_is_complete);
-                let kind = if history_is_complete {
-                    "cached"
-                } else {
-                    "full"
-                };
-                let started = Instant::now();
+                let timing = start_thread_open_timing(app);
                 match focus_selected_chat_in_mode(app, server, mode).await {
                     Ok(()) => {
-                        *pending.thread_paint = thread_id.map(|thread_id| PendingThreadPaint {
-                            thread_id,
-                            kind,
-                            started,
+                        *pending.thread_paint = timing.and_then(|(started, kind)| {
+                            app.chat().map(|chat| PendingThreadPaint {
+                                thread_id: chat.thread_id.clone(),
+                                kind,
+                                started,
+                            })
                         });
                     }
                     Err(error) => {
-                        app.performance.record_duration(
-                            "thread.visible",
-                            started,
-                            "error",
-                            &[("kind", kind)],
-                        );
+                        if let Some((started, kind)) = timing {
+                            app.performance.record_duration(
+                                "thread.visible",
+                                Some(started),
+                                "error",
+                                &[("kind", kind)],
+                            );
+                        }
                         app.message = Some(format!("Could not open thread: {error}"));
                     }
                 }
@@ -3061,7 +3053,27 @@ fn schedule_selected_chat_preview(
     }));
 }
 
+fn start_thread_open_timing(app: &App) -> Option<(Instant, &'static str)> {
+    let started = app.performance.start_timer()?;
+    let history_is_complete = app
+        .selected_thread()
+        .and_then(|thread| app.chats.get(&thread.record.id))
+        .is_some_and(ChatState::history_is_complete);
+    Some((
+        started,
+        if history_is_complete {
+            "cached"
+        } else {
+            "full"
+        },
+    ))
+}
+
 fn begin_navigation_paint(app: &App, pending: &mut Option<PendingThreadPaint>) {
+    let Some(started) = app.performance.start_timer() else {
+        *pending = None;
+        return;
+    };
     let Some(thread_id) = app
         .selected_thread()
         .filter(|_| app.selected_tree_is_thread())
@@ -3078,7 +3090,7 @@ fn begin_navigation_paint(app: &App, pending: &mut Option<PendingThreadPaint>) {
     *pending = Some(PendingThreadPaint {
         thread_id,
         kind,
-        started: Instant::now(),
+        started,
     });
 }
 

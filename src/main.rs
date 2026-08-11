@@ -19,7 +19,6 @@ use std::{
     path::Path,
     process::Command as ProcessCommand,
     sync::Arc,
-    time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
@@ -79,7 +78,7 @@ fn main() -> Result<()> {
 }
 
 fn run(performance: Arc<performance::PerformanceSession>) -> Result<()> {
-    let cli_started = Instant::now();
+    let cli_started = performance.start_timer();
     let cli = Cli::parse();
     performance.record_duration("startup.cli_parse", cli_started, "success", &[]);
     match (cli.config, cli.config_path, cli.reset_config, cli.command) {
@@ -88,7 +87,7 @@ fn run(performance: Arc<performance::PerformanceSession>) -> Result<()> {
         (false, false, true, None) => reset_config()?,
         (false, false, false, None) => {
             performance.mark_interactive();
-            let lock_started = Instant::now();
+            let lock_started = performance.start_timer();
             let instance_lock = app_server::InstanceLock::acquire();
             performance.record_duration(
                 "startup.instance_lock",
@@ -101,13 +100,13 @@ fn run(performance: Arc<performance::PerformanceSession>) -> Result<()> {
                 &[],
             );
             let _instance_lock = instance_lock?;
-            let runtime_started = Instant::now();
+            let runtime_started = performance.start_timer();
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .context("build Tokio runtime")?;
             performance.record_duration("startup.runtime", runtime_started, "success", &[]);
-            let app_started = Instant::now();
+            let app_started = performance.start_timer();
             let app = App::load(Arc::clone(&performance));
             performance.record_duration(
                 "startup.app_load",

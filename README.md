@@ -52,9 +52,17 @@ shi --config-path
 
 The equivalent subcommand form is `shi config path`.
 
-Shikigami always records lightweight local performance measurements for
-interactive sessions. Show p50, p95, and maximum startup, App Server, repository
-scan, thread-display, and frame-render times with:
+Enable lightweight local performance measurements for an interactive session
+with `SHI_PERF=1`:
+
+```bash
+SHI_PERF=1 shi
+```
+
+Set `SHI_PERF=1` in your shell environment to keep measurement enabled for
+development. It is disabled when the variable is unset or has another value.
+Show p50, p95, and maximum startup, App Server, repository scan, thread-display,
+and frame-render times with:
 
 ```bash
 shi perf

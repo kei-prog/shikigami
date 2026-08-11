@@ -8,7 +8,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -136,7 +136,9 @@ impl AppServer {
         request_timeout: Duration,
         performance: Option<Arc<PerformanceSession>>,
     ) -> Result<Arc<Self>> {
-        let version_started = Instant::now();
+        let version_started = performance
+            .as_ref()
+            .and_then(|performance| performance.start_timer());
         let version_output = Command::new(command)
             .arg("--version")
             .output()
@@ -171,7 +173,9 @@ impl AppServer {
             .truncate(true)
             .open(&log_path)
             .with_context(|| format!("open App Server log {}", log_path.display()))?;
-        let process_started = Instant::now();
+        let process_started = performance
+            .as_ref()
+            .and_then(|performance| performance.start_timer());
         let mut child = Command::new(command)
             .args(["app-server", "--listen", "stdio://"])
             .stdin(Stdio::piped())
@@ -290,7 +294,10 @@ impl AppServer {
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        let started = Instant::now();
+        let started = self
+            .performance
+            .as_ref()
+            .and_then(|performance| performance.start_timer());
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
         self.pending.lock().await.insert(id, sender);

@@ -1,5 +1,7 @@
 use std::{
     collections::BTreeMap,
+    env,
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -15,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::paths;
 
 const FORMAT_VERSION: u8 = 1;
+const ENABLE_ENV: &str = "SHI_PERF";
 const LOG_FILE_NAME: &str = "performance-v1.jsonl";
 const MAX_LOG_BYTES: usize = 1024 * 1024;
 const MAX_SESSIONS: usize = 200;
@@ -81,6 +84,7 @@ impl AtomicHistogram {
 }
 
 pub struct PerformanceSession {
+    enabled: bool,
     started: Instant,
     started_at_unix_millis: u64,
     interactive: AtomicBool,
@@ -92,12 +96,18 @@ pub struct PerformanceSession {
 
 impl PerformanceSession {
     pub fn start() -> Arc<Self> {
+        let value = env::var_os(ENABLE_ENV);
+        Self::start_with_enabled(enabled_from_env_value(value.as_deref()))
+    }
+
+    fn start_with_enabled(enabled: bool) -> Arc<Self> {
         let started_at_unix_millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis()
             .min(u64::MAX as u128) as u64;
         Arc::new(Self {
+            enabled,
             started: Instant::now(),
             started_at_unix_millis,
             interactive: AtomicBool::new(false),
@@ -108,11 +118,22 @@ impl PerformanceSession {
         })
     }
 
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn start_timer(&self) -> Option<Instant> {
+        self.enabled.then(Instant::now)
+    }
+
     pub fn mark_interactive(&self) {
         self.interactive.store(true, Ordering::Relaxed);
     }
 
     pub fn record_elapsed(&self, metric: &str) {
+        if !self.enabled {
+            return;
+        }
         let elapsed = self.started.elapsed();
         self.record_event(metric, elapsed, "success", &[]);
     }
@@ -120,11 +141,13 @@ impl PerformanceSession {
     pub fn record_duration(
         &self,
         metric: &str,
-        started: Instant,
+        started: Option<Instant>,
         outcome: &str,
         tags: &[(&str, &str)],
     ) {
-        self.record_event(metric, started.elapsed(), outcome, tags);
+        if let Some(started) = started {
+            self.record_event(metric, started.elapsed(), outcome, tags);
+        }
     }
 
     pub fn record_value(
@@ -134,6 +157,9 @@ impl PerformanceSession {
         outcome: &str,
         tags: &[(&str, &str)],
     ) {
+        if !self.enabled {
+            return;
+        }
         self.record_event(metric, duration, outcome, tags);
     }
 
@@ -158,12 +184,15 @@ impl PerformanceSession {
     }
 
     pub fn record_frame(&self, render: Duration, draw: Duration) {
+        if !self.enabled {
+            return;
+        }
         self.render_frames.record(render);
         self.draw_frames.record(draw);
     }
 
     pub fn save(&self) -> Result<()> {
-        if !self.interactive.load(Ordering::Relaxed) {
+        if !self.enabled || !self.interactive.load(Ordering::Relaxed) {
             return Ok(());
         }
         let path = performance_path()?;
@@ -195,6 +224,10 @@ impl PerformanceSession {
         };
         save_session(path, &session)
     }
+}
+
+fn enabled_from_env_value(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
 }
 
 pub fn print_report() -> Result<()> {
@@ -367,7 +400,7 @@ mod tests {
     fn saves_and_loads_an_interactive_session() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("performance.jsonl");
-        let session = PerformanceSession::start();
+        let session = PerformanceSession::start_with_enabled(true);
         session.mark_interactive();
         session.record_value(
             "startup.app_load",
@@ -387,6 +420,25 @@ mod tests {
     }
 
     #[test]
+    fn disabled_session_does_not_collect_measurements() {
+        let session = PerformanceSession::start_with_enabled(false);
+        session.record_value("event", Duration::from_millis(1), "success", &[]);
+        session.record_frame(Duration::from_millis(1), Duration::from_millis(2));
+
+        assert!(session.events.lock().unwrap().is_empty());
+        assert_eq!(session.render_frames.snapshot().0, [0; 7]);
+        assert_eq!(session.draw_frames.snapshot().0, [0; 7]);
+    }
+
+    #[test]
+    fn only_one_enables_performance_measurement() {
+        assert!(enabled_from_env_value(Some(OsStr::new("1"))));
+        assert!(!enabled_from_env_value(None));
+        assert!(!enabled_from_env_value(Some(OsStr::new("0"))));
+        assert!(!enabled_from_env_value(Some(OsStr::new("true"))));
+    }
+
+    #[test]
     fn percentile_uses_the_nearest_rank() {
         assert_eq!(percentile(&[1, 2, 3, 4], 50), 2);
         assert_eq!(percentile(&[1, 2, 3, 4], 95), 4);
@@ -400,7 +452,7 @@ mod tests {
 
     #[test]
     fn bounds_events_in_a_long_running_session() {
-        let session = PerformanceSession::start();
+        let session = PerformanceSession::start_with_enabled(true);
         for _ in 0..MAX_EVENTS_PER_SESSION + 5 {
             session.record_value("event", Duration::ZERO, "success", &[]);
         }
@@ -432,7 +484,7 @@ mod tests {
     #[test]
     #[ignore = "manual performance measurement"]
     fn measures_frame_recording_overhead() {
-        let session = PerformanceSession::start();
+        let session = PerformanceSession::start_with_enabled(true);
         let iterations = 1_000_000;
         let started = Instant::now();
         for _ in 0..iterations {

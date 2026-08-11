@@ -2246,7 +2246,7 @@ impl App {
                             {
                                 self.performance.record_duration(
                                     "repository_scan.first_result",
-                                    started,
+                                    Some(started),
                                     "success",
                                     &[("scope", scope)],
                                 );
@@ -2311,7 +2311,7 @@ impl App {
                 if let Some(started) = scan_started_at {
                     self.performance.record_duration(
                         "repository_scan.visible_total",
-                        started,
+                        Some(started),
                         if completed { "success" } else { "error" },
                         &[("scope", scope), ("found", &found)],
                     );
@@ -3418,7 +3418,7 @@ impl App {
             ScanScope::Roots(_) => "roots",
             ScanScope::Home => "home",
         });
-        self.scan_started_at = Some(Instant::now());
+        self.scan_started_at = self.performance.start_timer();
         self.scan_receiver = Some(start_scan(scope));
         self.scan_animation_tick = 0;
         self.scan_first_result_recorded = false;
