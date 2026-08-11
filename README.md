@@ -286,7 +286,7 @@ New output follows the bottom only while the view is already at the latest
 message. Entering scroll mode always starts from the latest message at the
 bottom.
 
-Press `Ctrl-v` (or `Ctrl-Alt-v` in terminals that reserve `Ctrl-v`) to attach
+Press `Ctrl-v` (or `Alt-v` in terminals that reserve `Ctrl-v`) to attach
 an image from the system clipboard. Pasting a single PNG, JPEG, GIF, or WebP
 file path also attaches that file; other pasted content remains composer text.
 Attachments appear as numbered image rows in the message box. `Backspace` in an
