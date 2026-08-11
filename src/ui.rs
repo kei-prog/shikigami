@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{self, Stdout},
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -736,6 +737,9 @@ async fn handle_key(
                     } else {
                         app.message = Some("Scroll a diff hunk into view first".into());
                     }
+                }
+                KeyCode::Char(number @ '1'..='9') => {
+                    open_selected_message_link(app, number.to_digit(10).unwrap_or(0) as usize);
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     if let Some(chat) = app.chat_mut() {
@@ -1829,6 +1833,57 @@ fn copy_selected_message(app: &mut App) {
         },
         None => "No message selected".into(),
     });
+}
+
+fn open_selected_message_link(app: &mut App, number: usize) {
+    let Some(message) = app.chat().and_then(ChatState::selected_message) else {
+        app.message = Some("Select a message with J / K first".into());
+        return;
+    };
+    let links = message_web_links(&message.content);
+    let Some(url) = links.get(number.saturating_sub(1)) else {
+        app.message = Some(if links.is_empty() {
+            "Selected message has no numbered links".into()
+        } else {
+            format!("Selected message has only {} numbered links", links.len())
+        });
+        return;
+    };
+    app.message = Some(match open_web_link(url) {
+        Ok(()) => format!("Opened link [{number}]"),
+        Err(error) => format!("Could not open link [{number}]: {error}"),
+    });
+}
+
+fn open_web_link(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = tokio::process::Command::new("open");
+        command.arg(url);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = tokio::process::Command::new("rundll32.exe");
+        command.args(["url.dll,FileProtocolHandler", url]);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = {
+        let mut command = tokio::process::Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("launch the system browser for {url}"))?;
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    Ok(())
 }
 
 fn copy_conversation(app: &mut App) {
@@ -4006,22 +4061,26 @@ fn chat_help(
                 keybindings.label("chat_input.focus_tree"),
             ),
             (ChatMode::Scroll, true) => format!(
-                "MESSAGES · {} / {} line · {} / {} msg · {} editor cmd · {} copy · {} input · {} repositories",
+                "MESSAGES · {} / {} line · {} / {} msg · {}-{} link · {} editor cmd · {} copy · {} input · {} repositories",
                 keybindings.label("chat_scroll.line_up"),
                 keybindings.label("chat_scroll.line_down"),
                 keybindings.label("chat_scroll.previous_message"),
                 keybindings.label("chat_scroll.next_message"),
+                keybindings.label("chat_scroll.open_link_1"),
+                keybindings.label("chat_scroll.open_link_9"),
                 keybindings.label("chat_scroll.copy_editor_command"),
                 keybindings.label("chat_scroll.copy_message"),
                 keybindings.label("chat_scroll.focus_input"),
                 keybindings.label("chat_scroll.focus_tree"),
             ),
             (ChatMode::Scroll, false) => format!(
-                "MESSAGES · {} / {} line · {} / {} msg · {} editor cmd · {} / {} copy · {} / {} half · {} input · {} repositories",
+                "MESSAGES · {} / {} line · {} / {} msg · {}-{} link · {} editor cmd · {} / {} copy · {} / {} half · {} input · {} repositories",
                 keybindings.label("chat_scroll.line_up"),
                 keybindings.label("chat_scroll.line_down"),
                 keybindings.label("chat_scroll.previous_message"),
                 keybindings.label("chat_scroll.next_message"),
+                keybindings.label("chat_scroll.open_link_1"),
+                keybindings.label("chat_scroll.open_link_9"),
                 keybindings.label("chat_scroll.copy_editor_command"),
                 keybindings.label("chat_scroll.copy_message"),
                 keybindings.label("chat_scroll.copy_conversation"),

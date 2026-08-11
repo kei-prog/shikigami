@@ -77,6 +77,8 @@ struct MarkdownRenderer {
     quote_depth: usize,
     code_block: bool,
     code_line: String,
+    links: Vec<String>,
+    active_link: Option<usize>,
 }
 
 impl MarkdownRenderer {
@@ -91,6 +93,8 @@ impl MarkdownRenderer {
             quote_depth: 0,
             code_block: false,
             code_line: String::new(),
+            links: Vec::new(),
+            active_link: None,
         }
     }
 
@@ -164,11 +168,14 @@ impl MarkdownRenderer {
             Tag::Strikethrough => self
                 .styles
                 .push(Style::default().add_modifier(Modifier::CROSSED_OUT)),
-            Tag::Link { .. } => self.styles.push(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::UNDERLINED),
-            ),
+            Tag::Link { dest_url, .. } => {
+                self.active_link = web_link_number(&mut self.links, &dest_url);
+                self.styles.push(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::UNDERLINED),
+                );
+            }
             Tag::Image { .. } => self.styles.push(
                 Style::default()
                     .fg(Color::Magenta)
@@ -222,11 +229,13 @@ impl MarkdownRenderer {
                 self.styles.pop();
                 self.blank_line();
             }
-            TagEnd::Strong
-            | TagEnd::Emphasis
-            | TagEnd::Strikethrough
-            | TagEnd::Link
-            | TagEnd::Image => {
+            TagEnd::Link => {
+                self.styles.pop();
+                if let Some(number) = self.active_link.take() {
+                    self.push_link_number(number);
+                }
+            }
+            TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough | TagEnd::Image => {
                 self.styles.pop();
             }
             TagEnd::BlockQuote(_) => {
@@ -255,6 +264,14 @@ impl MarkdownRenderer {
     }
 
     fn push_text(&mut self, text: &str) {
+        if self.active_link.is_none() && !self.code_block {
+            self.push_text_with_bare_links(text);
+            return;
+        }
+        self.push_plain_text(text);
+    }
+
+    fn push_plain_text(&mut self, text: &str) {
         let style = self.current_style();
         for (index, part) in text.split('\n').enumerate() {
             if index > 0 {
@@ -265,6 +282,34 @@ impl MarkdownRenderer {
                 self.spans.push(Span::styled(part.to_owned(), style));
             }
         }
+    }
+
+    fn push_text_with_bare_links(&mut self, text: &str) {
+        let mut remaining = text;
+        while let Some((start, end)) = next_bare_web_link(remaining) {
+            self.push_plain_text(&remaining[..start]);
+            let url = &remaining[start..end];
+            if let Some(number) = web_link_number(&mut self.links, url) {
+                self.push_styled(
+                    url,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::UNDERLINED),
+                );
+                self.push_link_number(number);
+            }
+            remaining = &remaining[end..];
+        }
+        self.push_plain_text(remaining);
+    }
+
+    fn push_link_number(&mut self, number: usize) {
+        self.push_styled(
+            &format!("[{number}]"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
     }
 
     fn push_styled(&mut self, text: &str, style: Style) {
@@ -337,6 +382,55 @@ impl MarkdownRenderer {
             .iter()
             .fold(Style::default(), |style, addition| style.patch(*addition))
     }
+}
+
+fn web_link_number(links: &mut Vec<String>, destination: &str) -> Option<usize> {
+    if !destination.starts_with("https://") && !destination.starts_with("http://") {
+        return None;
+    }
+    if let Some(index) = links.iter().position(|link| link == destination) {
+        return Some(index + 1);
+    }
+    links.push(destination.to_owned());
+    Some(links.len())
+}
+
+fn next_bare_web_link(text: &str) -> Option<(usize, usize)> {
+    let start = [text.find("https://"), text.find("http://")]
+        .into_iter()
+        .flatten()
+        .min()?;
+    let candidate = &text[start..];
+    let raw_end = candidate
+        .find(char::is_whitespace)
+        .unwrap_or(candidate.len());
+    let trimmed =
+        candidate[..raw_end].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}']);
+    Some((start, start + trimmed.len()))
+}
+
+pub(super) fn message_web_links(content: &str) -> Vec<String> {
+    let mut links = Vec::new();
+    let parser = Parser::new_ext(content, Options::ENABLE_STRIKETHROUGH);
+    let mut inside_link = false;
+    for event in parser {
+        match event {
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                inside_link = true;
+                web_link_number(&mut links, &dest_url);
+            }
+            Event::End(TagEnd::Link) => inside_link = false,
+            Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) if !inside_link => {
+                let mut remaining = text.as_ref();
+                while let Some((start, end)) = next_bare_web_link(remaining) {
+                    web_link_number(&mut links, &remaining[start..end]);
+                    remaining = &remaining[end..];
+                }
+            }
+            _ => {}
+        }
+    }
+    links
 }
 
 fn markdown_message_lines(content: &str, available_width: usize) -> Vec<Line<'static>> {
@@ -817,5 +911,30 @@ mod tests {
 
         assert!(text.contains("Working on **unfinished"));
         assert!(text.contains("let value = 1;"));
+    }
+
+    #[test]
+    fn markdown_numbers_named_and_bare_web_links_in_encounter_order() {
+        let content = "Read [Rust](https://rust-lang.org) then https://example.com/docs. Again [Rust](https://rust-lang.org).";
+        let lines = markdown_message_lines(content, 120);
+        let text = lines.iter().map(line_text).collect::<String>();
+
+        assert!(text.contains("Rust[1]"));
+        assert!(text.contains("https://example.com/docs[2]."));
+        assert!(text.ends_with("Rust[1]."));
+        assert_eq!(
+            message_web_links(content),
+            vec!["https://rust-lang.org", "https://example.com/docs"]
+        );
+    }
+
+    #[test]
+    fn markdown_does_not_number_non_web_or_code_links() {
+        let content = "[file](../README.md) and `https://example.com/code`";
+        let lines = markdown_message_lines(content, 80);
+        let text = lines.iter().map(line_text).collect::<String>();
+
+        assert!(!text.contains("[1]"));
+        assert!(message_web_links(content).is_empty());
     }
 }

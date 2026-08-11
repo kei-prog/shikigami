@@ -131,6 +131,7 @@ levels deep; choose a projects folder directly for repositories nested deeper.
 - `Enter`: expand a repository or focus the selected thread's chat input
 - `i`: focus the selected thread's chat input directly
 - `Tab`: focus the open chat
+- In message scroll mode, `J` / `K` selects a message and `1`–`9` opens its numbered web link in the system browser
 - `Esc`: select the parent group or return from chat to the tree
 - `/`: open the command palette
 - `f`: fuzzy-search active threads from the thread tree
