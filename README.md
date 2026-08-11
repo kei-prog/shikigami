@@ -4,6 +4,8 @@ Shikigami is a fast, lightweight TUI for switching between Codex CLI threads
 across repositories. It keeps a small list of repositories chosen by the user,
 uses Codex App Server, and only lists threads created through Shikigami.
 
+![Shikigami TUI showing its first-run help chat](docs/shikigami.png)
+
 ## Requirements
 
 - Rust 1.88 or later
