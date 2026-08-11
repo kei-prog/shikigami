@@ -105,7 +105,10 @@ chat focus and interrupt bindings are fully replaceable.
 The `?` help screen displays the active bindings and config path. Press `Enter`
 there to create or reopen a dedicated `Shikigami Help` chat in General. Only
 that chat receives the bundled README as product context, so normal chats keep
-their context focused on the user's work.
+their context focused on the user's work. It can also turn a feature request or
+bug report into a reviewable issue draft and direct the user to
+[GitHub Issues](https://github.com/kei-prog/shikigami/issues/new); it never
+submits the issue itself.
 
 Shikigami opens with a `General` area for one-off chats. On a fresh installation,
 it starts one `Shikigami Help` welcome chat there after drawing the first
