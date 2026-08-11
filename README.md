@@ -130,7 +130,9 @@ home-directory scan. Results are cached for later launches. Add more repositorie
 with `a`, use `r` to rescan `ghq` and saved projects folders, `s` to explicitly
 scan the home directory, or `b` to choose another folder or repository. The main
 screen only shows repositories you register. Home scans search six directory
-levels deep; choose a projects folder directly for repositories nested deeper.
+levels deep. In the folder browser, highlight a Git repository and press `a` to
+register it, or open a projects folder and press `s` to scan repositories nested
+deeper.
 
 - `j` / `k`: move through the thread tree and preview the selected thread
 - `h` / `l`: collapse or expand a repository; `l` focuses a selected thread's messages

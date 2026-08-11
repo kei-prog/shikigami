@@ -2378,7 +2378,9 @@ impl App {
     }
 
     pub fn browse_into_selected(&mut self) {
-        let Some(path) = self.browse_directories.get(self.browse_index).cloned() else {
+        let Some(path) = selected_browse_directory(&self.browse_directories, self.browse_index)
+            .map(Path::to_path_buf)
+        else {
             return;
         };
         self.browse_path = path;
@@ -2393,7 +2395,9 @@ impl App {
     }
 
     pub fn register_browse_path(&mut self) -> Result<()> {
-        let repository = repository::repository_at(&self.browse_path)?;
+        let path = selected_browse_directory(&self.browse_directories, self.browse_index)
+            .context("select a repository folder first")?;
+        let repository = repository::repository_at(path)?;
         self.repository_store.register(&[repository])?;
         self.refresh_repositories()?;
         self.mode = Mode::Normal;
@@ -4065,6 +4069,10 @@ fn attention_kind_for_event(event: &AppServerEvent) -> Option<AttentionKind> {
     }
 }
 
+fn selected_browse_directory(directories: &[PathBuf], index: usize) -> Option<&Path> {
+    directories.get(index).map(PathBuf::as_path)
+}
+
 fn upsert_attention(
     items: &mut VecDeque<AttentionItem>,
     thread_id: String,
@@ -4168,6 +4176,17 @@ mod tests {
         remember_archive_undo(&mut history, archive_undo("1"));
         assert_eq!(history.len(), MAX_ARCHIVE_UNDOS);
         assert_eq!(history.back().map(|undo| undo.id.as_str()), Some("1"));
+    }
+
+    #[test]
+    fn browse_selection_uses_the_highlighted_directory() {
+        let directories = vec![PathBuf::from("first"), PathBuf::from("second")];
+
+        assert_eq!(
+            selected_browse_directory(&directories, 1),
+            Some(Path::new("second"))
+        );
+        assert_eq!(selected_browse_directory(&directories, 2), None);
     }
 
     #[test]

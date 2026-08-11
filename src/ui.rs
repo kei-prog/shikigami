@@ -5683,11 +5683,11 @@ fn render_browser(frame: &mut Frame, area: Rect, app: &App) {
         .block(
             Block::default()
                 .title(format!(
-                    " Choose projects folder or repository · {} ",
+                    " Register repository · {} ",
                     app.browse_path.display()
                 ))
                 .title_bottom(Line::from(format!(
-                    " {} open · {} parent · {} scan folder · {} register repository · {} back ",
+                    " {} open · {} parent · {} scan folder · {} register selected · {} back ",
                     app.keybindings.label("directory.open"),
                     app.keybindings.label("directory.parent"),
                     app.keybindings.label("directory.scan"),
