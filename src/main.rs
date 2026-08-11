@@ -6,6 +6,7 @@ mod git_workspace;
 mod keybindings;
 mod onboarding;
 mod paths;
+mod performance;
 mod registry;
 mod repository;
 mod settings;
@@ -17,6 +18,8 @@ use std::{
     io::{self, Write},
     path::Path,
     process::Command as ProcessCommand,
+    sync::Arc,
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
@@ -52,6 +55,8 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Show locally recorded startup and interaction performance
+    Perf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -66,19 +71,55 @@ enum ConfigCommand {
     Path,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let performance = performance::PerformanceSession::start();
+    let result = run(Arc::clone(&performance));
+    let _ = performance.save();
+    result
+}
+
+fn run(performance: Arc<performance::PerformanceSession>) -> Result<()> {
+    let cli_started = Instant::now();
     let cli = Cli::parse();
+    performance.record_duration("startup.cli_parse", cli_started, "success", &[]);
     match (cli.config, cli.config_path, cli.reset_config, cli.command) {
         (true, false, false, None) => open_config()?,
         (false, true, false, None) => print_config_path()?,
         (false, false, true, None) => reset_config()?,
         (false, false, false, None) => {
-            let _instance_lock = app_server::InstanceLock::acquire()?;
-            ui::run(App::load()?).await?
+            performance.mark_interactive();
+            let lock_started = Instant::now();
+            let instance_lock = app_server::InstanceLock::acquire();
+            performance.record_duration(
+                "startup.instance_lock",
+                lock_started,
+                if instance_lock.is_ok() {
+                    "success"
+                } else {
+                    "error"
+                },
+                &[],
+            );
+            let _instance_lock = instance_lock?;
+            let runtime_started = Instant::now();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("build Tokio runtime")?;
+            performance.record_duration("startup.runtime", runtime_started, "success", &[]);
+            let app_started = Instant::now();
+            let app = App::load(Arc::clone(&performance));
+            performance.record_duration(
+                "startup.app_load",
+                app_started,
+                if app.is_ok() { "success" } else { "error" },
+                &[],
+            );
+            runtime.block_on(ui::run(app?))?
         }
         (false, false, false, Some(Command::Repo { command })) => run_repo_command(command)?,
         (false, false, false, Some(Command::Config { command })) => run_config_command(command)?,
+        (false, false, false, Some(Command::Perf)) => performance::print_report()?,
         _ => unreachable!("clap rejects conflicting config options"),
     }
 
@@ -198,6 +239,13 @@ mod tests {
         assert!(edit.config);
         assert!(path.config_path);
         assert!(reset.reset_config);
+    }
+
+    #[test]
+    fn performance_report_is_a_subcommand() {
+        let cli = Cli::try_parse_from(["shi", "perf"]).unwrap();
+
+        assert!(matches!(cli.command, Some(Command::Perf)));
     }
 
     #[test]

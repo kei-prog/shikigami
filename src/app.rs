@@ -3,6 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
+        Arc,
         atomic::{AtomicU64, Ordering},
         mpsc::{Receiver, TryRecvError},
     },
@@ -23,6 +24,7 @@ use crate::{
     keybindings::KeyBindings,
     onboarding::{self, OnboardingStore},
     paths,
+    performance::PerformanceSession,
     registry::{
         AttentionRegistry, PersistentAttentionKind, Registry, SideChatRegistry, ThreadRecord,
         ThreadScope, ThreadTitleCache,
@@ -275,6 +277,7 @@ struct ArchivedThreadUndo {
 }
 
 pub struct App {
+    pub performance: Arc<PerformanceSession>,
     pub repositories: Vec<Repository>,
     pub threads: Vec<ThreadItem>,
     pub locations: Vec<Workspace>,
@@ -349,12 +352,16 @@ pub struct App {
     workspaces_by_repository: HashMap<PathBuf, Vec<Workspace>>,
     scan_receiver: Option<Receiver<ScanEvent>>,
     scan_label: Option<&'static str>,
+    scan_metric_scope: Option<&'static str>,
     scan_animation_tick: usize,
+    scan_started_at: Option<Instant>,
+    scan_first_result_recorded: bool,
+    scan_found_count: usize,
     initial_home_scan_in_progress: bool,
 }
 
 impl App {
-    pub fn load() -> Result<Self> {
+    pub fn load(performance: Arc<PerformanceSession>) -> Result<Self> {
         let repository_store = RepositoryStore::discover()?;
         let settings_store = SettingsStore::discover()?;
         let onboarding_store = OnboardingStore::discover()?;
@@ -465,6 +472,7 @@ impl App {
         .collect::<Vec<_>>()
         .join("; ");
         let mut app = Self {
+            performance,
             repositories,
             threads: Vec::new(),
             locations: Vec::new(),
@@ -538,7 +546,11 @@ impl App {
             workspaces_by_repository: HashMap::new(),
             scan_receiver: None,
             scan_label: None,
+            scan_metric_scope: None,
             scan_animation_tick: 0,
+            scan_started_at: None,
+            scan_first_result_recorded: false,
+            scan_found_count: 0,
             initial_home_scan_in_progress: false,
         };
         app.refresh_current();
@@ -2215,6 +2227,7 @@ impl App {
     pub fn poll_scan(&mut self) {
         let mut finished = false;
         let mut completed = false;
+        let mut worker_duration = None;
         let Some(receiver) = &self.scan_receiver else {
             return;
         };
@@ -2227,14 +2240,31 @@ impl App {
                         .iter()
                         .any(|candidate| candidate.path == repository.path)
                     {
+                        if !self.scan_first_result_recorded {
+                            if let (Some(started), Some(scope)) =
+                                (self.scan_started_at, self.scan_metric_scope)
+                            {
+                                self.performance.record_duration(
+                                    "repository_scan.first_result",
+                                    started,
+                                    "success",
+                                    &[("scope", scope)],
+                                );
+                            }
+                            self.scan_first_result_recorded = true;
+                        }
                         self.candidates.push(repository);
+                        self.scan_found_count += 1;
                         self.candidates
                             .sort_by(|left, right| left.name.cmp(&right.name));
                     }
                 }
-                Ok(ScanEvent::Finished) => {
+                Ok(ScanEvent::Finished {
+                    worker_duration: duration,
+                }) => {
                     finished = true;
                     completed = true;
+                    worker_duration = Some(duration);
                     break;
                 }
                 Err(TryRecvError::Disconnected) => {
@@ -2245,6 +2275,9 @@ impl App {
             }
         }
         if finished {
+            let scan_started_at = self.scan_started_at.take();
+            let scan_scope = self.scan_metric_scope.take();
+            let scan_found_count = self.scan_found_count;
             self.scanning = false;
             self.scan_receiver = None;
             self.scan_label = None;
@@ -2265,6 +2298,25 @@ impl App {
             self.candidate_index = self
                 .candidate_index
                 .min(self.visible_candidates().len().saturating_sub(1));
+            if let Some(scope) = scan_scope {
+                let found = scan_found_count.to_string();
+                if let Some(duration) = worker_duration {
+                    self.performance.record_value(
+                        "repository_scan.worker_total",
+                        duration,
+                        "success",
+                        &[("scope", scope), ("found", &found)],
+                    );
+                }
+                if let Some(started) = scan_started_at {
+                    self.performance.record_duration(
+                        "repository_scan.visible_total",
+                        started,
+                        if completed { "success" } else { "error" },
+                        &[("scope", scope), ("found", &found)],
+                    );
+                }
+            }
         }
     }
 
@@ -3362,8 +3414,15 @@ impl App {
             ScanScope::Roots(_) => "projects folders",
             ScanScope::Home => "home directory",
         });
+        self.scan_metric_scope = Some(match &scope {
+            ScanScope::Roots(_) => "roots",
+            ScanScope::Home => "home",
+        });
+        self.scan_started_at = Some(Instant::now());
         self.scan_receiver = Some(start_scan(scope));
         self.scan_animation_tick = 0;
+        self.scan_first_result_recorded = false;
+        self.scan_found_count = 0;
         self.scanning = true;
     }
 

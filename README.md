@@ -52,6 +52,18 @@ shi --config-path
 
 The equivalent subcommand form is `shi config path`.
 
+Shikigami always records lightweight local performance measurements for
+interactive sessions. Show p50, p95, and maximum startup, App Server, repository
+scan, thread-display, and frame-render times with:
+
+```bash
+shi perf
+```
+
+Measurements stay in memory while the TUI is running and are written only after
+the terminal is restored. The cache keeps at most 200 sessions and 1 MiB. It
+does not record repository paths, thread IDs, prompts, or conversation content.
+
 Restore every binding to its default with:
 
 ```bash

@@ -5,6 +5,7 @@ use std::{
     process::Command,
     sync::mpsc::{self, Receiver, Sender},
     thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -54,7 +55,7 @@ pub enum ScanScope {
 
 pub enum ScanEvent {
     Found(Repository),
-    Finished,
+    Finished { worker_duration: Duration },
 }
 
 impl RepositoryStore {
@@ -220,6 +221,7 @@ impl RepositoryStore {
 pub fn start_scan(scope: ScanScope) -> Receiver<ScanEvent> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
+        let started = Instant::now();
         let mut seen = HashSet::new();
         let max_depth = max_depth(&scope);
         let ghq_root = ghq_root();
@@ -231,7 +233,9 @@ pub fn start_scan(scope: ScanScope) -> Receiver<ScanEvent> {
             }
             walk(&root, 0, max_depth, &sender, &mut seen);
         }
-        let _ = sender.send(ScanEvent::Finished);
+        let _ = sender.send(ScanEvent::Finished {
+            worker_duration: started.elapsed(),
+        });
     });
     receiver
 }

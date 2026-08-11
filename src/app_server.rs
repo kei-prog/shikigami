@@ -8,7 +8,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -23,7 +23,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::{paths, settings::ExecutionMode};
+use crate::{paths, performance::PerformanceSession, settings::ExecutionMode};
 
 type PendingResponses = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 
@@ -115,15 +115,45 @@ pub struct AppServer {
     server_requests: Mutex<mpsc::Receiver<AppServerRequest>>,
     version: String,
     request_timeout: Duration,
+    performance: Option<Arc<PerformanceSession>>,
 }
 
 impl AppServer {
     pub async fn spawn(command: &str, request_timeout: Duration) -> Result<Arc<Self>> {
+        Self::spawn_inner(command, request_timeout, None).await
+    }
+
+    pub async fn spawn_measured(
+        command: &str,
+        request_timeout: Duration,
+        performance: Arc<PerformanceSession>,
+    ) -> Result<Arc<Self>> {
+        Self::spawn_inner(command, request_timeout, Some(performance)).await
+    }
+
+    async fn spawn_inner(
+        command: &str,
+        request_timeout: Duration,
+        performance: Option<Arc<PerformanceSession>>,
+    ) -> Result<Arc<Self>> {
+        let version_started = Instant::now();
         let version_output = Command::new(command)
             .arg("--version")
             .output()
             .await
             .with_context(|| format!("run {command} --version"))?;
+        if let Some(performance) = &performance {
+            performance.record_duration(
+                "app_server.version",
+                version_started,
+                if version_output.status.success() {
+                    "success"
+                } else {
+                    "error"
+                },
+                &[],
+            );
+        }
         if !version_output.status.success() {
             bail!("{command} --version failed");
         }
@@ -141,6 +171,7 @@ impl AppServer {
             .truncate(true)
             .open(&log_path)
             .with_context(|| format!("open App Server log {}", log_path.display()))?;
+        let process_started = Instant::now();
         let mut child = Command::new(command)
             .args(["app-server", "--listen", "stdio://"])
             .stdin(Stdio::piped())
@@ -149,6 +180,14 @@ impl AppServer {
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("start {command} app-server"))?;
+        if let Some(performance) = &performance {
+            performance.record_duration(
+                "app_server.process_spawn",
+                process_started,
+                "success",
+                &[],
+            );
+        }
         let mut child_stdin = child.stdin.take().context("open App Server stdin")?;
         let child_stdout = child.stdout.take().context("open App Server stdout")?;
         let (writer, mut writer_rx) = mpsc::channel::<OutgoingMessage>(128);
@@ -211,6 +250,7 @@ impl AppServer {
             server_requests: Mutex::new(request_rx),
             version,
             request_timeout,
+            performance,
         });
 
         if let Err(error) = server.initialize().await {
@@ -250,6 +290,7 @@ impl AppServer {
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        let started = Instant::now();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
         self.pending.lock().await.insert(id, sender);
@@ -258,9 +299,17 @@ impl AppServer {
             .await
         {
             self.pending.lock().await.remove(&id);
+            if let Some(performance) = &self.performance {
+                performance.record_duration(
+                    "app_server.request",
+                    started,
+                    "error",
+                    &[("method", method)],
+                );
+            }
             return Err(error);
         }
-        match timeout(self.request_timeout, receiver).await {
+        let result = match timeout(self.request_timeout, receiver).await {
             Ok(Ok(Ok(value))) => Ok(value),
             Ok(Ok(Err(error))) => Err(anyhow!("Codex {method} error: {error}")),
             Ok(Err(_)) => Err(anyhow!("Codex {method} response channel closed")),
@@ -268,7 +317,16 @@ impl AppServer {
                 self.pending.lock().await.remove(&id);
                 Err(anyhow!("Codex {method} timed out"))
             }
+        };
+        if let Some(performance) = &self.performance {
+            performance.record_duration(
+                "app_server.request",
+                started,
+                if result.is_ok() { "success" } else { "error" },
+                &[("method", method)],
+            );
         }
+        result
     }
 
     pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
@@ -921,6 +979,7 @@ mod tests {
             server_requests: Mutex::new(request_rx),
             version: "test".into(),
             request_timeout: Duration::from_secs(1),
+            performance: None,
         });
 
         let task = tokio::spawn({
@@ -971,6 +1030,7 @@ mod tests {
             server_requests: Mutex::new(request_rx),
             version: "test".into(),
             request_timeout: Duration::from_secs(1),
+            performance: None,
         });
 
         let task = tokio::spawn({
@@ -1015,6 +1075,7 @@ mod tests {
             server_requests: Mutex::new(request_rx),
             version: "test".into(),
             request_timeout: Duration::from_secs(1),
+            performance: None,
         });
 
         let task = tokio::spawn({
@@ -1067,6 +1128,7 @@ mod tests {
             server_requests: Mutex::new(request_rx),
             version: "test".into(),
             request_timeout: Duration::from_secs(1),
+            performance: None,
         });
 
         let task = tokio::spawn({
@@ -1103,6 +1165,7 @@ mod tests {
             server_requests: Mutex::new(request_rx),
             version: "test".into(),
             request_timeout: Duration::from_secs(1),
+            performance: None,
         });
 
         let task = tokio::spawn({
@@ -1156,6 +1219,7 @@ mod tests {
             server_requests: Mutex::new(request_rx),
             version: "test".into(),
             request_timeout: Duration::from_secs(1),
+            performance: None,
         });
 
         let task = tokio::spawn({
@@ -1356,6 +1420,7 @@ mod tests {
             server_requests: Mutex::new(request_rx),
             version: "test".into(),
             request_timeout: Duration::from_secs(1),
+            performance: None,
         });
 
         let task = tokio::spawn({
@@ -1411,6 +1476,7 @@ mod tests {
             server_requests: Mutex::new(request_rx),
             version: "test".into(),
             request_timeout: Duration::from_secs(1),
+            performance: None,
         });
 
         let task = tokio::spawn({
