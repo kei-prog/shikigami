@@ -139,11 +139,18 @@ impl AppServer {
         let version_started = performance
             .as_ref()
             .and_then(|performance| performance.start_timer());
-        let version_output = Command::new(command)
-            .arg("--version")
-            .output()
-            .await
-            .with_context(|| format!("run {command} --version"))?;
+        let version_output = Command::new(command).arg("--version").output().await;
+        let version_output = match version_output {
+            Ok(output) => output,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                bail!(
+                    "Codex CLI (`{command}`) was not found in PATH. Install Codex CLI, then run `shi` again."
+                );
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("run {command} --version"));
+            }
+        };
         if let Some(performance) = &performance {
             performance.record_duration(
                 "app_server.version",
@@ -935,6 +942,23 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[tokio::test]
+    async fn missing_codex_cli_has_setup_guidance() {
+        let result = AppServer::spawn(
+            "shikigami-test-command-that-does-not-exist",
+            Duration::from_secs(1),
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("missing command unexpectedly started");
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Codex CLI (`shikigami-test-command-that-does-not-exist`) was not found in PATH. Install Codex CLI, then run `shi` again."
+        );
+    }
 
     #[test]
     fn execution_modes_map_to_app_server_policies() {
