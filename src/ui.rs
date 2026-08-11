@@ -1280,12 +1280,19 @@ async fn handle_key(
             }
             KeyCode::Char('a') => app.open_repository_add(),
             KeyCode::Char('A') => app.toggle_archive_view(),
-            KeyCode::Char('u') => {
-                app.message = Some(match app.undo_last_archive() {
-                    Ok(title) => format!("restored {title}"),
-                    Err(error) => error.to_string(),
-                });
-            }
+            KeyCode::Char('u') => match app.undo_last_archive() {
+                Ok(title) => {
+                    schedule_selected_chat_preview(
+                        app,
+                        server,
+                        preview_generation,
+                        preview_sender,
+                        preview_task,
+                    );
+                    app.message = Some(format!("restored {title}"));
+                }
+                Err(error) => app.message = Some(error.to_string()),
+            },
             KeyCode::Char('n') if app.show_archived => {
                 app.message = Some("switch to active threads before creating a chat".into());
             }
@@ -1334,22 +1341,38 @@ async fn handle_key(
             }
             KeyCode::Char('x') if app.selected_tree_is_thread() => {
                 if app.show_archived {
-                    app.message = Some(match app.unarchive_selected_thread() {
-                        Ok(()) => "thread restored".into(),
-                        Err(error) => error.to_string(),
-                    });
+                    match app.unarchive_selected_thread() {
+                        Ok(()) => {
+                            schedule_selected_chat_preview(
+                                app,
+                                server,
+                                preview_generation,
+                                preview_sender,
+                                preview_task,
+                            );
+                            app.message = Some("thread restored".into());
+                        }
+                        Err(error) => app.message = Some(error.to_string()),
+                    }
                 } else {
                     match app.selected_thread_has_active_turn() {
                         Ok(true) => {
                             app.message =
                                 Some("response is running; stop it before archiving".into());
                         }
-                        Ok(false) => {
-                            app.message = Some(match app.archive_selected_thread() {
-                                Ok(()) => "thread archived · u undo".into(),
-                                Err(error) => error.to_string(),
-                            });
-                        }
+                        Ok(false) => match app.archive_selected_thread() {
+                            Ok(()) => {
+                                schedule_selected_chat_preview(
+                                    app,
+                                    server,
+                                    preview_generation,
+                                    preview_sender,
+                                    preview_task,
+                                );
+                                app.message = Some("thread archived · u undo".into());
+                            }
+                            Err(error) => app.message = Some(error.to_string()),
+                        },
                         Err(error) => app.message = Some(error.to_string()),
                     }
                 }
