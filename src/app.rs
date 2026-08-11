@@ -744,10 +744,23 @@ impl App {
         Ok(())
     }
 
+    pub fn begin_side_chat_deletion(&mut self) -> Option<(String, Option<String>)> {
+        let chat = self.side_chat()?;
+        let thread_id = chat.thread_id.clone();
+        let turn_id = chat.active_turn_id.clone();
+        self.remove_side_chat_from_session(&thread_id);
+        Some((thread_id, turn_id))
+    }
+
     pub fn complete_side_chat_deletion(&mut self, thread_id: &str) -> Result<()> {
         self.side_chat_registry.remove(thread_id)?;
+        self.remove_side_chat_from_session(thread_id);
+        Ok(())
+    }
+
+    fn remove_side_chat_from_session(&mut self, thread_id: &str) {
         let Some(parent_thread_id) = self.side_chat_parent(thread_id) else {
-            return Ok(());
+            return;
         };
         let removed_was_visible = self.side_chat_id.as_deref() == Some(thread_id);
         self.chats.remove(thread_id);
@@ -793,7 +806,6 @@ impl App {
         if removed_was_visible {
             self.active_chat_pane = ChatPane::Main;
         }
-        Ok(())
     }
 
     pub fn promote_side_chat(&mut self) -> Result<(String, Option<String>)> {

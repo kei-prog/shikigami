@@ -119,8 +119,17 @@ struct RenderCache {
 }
 
 enum UiAction {
-    CopyEditorCommand { cwd: PathBuf, target: EditorTarget },
-    PasteClipboardImage { thread_id: String },
+    CopyEditorCommand {
+        cwd: PathBuf,
+        target: EditorTarget,
+    },
+    PasteClipboardImage {
+        thread_id: String,
+    },
+    DeleteSideChat {
+        thread_id: String,
+        turn_id: Option<String>,
+    },
     CleanupDraftWorkspace(DraftWorkspaceCleanup),
     DeleteThread(ThreadRecord),
     GenerateThreadNames(ThreadNameGenerationRequest),
@@ -150,6 +159,11 @@ enum ThreadDeletionEvent {
         thread_id: String,
         result: std::result::Result<(), String>,
     },
+}
+
+struct SideChatDeletionEvent {
+    thread_id: String,
+    result: std::result::Result<(), String>,
 }
 
 struct ApprovalPrompt {
@@ -260,6 +274,7 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
     let (thread_name_sender, mut thread_name_receiver) = mpsc::unbounded_channel();
     let (clipboard_image_sender, mut clipboard_image_receiver) = mpsc::unbounded_channel();
     let (draft_cleanup_sender, mut draft_cleanup_receiver) = mpsc::unbounded_channel();
+    let (side_chat_deletion_sender, mut side_chat_deletion_receiver) = mpsc::unbounded_channel();
     spawn_thread_name_refresh(app, Arc::clone(&server), thread_name_sender);
     let mut thread_name_refresh_pending = true;
     let mut clipboard_image_paste_pending = false;
@@ -359,6 +374,14 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                                     clipboard_image_sender.clone(),
                                 );
                             }
+                            Some(UiAction::DeleteSideChat { thread_id, turn_id }) => {
+                                spawn_side_chat_deletion(
+                                    Arc::clone(&server),
+                                    thread_id,
+                                    turn_id,
+                                    side_chat_deletion_sender.clone(),
+                                );
+                            }
                             Some(UiAction::CleanupDraftWorkspace(cleanup)) => {
                                 spawn_draft_workspace_cleanup(
                                     cleanup,
@@ -444,6 +467,25 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
                         Ok(()) => app.forget_workspace(&workspace_path),
                         Err(error) => {
                             app.message = Some(format!("Could not remove unused workspace: {error}"));
+                        }
+                    }
+                    needs_draw = true;
+                }
+            }
+            deletion = side_chat_deletion_receiver.recv() => {
+                if let Some(deletion) = deletion {
+                    match deletion.result {
+                        Ok(()) => {
+                            if let Err(error) = app.forget_temporary_side_chat(&deletion.thread_id) {
+                                app.message = Some(format!(
+                                    "Side chat was deleted, but local cleanup failed: {error}"
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            app.message = Some(format!(
+                                "Could not delete side chat; cleanup will retry next launch: {error}"
+                            ));
                         }
                     }
                     needs_draw = true;
@@ -741,7 +783,7 @@ async fn handle_key(
     let mut action = None;
     match app.mode {
         _ if app.command_palette.is_some() => {
-            handle_palette_key(app, key, server).await?;
+            action = handle_palette_key(app, key, server).await?;
         }
         Mode::Chat if app.chat().map(|chat| chat.mode) == Some(ChatMode::Scroll) => {
             if let Some(target) = scroll_navigation_target(
@@ -2158,7 +2200,12 @@ fn apply_thread_name_refresh(
     }
 }
 
-async fn handle_palette_key(app: &mut App, key: KeyEvent, server: &Arc<AppServer>) -> Result<()> {
+async fn handle_palette_key(
+    app: &mut App,
+    key: KeyEvent,
+    server: &Arc<AppServer>,
+) -> Result<Option<UiAction>> {
+    let mut action = None;
     match key.code {
         KeyCode::Esc => app.command_palette = None,
         KeyCode::Up => {
@@ -2200,7 +2247,7 @@ async fn handle_palette_key(app: &mut App, key: KeyEvent, server: &Arc<AppServer
                 }
             }
         }
-        KeyCode::Enter => select_palette_entry(app, server).await?,
+        KeyCode::Enter => action = select_palette_entry(app, server).await?,
         KeyCode::Char(character)
             if !key
                 .modifiers
@@ -2212,10 +2259,11 @@ async fn handle_palette_key(app: &mut App, key: KeyEvent, server: &Arc<AppServer
         }
         _ => {}
     }
-    Ok(())
+    Ok(action)
 }
 
-async fn select_palette_entry(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
+async fn select_palette_entry(app: &mut App, server: &Arc<AppServer>) -> Result<Option<UiAction>> {
+    let mut action = None;
     let entry = app
         .command_palette
         .as_ref()
@@ -2256,7 +2304,7 @@ async fn select_palette_entry(app: &mut App, server: &Arc<AppServer>) -> Result<
             app.open_side_chat_picker();
         }
         Some(PaletteEntry::Command(PaletteCommand::SideClose)) => {
-            close_side_chat(app, server).await?;
+            action = close_side_chat(app);
         }
         Some(PaletteEntry::Command(PaletteCommand::SidePromote)) => {
             let target = app
@@ -2300,7 +2348,7 @@ async fn select_palette_entry(app: &mut App, server: &Arc<AppServer>) -> Result<
         }
         None => {}
     }
-    Ok(())
+    Ok(action)
 }
 
 async fn open_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
@@ -2361,31 +2409,31 @@ async fn open_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     Ok(())
 }
 
-async fn close_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
-    let active_turn = app.side_chat().and_then(|chat| {
-        chat.active_turn_id
-            .as_ref()
-            .map(|turn_id| (chat.thread_id.clone(), turn_id.clone()))
+fn close_side_chat(app: &mut App) -> Option<UiAction> {
+    app.begin_side_chat_deletion()
+        .map(|(thread_id, turn_id)| UiAction::DeleteSideChat { thread_id, turn_id })
+}
+
+fn spawn_side_chat_deletion(
+    server: Arc<AppServer>,
+    thread_id: String,
+    turn_id: Option<String>,
+    sender: mpsc::UnboundedSender<SideChatDeletionEvent>,
+) {
+    tokio::spawn(async move {
+        let result = async {
+            if let Some(turn_id) = turn_id
+                && let Err(error) = server.interrupt_turn(&thread_id, &turn_id).await
+                && !is_inactive_turn_error(&error)
+            {
+                return Err(error);
+            }
+            delete_temporary_thread(&server, &thread_id).await
+        }
+        .await
+        .map_err(|error| error.to_string());
+        let _ = sender.send(SideChatDeletionEvent { thread_id, result });
     });
-    if let Some((thread_id, turn_id)) = active_turn
-        && let Err(error) = server.interrupt_turn(&thread_id, &turn_id).await
-    {
-        app.message = Some(format!("Could not interrupt side chat: {error}"));
-        return Ok(());
-    }
-    let Some(thread_id) = app.side_chat().map(|chat| chat.thread_id.clone()) else {
-        return Ok(());
-    };
-    if let Err(error) = delete_temporary_thread(server, &thread_id).await {
-        app.message = Some(format!("Could not delete side chat: {error}"));
-        return Ok(());
-    }
-    if let Err(error) = app.complete_side_chat_deletion(&thread_id) {
-        app.message = Some(format!(
-            "Side chat was deleted, but local cleanup failed: {error}"
-        ));
-    }
-    Ok(())
 }
 
 async fn cleanup_abandoned_side_chats(app: &mut App, server: &Arc<AppServer>) {
