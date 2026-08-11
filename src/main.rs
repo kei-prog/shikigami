@@ -2,6 +2,7 @@ mod app;
 pub mod app_server;
 mod chat;
 mod clipboard;
+mod codex_workspace;
 mod git_workspace;
 mod keybindings;
 mod onboarding;

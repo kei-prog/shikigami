@@ -115,13 +115,21 @@ it starts one `Shikigami Help` welcome chat there after drawing the first
 screen. Codex explains the main workflow in the operating system's preferred
 locale; locale detection
 supports macOS, Windows, Linux, and other supported Unix systems, with English
-as the fallback. The same chat is reopened by `?`, then `Enter`; if it was
-archived or deleted, Shikigami creates a new one. Its first response prioritizes
-adding a repository and the essential navigation keys. The welcome remains
-visible in the right pane while focus stays on `General`, so `a` opens the
-repository picker immediately without an extra `Esc`. Later questions use the
-README as the source of truth. Repository discovery continues in the background
-while the welcome response runs. The welcome is versioned and shown only once.
+as the fallback. On a fresh installation, Shikigami restores valid Git
+repositories from the workspaces saved by Codex App and initially selects its
+active workspace, or the first restored repository when no active workspace is
+recorded. This import is best-effort; if Codex App state is unavailable or
+incompatible, normal repository discovery continues unchanged. The same chat is
+reopened by `?`, then `Enter`; if it was archived or deleted, Shikigami creates
+a new one. Its first response prioritizes a restored workspace when one is
+available; otherwise, it prioritizes adding a repository. The welcome remains
+visible in the right pane while
+navigation focus stays on the restored workspace or `General`, so `n` starts a
+repository chat after a successful import and `a` opens the repository picker
+without an extra `Esc`. Later questions use the README as the source of truth.
+When no repository was imported, repository discovery continues in the
+background while the welcome response runs. The welcome is versioned and shown
+only once.
 
 After onboarding, whenever no Git repository is registered, Shikigami opens the
 repository picker and discovers repositories from `ghq` and saved projects

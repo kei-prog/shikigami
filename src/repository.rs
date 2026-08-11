@@ -241,6 +241,9 @@ pub fn start_scan(scope: ScanScope) -> Receiver<ScanEvent> {
 }
 
 pub fn repository_at(path: &Path) -> Result<Repository> {
+    if path.join(".git").is_dir() {
+        return primary_repository(path);
+    }
     let output = Command::new("git")
         .arg("-C")
         .arg(path)

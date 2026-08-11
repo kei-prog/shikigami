@@ -590,7 +590,10 @@ async fn start_onboarding_chat(
     let cwd = chat.cwd.clone();
     let model = chat.model.clone();
     let effort = chat.reasoning_effort.clone();
-    let instructions = onboarding::developer_instructions(&onboarding.locale);
+    let instructions = onboarding::developer_instructions(
+        &onboarding.locale,
+        onboarding.imported_repository_count,
+    );
     let thread_id = match server
         .start_thread_with_developer_instructions(
             &cwd,

@@ -20,6 +20,7 @@ use directories::BaseDirs;
 use crate::{
     app_server::{AppServerEvent, AppServerRequest, ModelMetadata},
     chat::{ChatState, CommandPalette, fuzzy_score},
+    codex_workspace,
     git_workspace::{self, Workspace},
     keybindings::KeyBindings,
     onboarding::{self, OnboardingStore},
@@ -106,6 +107,7 @@ struct DraftThread {
 pub struct PendingOnboarding {
     pub draft_id: String,
     pub locale: String,
+    pub imported_repository_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -409,7 +411,7 @@ impl App {
             }
             Err(_) => true,
         };
-        let repositories = repository_store.load_registered()?;
+        let mut repositories = repository_store.load_registered()?;
         let initial_home_scan_is_pending = repository_store.initial_home_scan_is_pending();
         let should_show_onboarding = should_show_onboarding(
             onboarding_store.is_pending(),
@@ -417,6 +419,11 @@ impl App {
             repositories.is_empty(),
             has_existing_threads,
         );
+        let (imported_repository_count, imported_startup_repository) = if should_show_onboarding {
+            import_codex_workspaces(&repository_store, &mut repositories)
+        } else {
+            (0, None)
+        };
         let candidates = repository_store.load_candidates().unwrap_or_default();
         let browse_path = BaseDirs::new()
             .map(|dirs| dirs.home_dir().to_path_buf())
@@ -443,15 +450,19 @@ impl App {
                         None,
                     )
                 }
-                Ok(None) => (
-                    repositories
-                        .first()
-                        .map(|repository| HashSet::from([repository.path.clone()]))
-                        .unwrap_or_default(),
-                    None,
-                    None,
-                    None,
-                ),
+                Ok(None) => {
+                    let repository = imported_startup_repository.clone().or_else(|| {
+                        repositories
+                            .first()
+                            .map(|repository| repository.path.clone())
+                    });
+                    (
+                        repository.iter().cloned().collect::<HashSet<_>>(),
+                        None,
+                        imported_startup_repository.clone(),
+                        None,
+                    )
+                }
                 Err(error) => (
                     repositories
                         .first()
@@ -587,6 +598,7 @@ impl App {
                 app.pending_onboarding = Some(PendingOnboarding {
                     draft_id,
                     locale: onboarding::preferred_locale(),
+                    imported_repository_count,
                 });
                 Ok(())
             }) {
@@ -3758,6 +3770,50 @@ fn should_show_onboarding(
     marker_is_pending && initial_scan_is_pending && repositories_are_empty && !has_existing_threads
 }
 
+fn import_codex_workspaces(
+    repository_store: &RepositoryStore,
+    repositories: &mut Vec<Repository>,
+) -> (usize, Option<PathBuf>) {
+    let Ok(Some(state)) = codex_workspace::discover() else {
+        return (0, None);
+    };
+    let (imported, active_repository) = resolve_codex_workspaces(state);
+    if imported.is_empty() || repository_store.register(&imported).is_err() {
+        return (0, None);
+    }
+    let Ok(registered) = repository_store.load_registered() else {
+        return (0, None);
+    };
+    let imported_count = imported.len();
+    *repositories = registered;
+    (imported_count, active_repository)
+}
+
+fn resolve_codex_workspaces(
+    state: codex_workspace::CodexWorkspaceState,
+) -> (Vec<Repository>, Option<PathBuf>) {
+    let active_roots = state.active_roots.into_iter().collect::<HashSet<_>>();
+    let mut imported = Vec::new();
+    let mut active_repository = None;
+    for root in state.roots {
+        let Ok(repository) = repository::repository_at(&root) else {
+            continue;
+        };
+        if active_roots.contains(&root) {
+            active_repository = Some(repository.path.clone());
+        }
+        if !imported
+            .iter()
+            .any(|candidate: &Repository| candidate.path == repository.path)
+        {
+            imported.push(repository);
+        }
+    }
+    let startup_repository =
+        active_repository.or_else(|| imported.first().map(|repository| repository.path.clone()));
+    (imported, startup_repository)
+}
+
 fn thread_picker_matches(
     threads: &[ThreadItem],
     repositories: &[Repository],
@@ -4092,6 +4148,7 @@ fn upsert_attention(
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -4737,5 +4794,40 @@ mod tests {
         assert!(!should_show_onboarding(true, false, true, false));
         assert!(!should_show_onboarding(true, true, false, false));
         assert!(!should_show_onboarding(true, true, true, true));
+    }
+
+    #[test]
+    fn resolves_valid_codex_workspaces_and_selects_the_active_repository() {
+        let temp = tempdir().unwrap();
+        let first = temp.path().join("first");
+        let active = temp.path().join("active");
+        let invalid = temp.path().join("invalid");
+        for path in [&first, &active] {
+            fs::create_dir_all(path.join(".git")).unwrap();
+        }
+        fs::create_dir(&invalid).unwrap();
+
+        let (repositories, selected) =
+            resolve_codex_workspaces(codex_workspace::CodexWorkspaceState {
+                roots: vec![first.clone(), active.clone(), first, invalid.clone()],
+                active_roots: vec![active.clone(), invalid],
+            });
+
+        assert_eq!(repositories.len(), 2);
+        assert_eq!(selected, Some(active.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn selects_the_first_imported_repository_without_an_active_workspace() {
+        let temp = tempdir().unwrap();
+        let first = temp.path().join("first");
+        fs::create_dir_all(first.join(".git")).unwrap();
+
+        let (_, selected) = resolve_codex_workspaces(codex_workspace::CodexWorkspaceState {
+            roots: vec![first.clone()],
+            active_roots: Vec::new(),
+        });
+
+        assert_eq!(selected, Some(first.canonicalize().unwrap()));
     }
 }
