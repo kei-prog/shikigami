@@ -59,7 +59,6 @@ enum Command {
     /// Show locally recorded startup and interaction performance
     Perf,
     /// Back up, reset, or restore Shikigami's local state
-    #[command(hide = true)]
     Maintenance {
         #[command(subcommand)]
         command: MaintenanceCommand,
@@ -315,6 +314,8 @@ fn run_repo_command(command: RepoCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     use super::*;
 
     #[test]
@@ -352,6 +353,13 @@ mod tests {
                 command: MaintenanceCommand::Restore { backup }
             }) if backup == "reset-123"
         ));
+    }
+
+    #[test]
+    fn top_level_help_lists_maintenance() {
+        let help = Cli::command().render_long_help().to_string();
+
+        assert!(help.contains("maintenance"));
     }
 
     #[test]
