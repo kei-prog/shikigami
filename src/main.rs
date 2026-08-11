@@ -5,6 +5,7 @@ mod clipboard;
 mod codex_workspace;
 mod git_workspace;
 mod keybindings;
+mod maintenance;
 mod onboarding;
 mod paths;
 mod performance;
@@ -57,6 +58,12 @@ enum Command {
     },
     /// Show locally recorded startup and interaction performance
     Perf,
+    /// Back up, reset, or restore Shikigami's local state
+    #[command(hide = true)]
+    Maintenance {
+        #[command(subcommand)]
+        command: MaintenanceCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -69,6 +76,19 @@ enum RepoCommand {
 enum ConfigCommand {
     /// Print the keybindings configuration path
     Path,
+}
+
+#[derive(Debug, Subcommand)]
+enum MaintenanceCommand {
+    /// Back up local state and make the next launch behave like a fresh installation
+    Reset,
+    /// List available maintenance backups
+    Backups,
+    /// Restore local state from a maintenance backup
+    Restore {
+        /// Backup identifier printed by reset or backups
+        backup: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -120,9 +140,76 @@ fn run(performance: Arc<performance::PerformanceSession>) -> Result<()> {
         (false, false, false, Some(Command::Repo { command })) => run_repo_command(command)?,
         (false, false, false, Some(Command::Config { command })) => run_config_command(command)?,
         (false, false, false, Some(Command::Perf)) => performance::print_report()?,
+        (false, false, false, Some(Command::Maintenance { command })) => {
+            run_maintenance_command(command)?
+        }
         _ => unreachable!("clap rejects conflicting config options"),
     }
 
+    Ok(())
+}
+
+fn run_maintenance_command(command: MaintenanceCommand) -> Result<()> {
+    let _instance_lock = app_server::InstanceLock::acquire()?;
+    match command {
+        MaintenanceCommand::Reset => {
+            println!(
+                "This backs up and resets Shikigami's local repositories, thread registry, settings, keybindings, and caches."
+            );
+            println!(
+                "Codex threads, Git repositories, General workspaces, and managed worktrees are not deleted."
+            );
+            print!("Type RESET to continue: ");
+            io::stdout().flush().context("show reset confirmation")?;
+            let mut answer = String::new();
+            io::stdin()
+                .read_line(&mut answer)
+                .context("read reset confirmation")?;
+            if answer.trim() != "RESET" {
+                println!("Local state was not changed");
+                return Ok(());
+            }
+            let outcome = maintenance::reset()?;
+            println!("Reset {} local state files", outcome.file_count);
+            if let Some(backup) = outcome.backup {
+                println!("Backup: {backup}");
+                println!("Restore with: shi maintenance restore {backup}");
+            }
+            println!("Run shi to start with the first-launch experience");
+        }
+        MaintenanceCommand::Backups => {
+            let backups = maintenance::list_backups()?;
+            if backups.is_empty() {
+                println!("No maintenance backups");
+            } else {
+                for backup in backups {
+                    println!("{backup}");
+                }
+            }
+        }
+        MaintenanceCommand::Restore { backup } => {
+            println!("This replaces current Shikigami local state with backup {backup}.");
+            println!("The current state will be backed up first.");
+            print!("Type RESTORE to continue: ");
+            io::stdout().flush().context("show restore confirmation")?;
+            let mut answer = String::new();
+            io::stdin()
+                .read_line(&mut answer)
+                .context("read restore confirmation")?;
+            if answer.trim() != "RESTORE" {
+                println!("Local state was not changed");
+                return Ok(());
+            }
+            let outcome = maintenance::restore(&backup)?;
+            println!(
+                "Restored {} local state files from {backup}",
+                outcome.file_count
+            );
+            if let Some(safety_backup) = outcome.safety_backup {
+                println!("Previous state backup: {safety_backup}");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -246,6 +333,25 @@ mod tests {
         let cli = Cli::try_parse_from(["shi", "perf"]).unwrap();
 
         assert!(matches!(cli.command, Some(Command::Perf)));
+    }
+
+    #[test]
+    fn maintenance_commands_are_nested() {
+        let reset = Cli::try_parse_from(["shi", "maintenance", "reset"]).unwrap();
+        let restore = Cli::try_parse_from(["shi", "maintenance", "restore", "reset-123"]).unwrap();
+
+        assert!(matches!(
+            reset.command,
+            Some(Command::Maintenance {
+                command: MaintenanceCommand::Reset
+            })
+        ));
+        assert!(matches!(
+            restore.command,
+            Some(Command::Maintenance {
+                command: MaintenanceCommand::Restore { backup }
+            }) if backup == "reset-123"
+        ));
     }
 
     #[test]

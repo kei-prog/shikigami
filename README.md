@@ -142,6 +142,16 @@ levels deep. In the folder browser, highlight a Git repository and press `a` to
 register it, or open a projects folder and press `s` to scan repositories nested
 deeper.
 
+For rare first-launch testing or local-state recovery, `shi maintenance reset`
+backs up Shikigami's repositories, selected thread registry, settings,
+keybindings, and caches before resetting them. The next `shi` launch follows the
+fresh-install onboarding path. It does not delete Codex threads, Git
+repositories, General workspaces, or managed worktrees. Use
+`shi maintenance backups` to list backup identifiers and
+`shi maintenance restore <backup>` to restore one; restoration first backs up
+the current state. Both destructive operations require typing an explicit
+confirmation word, and they refuse to run while Shikigami is open.
+
 - `j` / `k`: move through the thread tree and preview the selected thread
 - `h` / `l`: collapse or expand a repository; `l` focuses a selected thread's messages
 - `H` / `L`: collapse or expand all repositories
