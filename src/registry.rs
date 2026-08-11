@@ -18,11 +18,21 @@ pub enum ThreadScope {
     General,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ThreadKind {
+    #[default]
+    Regular,
+    ShikigamiHelp,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ThreadRecord {
     pub id: String,
     #[serde(default)]
     pub scope: ThreadScope,
+    #[serde(default)]
+    pub kind: ThreadKind,
     pub repository_path: PathBuf,
     pub cwd: PathBuf,
     #[serde(skip, default = "untitled_thread")]
@@ -353,6 +363,7 @@ impl Registry {
         self.upsert(ThreadRecord {
             id: thread_id,
             scope: ThreadScope::Repository,
+            kind: ThreadKind::Regular,
             repository_path: repository_path.to_path_buf(),
             cwd: cwd.to_path_buf(),
             title: untitled_thread(),
@@ -365,10 +376,20 @@ impl Registry {
     }
 
     pub fn register_general_thread(&self, thread_id: String, cwd: &Path) -> Result<()> {
+        self.register_general_thread_with_kind(thread_id, cwd, ThreadKind::Regular)
+    }
+
+    pub fn register_general_thread_with_kind(
+        &self,
+        thread_id: String,
+        cwd: &Path,
+        kind: ThreadKind,
+    ) -> Result<()> {
         let now = now_seconds()?;
         self.upsert(ThreadRecord {
             id: thread_id,
             scope: ThreadScope::General,
+            kind,
             repository_path: cwd.to_path_buf(),
             cwd: cwd.to_path_buf(),
             title: untitled_thread(),
@@ -571,6 +592,7 @@ mod tests {
 
         let thread = registry.load().unwrap().remove(0);
         assert_eq!(thread.scope, ThreadScope::General);
+        assert_eq!(thread.kind, ThreadKind::Regular);
         assert_eq!(thread.cwd, workspace);
         assert!(!thread.managed_worktree);
         assert_eq!(thread.worktree_branch, None);
@@ -632,8 +654,29 @@ mod tests {
         let thread = Registry::at(path).load().unwrap().remove(0);
         assert_eq!(thread.title, "Untitled thread");
         assert_eq!(thread.scope, ThreadScope::Repository);
+        assert_eq!(thread.kind, ThreadKind::Regular);
         assert_eq!(thread.archived_at, None);
         assert!(!thread.managed_worktree);
         assert_eq!(thread.worktree_branch, None);
+    }
+
+    #[test]
+    fn registers_a_shikigami_help_thread_distinctly() {
+        let temp = tempdir().unwrap();
+        let registry = Registry::at(temp.path().join("threads.json"));
+        let workspace = temp.path().join("new-chat");
+        fs::create_dir(&workspace).unwrap();
+
+        registry
+            .register_general_thread_with_kind(
+                "help-1".into(),
+                &workspace,
+                ThreadKind::ShikigamiHelp,
+            )
+            .unwrap();
+
+        let thread = registry.load().unwrap().remove(0);
+        assert_eq!(thread.scope, ThreadScope::General);
+        assert_eq!(thread.kind, ThreadKind::ShikigamiHelp);
     }
 }

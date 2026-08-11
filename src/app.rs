@@ -26,8 +26,8 @@ use crate::{
     paths,
     performance::PerformanceSession,
     registry::{
-        AttentionRegistry, PersistentAttentionKind, Registry, SideChatRegistry, ThreadRecord,
-        ThreadScope, ThreadTitleCache,
+        AttentionRegistry, PersistentAttentionKind, Registry, SideChatRegistry, ThreadKind,
+        ThreadRecord, ThreadScope, ThreadTitleCache,
     },
     repository::{self, Repository, RepositoryStore, ScanEvent, ScanScope, start_scan},
     settings::{ExecutionMode, SettingsStore},
@@ -96,6 +96,7 @@ pub struct DraftWorkspaceCleanup {
 #[derive(Clone, Debug)]
 struct DraftThread {
     scope: ThreadScope,
+    kind: ThreadKind,
     repository_path: PathBuf,
     workspace_path: PathBuf,
     cleanup_workspace_on_cancel: bool,
@@ -574,9 +575,9 @@ impl App {
         }
         let onboarding_opened = if should_show_onboarding {
             match app.create_general_workspace().and_then(|workspace| {
-                let draft_id = app.begin_draft_thread(&workspace, ThreadScope::General, true)?;
+                let draft_id = app.begin_shikigami_help_draft_thread(&workspace)?;
                 let mut chat =
-                    ChatState::new(draft_id.clone(), workspace.path, "👋 Shikigami".into());
+                    ChatState::new(draft_id.clone(), workspace.path, "Shikigami Help".into());
                 if let Some((model, display_name, effort)) = app.default_model_settings() {
                     chat.set_model(model, display_name, effort);
                 }
@@ -2556,6 +2557,30 @@ impl App {
         scope: ThreadScope,
         cleanup_workspace_on_cancel: bool,
     ) -> Result<String> {
+        self.begin_draft_thread_with_kind(
+            workspace,
+            scope,
+            ThreadKind::Regular,
+            cleanup_workspace_on_cancel,
+        )
+    }
+
+    pub fn begin_shikigami_help_draft_thread(&mut self, workspace: &Workspace) -> Result<String> {
+        self.begin_draft_thread_with_kind(
+            workspace,
+            ThreadScope::General,
+            ThreadKind::ShikigamiHelp,
+            true,
+        )
+    }
+
+    fn begin_draft_thread_with_kind(
+        &mut self,
+        workspace: &Workspace,
+        scope: ThreadScope,
+        kind: ThreadKind,
+        cleanup_workspace_on_cancel: bool,
+    ) -> Result<String> {
         let repository_path = match scope {
             ThreadScope::Repository => self
                 .selected_repository()
@@ -2572,6 +2597,7 @@ impl App {
             id.clone(),
             DraftThread {
                 scope,
+                kind,
                 repository_path,
                 workspace_path: workspace.path.clone(),
                 cleanup_workspace_on_cancel,
@@ -2597,9 +2623,11 @@ impl App {
                 &draft.repository_path,
                 &draft.workspace_path,
             )?,
-            ThreadScope::General => self
-                .thread_registry
-                .register_general_thread(thread_id.clone(), &draft.workspace_path)?,
+            ThreadScope::General => self.thread_registry.register_general_thread_with_kind(
+                thread_id.clone(),
+                &draft.workspace_path,
+                draft.kind,
+            )?,
         }
 
         self.draft_threads.remove(draft_id);
@@ -2616,6 +2644,24 @@ impl App {
         self.thread_names.insert(thread_id, None);
         self.refresh_current();
         Ok(())
+    }
+
+    pub fn reveal_shikigami_help_thread(&mut self) -> Result<bool> {
+        let Some(thread_id) = self
+            .thread_registry
+            .load()?
+            .into_iter()
+            .filter(|record| {
+                record.kind == ThreadKind::ShikigamiHelp && record.archived_at.is_none()
+            })
+            .max_by_key(|record| record.updated_at)
+            .map(|record| record.id)
+        else {
+            return Ok(false);
+        };
+        self.show_archived = false;
+        self.refresh_current();
+        Ok(self.reveal_chat(&thread_id))
     }
 
     pub fn cancel_visible_draft_thread(&mut self) -> Option<DraftWorkspaceCleanup> {
@@ -4029,6 +4075,7 @@ mod tests {
             record: ThreadRecord {
                 id: id.into(),
                 scope: ThreadScope::Repository,
+                kind: ThreadKind::Regular,
                 repository_path: repository.into(),
                 cwd: format!("{repository}/{id}").into(),
                 title: id.into(),

@@ -602,10 +602,84 @@ async fn start_onboarding_chat(
     {
         app.message = Some(error.to_string());
     }
-    match server.set_thread_name(&thread_id, "👋 Shikigami").await {
-        Ok(()) => app.apply_thread_name(&thread_id, Some("👋 Shikigami".into())),
+    match server.set_thread_name(&thread_id, "Shikigami Help").await {
+        Ok(()) => app.apply_thread_name(&thread_id, Some("Shikigami Help".into())),
         Err(error) => app.message = Some(format!("Welcome started, but naming failed: {error}")),
     }
+}
+
+async fn open_shikigami_help(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
+    if app.reveal_shikigami_help_thread()? {
+        focus_selected_chat_in_mode(app, server, ChatMode::Input).await?;
+        return Ok(());
+    }
+
+    let workspace = app.create_general_workspace()?;
+    let draft_id = app.begin_shikigami_help_draft_thread(&workspace)?;
+    let mut chat = ChatState::new(draft_id.clone(), workspace.path, "Shikigami Help".into());
+    if let Some((model, display_name, effort)) = app.default_model_settings() {
+        chat.set_model(model, display_name, effort);
+    }
+    let cwd = chat.cwd.clone();
+    let model = chat.model.clone();
+    let effort = chat.reasoning_effort.clone();
+    app.show_chat(chat);
+    app.focus = Focus::Chat;
+    app.mode = Mode::Chat;
+
+    let instructions = onboarding::help_developer_instructions(&onboarding::preferred_locale());
+    let thread_id = match server
+        .start_thread_with_developer_instructions(
+            &cwd,
+            model.as_deref(),
+            app.execution_mode,
+            Some(&instructions),
+        )
+        .await
+    {
+        Ok(thread_id) => thread_id,
+        Err(error) => {
+            let local_cleanup = app
+                .cancel_visible_draft_thread()
+                .and_then(|cleanup| cleanup_draft_workspace(cleanup).err());
+            app.focus = Focus::Navigation;
+            app.mode = Mode::Normal;
+            return Err(with_cleanup_errors(error, None, local_cleanup));
+        }
+    };
+    if let Err(error) = app.materialize_draft_thread(&draft_id, thread_id.clone()) {
+        let server_cleanup = delete_temporary_thread(server, &thread_id).await.err();
+        let local_cleanup = app
+            .cancel_visible_draft_thread()
+            .and_then(|cleanup| cleanup_draft_workspace(cleanup).err());
+        app.focus = Focus::Navigation;
+        app.mode = Mode::Normal;
+        return Err(with_cleanup_errors(error, server_cleanup, local_cleanup));
+    }
+    app.mark_thread_opened(thread_id.clone());
+    let turn_id = server
+        .start_turn(
+            &thread_id,
+            &cwd,
+            "❓",
+            &[],
+            &[],
+            TurnSettings {
+                model: model.as_deref(),
+                effort: effort.as_deref(),
+                execution_mode: app.execution_mode,
+            },
+        )
+        .await?;
+    app.record_owned_turn(thread_id.clone(), turn_id.clone());
+    if let Some(chat) = app.chats.get_mut(&thread_id) {
+        chat.begin_user_turn("❓".into(), turn_id);
+    }
+    match server.set_thread_name(&thread_id, "Shikigami Help").await {
+        Ok(()) => app.apply_thread_name(&thread_id, Some("Shikigami Help".into())),
+        Err(error) => app.message = Some(format!("Help started, but naming failed: {error}")),
+    }
+    Ok(())
 }
 
 async fn handle_key(
@@ -1316,11 +1390,15 @@ async fn handle_key(
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.mode = Mode::Normal,
             _ => {}
         },
-        Mode::Help => {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | '?')) {
-                app.mode = Mode::Normal;
+        Mode::Help => match key.code {
+            KeyCode::Enter => {
+                if let Err(error) = open_shikigami_help(app, server).await {
+                    app.message = Some(format!("Could not open Shikigami Help: {error}"));
+                }
             }
-        }
+            KeyCode::Esc | KeyCode::Char('q' | '?') => app.mode = Mode::Normal,
+            _ => {}
+        },
         Mode::Normal => match key.code {
             KeyCode::Char('q') => request_quit(app),
             KeyCode::Char('?') => app.mode = Mode::Help,
@@ -5677,9 +5755,9 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect, app: &App) {
-    let popup = centered_rect(78, 37, area);
+    let popup = centered_rect(78, 39, area);
     let help = format!(
-        "{up} / {down}  move and preview selected thread\n{collapse} / {expand}  collapse or expand a repository\n{open_scroll}  focus selected thread messages\n{open_input}  focus selected thread input\n{collapse_all} / {expand_all}  collapse / expand all repositories\n{submit}  send or steer in chat\n{newline}  insert a newline in chat input\n{left}/{right}/{input_up}/{input_down}  move the chat input cursor\n{line_start}/{line_end}  move to start/end of the current input line\n{focus_chat}  focus chat / enter scroll mode\n{previous_message} / {next_message}  select messages in scroll mode\n{copy_editor}  copy an editor command for the visible diff hunk\n{copy_id} / {copy_resume}  copy thread ID / resume command\n{copy_message} / {copy_chat}  copy selected message / full chat\n{interrupt}  stop the current response\n{toggle_pane}  switch main / side chat focus\n{next_chat} / {previous_chat}  next / previous side chat\n{palette}  open the command palette\n{find_thread}  filter threads\n/permissions  choose Auto or Dangerous execution\n{rename}  open thread-name actions\n{attention}  show threads that need attention\n{cancel}  return to thread tree / cancel\n{add_repository}  add repositories\n{new_thread}  create General chat or repository thread\n{archive}  archive / restore thread\n{undo}  undo the last archive\n{archived}  active / archived threads\n{delete}  unregister repository / delete archived thread\n{refresh}  reload repositories and names\n{show_help}  help\n{quit}  quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {permissions}\nConfig: {config}\n{close_help} closes this screen",
+        "{up} / {down}  move and preview selected thread\n{collapse} / {expand}  collapse or expand a repository\n{open_scroll}  focus selected thread messages\n{open_input}  focus selected thread input\n{collapse_all} / {expand_all}  collapse / expand all repositories\n{submit}  send or steer in chat\n{newline}  insert a newline in chat input\n{left}/{right}/{input_up}/{input_down}  move the chat input cursor\n{line_start}/{line_end}  move to start/end of the current input line\n{focus_chat}  focus chat / enter scroll mode\n{previous_message} / {next_message}  select messages in scroll mode\n{copy_editor}  copy an editor command for the visible diff hunk\n{copy_id} / {copy_resume}  copy thread ID / resume command\n{copy_message} / {copy_chat}  copy selected message / full chat\n{interrupt}  stop the current response\n{toggle_pane}  switch main / side chat focus\n{next_chat} / {previous_chat}  next / previous side chat\n{palette}  open the command palette\n{find_thread}  filter threads\n/permissions  choose Auto or Dangerous execution\n{rename}  open thread-name actions\n{attention}  show threads that need attention\n{cancel}  return to thread tree / cancel\n{add_repository}  add repositories\n{new_thread}  create General chat or repository thread\n{archive}  archive / restore thread\n{undo}  undo the last archive\n{archived}  active / archived threads\n{delete}  unregister repository / delete archived thread\n{refresh}  reload repositories and names\n{show_help}  help\n{quit}  quit\n\n{ask_shikigami}  ask about Shikigami\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {permissions}\nConfig: {config}\n{close_help} closes this screen",
         up = app.keybindings.label("normal.up"),
         down = app.keybindings.label("normal.down"),
         collapse = app.keybindings.label("normal.repository.collapse"),
@@ -5722,6 +5800,7 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
         refresh = app.keybindings.label("normal.refresh"),
         show_help = app.keybindings.label("normal.help"),
         quit = app.keybindings.label("normal.quit"),
+        ask_shikigami = app.keybindings.label("help.ask_shikigami"),
         permissions = execution_status(app.execution_mode),
         config = app.keybindings.path().display(),
         close_help = app.keybindings.label("help.close"),

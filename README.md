@@ -102,19 +102,23 @@ so older configs remain compatible when new commands are added. An invalid file
 or conflicting key in the same mode falls back to the full default keymap and
 shows the error in the TUI. `Esc` remains an emergency way out of dialogs;
 chat focus and interrupt bindings are fully replaceable.
-The `?` help screen displays the active bindings and config path.
+The `?` help screen displays the active bindings and config path. Press `Enter`
+there to create or reopen a dedicated `Shikigami Help` chat in General. Only
+that chat receives the bundled README as product context, so normal chats keep
+their context focused on the user's work.
 
 Shikigami opens with a `General` area for one-off chats. On a fresh installation,
-it starts one welcome chat there after drawing the first screen. Codex explains
-the main workflow in the operating system's preferred locale; locale detection
+it starts one `Shikigami Help` welcome chat there after drawing the first
+screen. Codex explains the main workflow in the operating system's preferred
+locale; locale detection
 supports macOS, Windows, Linux, and other supported Unix systems, with English
-as the fallback. Only this welcome thread receives the bundled README as product
-context. Its first response prioritizes adding a repository and the essential
-navigation keys. The welcome remains visible in the right pane while focus stays
-on `General`, so `a` opens the repository picker immediately without an extra
-`Esc`. Later questions use the README as the source of truth. Repository
-discovery continues in the background while the welcome response runs. The
-welcome is versioned and shown only once.
+as the fallback. The same chat is reopened by `?`, then `Enter`; if it was
+archived or deleted, Shikigami creates a new one. Its first response prioritizes
+adding a repository and the essential navigation keys. The welcome remains
+visible in the right pane while focus stays on `General`, so `a` opens the
+repository picker immediately without an extra `Esc`. Later questions use the
+README as the source of truth. Repository discovery continues in the background
+while the welcome response runs. The welcome is versioned and shown only once.
 
 After onboarding, whenever no Git repository is registered, Shikigami opens the
 repository picker and discovers repositories from `ghq` and saved projects
@@ -145,7 +149,7 @@ levels deep; choose a projects folder directly for repositories nested deeper.
 - `!`: show threads that completed, failed, or need approval
 - `d`: unregister a repository, or permanently delete a thread from the archived view
 - `r`: reload registered repositories and threads
-- `?`: show all keys
+- `?`: show all keys; press `Enter` there to ask about Shikigami
 - `q`: quit
 
 The left pane is one tree: `General` keeps one-off chats at the top, and each

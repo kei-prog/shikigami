@@ -621,6 +621,7 @@ static ACTIONS: &[ActionSpec] = &[
         ["n", "N", "esc"],
         fallback["esc"]
     ),
+    action!("help.ask_shikigami", Help, "enter", ["enter"]),
     action!(
         "help.close",
         Help,
@@ -1098,6 +1099,7 @@ mod tests {
         let config: ConfigFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(config.version, CONFIG_VERSION);
         assert_eq!(config.keybindings["normal.quit"], ["q"]);
+        assert_eq!(config.keybindings["help.ask_shikigami"], ["enter"]);
     }
 
     #[test]
