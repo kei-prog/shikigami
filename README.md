@@ -364,7 +364,10 @@ Choose `/permissions` to select the global execution mode. Choose `/sidechat` to
 create a temporary fork of the current thread. Each main
 thread can keep multiple side chats for the current Shikigami session. The chat
 area splits into main and the selected side pane, and both can stream independently.
-Press `Ctrl-g` to switch focus. While the side pane is focused, `Ctrl-n` and
+In message-scroll mode, press `l` / `Right` from the main pane to focus the side
+pane, then `h` / `Left` to return to the main pane; another `h` / `Left` returns
+to the repository tree. `Esc` returns directly to the tree, and `Ctrl-g` switches
+between chat panes directly. While the side pane is focused, `Ctrl-n` and
 `Ctrl-p` cycle through its forks. `/sides` opens the full list; moving with
 `j` / `k` previews immediately, `Enter` confirms, and `Esc` restores the
 previous selection. Use `/sideclose` to close the selected fork without

@@ -130,6 +130,8 @@ enum UiAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChatNavigationTarget {
     Input,
+    MainChat,
+    SideChat,
     RepositoryTree,
 }
 
@@ -695,6 +697,7 @@ async fn handle_key(
         return Ok(None);
     }
     let contexts = key_contexts(app);
+    let pressed_code = key.code;
     let key = app.keybindings.resolve(&contexts, key);
     if app.mode == Mode::Chat && app.focus == Focus::Chat && app.active_chat_has_pending_approval()
     {
@@ -741,11 +744,28 @@ async fn handle_key(
             handle_palette_key(app, key, server).await?;
         }
         Mode::Chat if app.chat().map(|chat| chat.mode) == Some(ChatMode::Scroll) => {
-            if let Some(target) = scroll_navigation_target(&key.code) {
+            if let Some(target) = scroll_navigation_target(
+                &pressed_code,
+                &key.code,
+                app.active_chat_pane,
+                app.has_side_chat(),
+            ) {
                 match target {
                     ChatNavigationTarget::Input => {
                         if let Some(chat) = app.chat_mut() {
                             chat.mode = ChatMode::Input;
+                        }
+                    }
+                    ChatNavigationTarget::MainChat => {
+                        app.active_chat_pane = ChatPane::Main;
+                        if let Some(chat) = app.chat_mut() {
+                            chat.enter_scroll_mode();
+                        }
+                    }
+                    ChatNavigationTarget::SideChat => {
+                        app.active_chat_pane = ChatPane::Side;
+                        if let Some(chat) = app.chat_mut() {
+                            chat.enter_scroll_mode();
                         }
                     }
                     ChatNavigationTarget::RepositoryTree => {
@@ -1658,11 +1678,23 @@ fn key_contexts(app: &App) -> [KeyContext; 2] {
     [context, KeyContext::Inactive]
 }
 
-fn scroll_navigation_target(code: &KeyCode) -> Option<ChatNavigationTarget> {
-    match code {
+fn scroll_navigation_target(
+    pressed_code: &KeyCode,
+    resolved_code: &KeyCode,
+    active_pane: ChatPane,
+    has_side_chat: bool,
+) -> Option<ChatNavigationTarget> {
+    match resolved_code {
         KeyCode::Char('i') | KeyCode::Enter | KeyCode::Tab => Some(ChatNavigationTarget::Input),
-        KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => {
-            Some(ChatNavigationTarget::RepositoryTree)
+        KeyCode::Esc
+            if active_pane == ChatPane::Side
+                && matches!(pressed_code, KeyCode::Char('h') | KeyCode::Left) =>
+        {
+            Some(ChatNavigationTarget::MainChat)
+        }
+        KeyCode::Esc => Some(ChatNavigationTarget::RepositoryTree),
+        KeyCode::Char('l') if active_pane == ChatPane::Main && has_side_chat => {
+            Some(ChatNavigationTarget::SideChat)
         }
         _ => None,
     }
@@ -4175,7 +4207,7 @@ fn chat_help(
                 keybindings.label("chat_input.focus_tree"),
             ),
             (ChatMode::Scroll, true) => format!(
-                "MESSAGES · {} / {} line · {} / {} msg · {}-{} link · {} editor cmd · {} copy · {} input · {} repositories",
+                "MESSAGES · {} / {} line · {} / {} msg · {}-{} link · {} editor cmd · {} copy · {} input · {} next pane · {} back",
                 keybindings.label("chat_scroll.line_up"),
                 keybindings.label("chat_scroll.line_down"),
                 keybindings.label("chat_scroll.previous_message"),
@@ -4185,6 +4217,7 @@ fn chat_help(
                 keybindings.label("chat_scroll.copy_editor_command"),
                 keybindings.label("chat_scroll.copy_message"),
                 keybindings.label("chat_scroll.focus_input"),
+                keybindings.label("chat_scroll.focus_next_pane"),
                 keybindings.label("chat_scroll.focus_tree"),
             ),
             (ChatMode::Scroll, false) => format!(
@@ -5943,17 +5976,63 @@ mod tests {
     fn scroll_navigation_enters_input_or_returns_to_the_repository_tree() {
         for code in [KeyCode::Char('i'), KeyCode::Enter, KeyCode::Tab] {
             assert_eq!(
-                scroll_navigation_target(&code),
+                scroll_navigation_target(&code, &code, ChatPane::Main, false),
                 Some(ChatNavigationTarget::Input)
             );
         }
-        for code in [KeyCode::Esc, KeyCode::Char('h'), KeyCode::Left] {
+        assert_eq!(
+            scroll_navigation_target(&KeyCode::Esc, &KeyCode::Esc, ChatPane::Side, true),
+            Some(ChatNavigationTarget::RepositoryTree)
+        );
+        for pressed_code in [KeyCode::Char('h'), KeyCode::Left] {
             assert_eq!(
-                scroll_navigation_target(&code),
+                scroll_navigation_target(&pressed_code, &KeyCode::Esc, ChatPane::Main, true,),
                 Some(ChatNavigationTarget::RepositoryTree)
             );
         }
-        assert_eq!(scroll_navigation_target(&KeyCode::Char('j')), None);
+        assert_eq!(
+            scroll_navigation_target(
+                &KeyCode::Char('j'),
+                &KeyCode::Char('j'),
+                ChatPane::Main,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn scroll_navigation_moves_between_main_and_side_chat_panes() {
+        for pressed_code in [KeyCode::Char('h'), KeyCode::Left] {
+            assert_eq!(
+                scroll_navigation_target(&pressed_code, &KeyCode::Esc, ChatPane::Side, true,),
+                Some(ChatNavigationTarget::MainChat)
+            );
+        }
+        for pressed_code in [KeyCode::Char('l'), KeyCode::Right] {
+            assert_eq!(
+                scroll_navigation_target(&pressed_code, &KeyCode::Char('l'), ChatPane::Main, true,),
+                Some(ChatNavigationTarget::SideChat)
+            );
+        }
+        assert_eq!(
+            scroll_navigation_target(
+                &KeyCode::Char('l'),
+                &KeyCode::Char('l'),
+                ChatPane::Main,
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            scroll_navigation_target(
+                &KeyCode::Char('l'),
+                &KeyCode::Char('l'),
+                ChatPane::Side,
+                true,
+            ),
+            None
+        );
     }
 
     #[test]

@@ -145,6 +145,12 @@ static ACTIONS: &[ActionSpec] = &[
         "esc",
         ["esc", "h", "left"]
     ),
+    action!(
+        "chat_scroll.focus_next_pane",
+        ChatScroll,
+        "l",
+        ["l", "right"]
+    ),
     action!("chat_scroll.interrupt", ChatScroll, "ctrl+c", ["ctrl+c"]),
     action!("chat_scroll.palette", ChatScroll, "/", ["/"]),
     action!("chat_scroll.toggle_pane", ChatScroll, "ctrl+g", ["ctrl+g"]),
@@ -1312,6 +1318,15 @@ mod tests {
                 )
                 .code,
             KeyCode::Char('q')
+        );
+        assert_eq!(
+            bindings
+                .resolve(
+                    &[KeyContext::ChatScroll],
+                    KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)
+                )
+                .code,
+            KeyCode::Char('l')
         );
     }
 }
