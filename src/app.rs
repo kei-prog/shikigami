@@ -644,6 +644,11 @@ impl App {
             .and_then(|thread_id| self.chats.get(thread_id))
     }
 
+    pub fn main_chat_mut(&mut self) -> Option<&mut ChatState> {
+        let thread_id = self.visible_chat_id.as_ref()?.to_owned();
+        self.chats.get_mut(&thread_id)
+    }
+
     pub fn side_chat(&self) -> Option<&ChatState> {
         self.side_chat_id
             .as_ref()

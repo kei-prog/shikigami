@@ -302,6 +302,7 @@ pub struct ChatState {
     streaming_message: Option<usize>,
     pending_user_message: Option<PendingInput>,
     pending_steers: VecDeque<PendingInput>,
+    inline_warning: Option<String>,
     interrupt_requested: bool,
     message_selection_scroll_pending: bool,
     history_complete: bool,
@@ -341,6 +342,7 @@ impl ChatState {
             streaming_message: None,
             pending_user_message: None,
             pending_steers: VecDeque::new(),
+            inline_warning: None,
             interrupt_requested: false,
             message_selection_scroll_pending: false,
             history_complete: true,
@@ -399,6 +401,7 @@ impl ChatState {
         self.streaming_message = None;
         self.pending_user_message = None;
         self.pending_steers.clear();
+        self.inline_warning = None;
         self.interrupt_requested = false;
         self.visible_editor_target = None;
         self.selected_message_index = None;
@@ -449,9 +452,18 @@ impl ChatState {
         self.streaming_message = None;
         self.interrupt_requested = false;
         self.waiting_for_activity = true;
+        self.inline_warning = None;
         if self.is_side_chat {
             self.side_chat_has_activity = true;
         }
+    }
+
+    pub fn show_inline_warning(&mut self, warning: impl Into<String>) {
+        self.inline_warning = Some(warning.into());
+    }
+
+    pub fn inline_warning(&self) -> Option<&str> {
+        self.inline_warning.as_deref()
     }
 
     #[cfg(test)]
@@ -918,6 +930,7 @@ impl ChatState {
                 self.streaming_message = None;
                 self.pending_user_message = None;
                 self.pending_steers.clear();
+                self.inline_warning = None;
                 self.interrupt_requested = false;
                 self.waiting_for_activity = false;
                 if interrupted {
@@ -1702,7 +1715,10 @@ mod tests {
     fn completed_turn_does_not_add_an_interruption_notice() {
         let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
         chat.begin_user_turn("question".into(), "u".into());
+        chat.show_inline_warning("Wait for the response");
         let message_count = chat.messages.len();
+
+        assert_eq!(chat.inline_warning(), Some("Wait for the response"));
 
         chat.apply(&event(
             "turn/completed",
@@ -1710,6 +1726,7 @@ mod tests {
         ));
 
         assert_eq!(chat.messages.len(), message_count);
+        assert_eq!(chat.inline_warning(), None);
     }
 
     #[test]

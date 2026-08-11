@@ -2276,7 +2276,10 @@ async fn open_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
         return Ok(());
     };
     if main_chat.active_turn_id.is_some() {
-        app.message = Some("Wait for the current turn before forking a side chat".into());
+        if let Some(main_chat) = app.main_chat_mut() {
+            main_chat
+                .show_inline_warning("Side chats can't be created while a response is streaming.");
+        }
         return Ok(());
     }
     if main_chat.messages.is_empty() {
@@ -3965,9 +3968,19 @@ fn render_chat_pane(
     let pending_height = u16::try_from(pending_lines.len().saturating_add(2))
         .unwrap_or(u16::MAX)
         .min(pending_height_limit);
+    let inline_warning_lines = chat
+        .inline_warning()
+        .map(|warning| inline_warning_lines(warning, area.width.max(1) as usize))
+        .unwrap_or_default();
+    let show_inline_warning = !inline_warning_lines.is_empty();
     let mut constraints = vec![Constraint::Min(5)];
     if show_pending {
         constraints.push(Constraint::Length(pending_height));
+    }
+    if show_inline_warning {
+        constraints.push(Constraint::Length(
+            u16::try_from(inline_warning_lines.len()).unwrap_or(u16::MAX),
+        ));
     }
     constraints.push(Constraint::Length(4));
     let chunks = Layout::default()
@@ -3976,7 +3989,9 @@ fn render_chat_pane(
         .split(area);
     let chat_area = chunks[0];
     let pending_area = show_pending.then_some(chunks[1]);
-    let message_index = usize::from(show_pending) + 1;
+    let inline_warning_index = usize::from(show_pending) + 1;
+    let inline_warning_area = show_inline_warning.then_some(chunks[inline_warning_index]);
+    let message_index = inline_warning_index + usize::from(show_inline_warning);
     let message_area = chunks[message_index];
     let visible_height = chat_area.height.saturating_sub(2).max(1) as usize;
     let chat_border = chat_border_color(chat_focused, chat.mode);
@@ -4026,6 +4041,23 @@ fn render_chat_pane(
             .scroll((u16::try_from(pending_scroll).unwrap_or(u16::MAX), 0))
             .block(pending_block),
             pending_area,
+        );
+    }
+    if let Some(inline_warning_area) = inline_warning_area {
+        frame.render_widget(
+            Paragraph::new(Text::from(
+                inline_warning_lines
+                    .into_iter()
+                    .map(Line::from)
+                    .collect::<Vec<_>>(),
+            ))
+            .style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            inline_warning_area,
         );
     }
     let pending_steers = chat.pending_steer_count();
@@ -4098,6 +4130,10 @@ fn render_chat_pane(
             .min(message_inner.bottom().saturating_sub(1));
         frame.set_cursor_position((x, y));
     }
+}
+
+fn inline_warning_lines(warning: &str, width: usize) -> Vec<String> {
+    wrap_composer(&format!(" WARNING · {warning}"), width.max(1))
 }
 
 fn chat_help(
@@ -5885,6 +5921,22 @@ mod tests {
         assert_eq!(chat_border_color(true, ChatMode::Input), Color::DarkGray);
         assert_eq!(chat_border_color(false, ChatMode::Scroll), Color::DarkGray);
         assert_eq!(chat_border_color(false, ChatMode::Input), Color::DarkGray);
+    }
+
+    #[test]
+    fn inline_warning_is_prefixed_and_wrapped_for_the_chat_pane() {
+        let lines = inline_warning_lines(
+            "Side chats can't be created while a response is streaming.",
+            36,
+        );
+
+        assert!(lines[0].starts_with(" WARNING · Side chats"));
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|line| line.chars().count() <= 36));
+        assert_eq!(
+            lines.concat(),
+            " WARNING · Side chats can't be created while a response is streaming."
+        );
     }
 
     #[test]
