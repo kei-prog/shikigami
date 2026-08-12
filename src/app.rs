@@ -4353,15 +4353,16 @@ mod tests {
 
     #[test]
     fn repository_registration_uses_an_exact_path_or_the_source_cwd() {
-        let explicit = Path::new("/projects/repository");
-        let source_cwd = Path::new("/projects/current-worktree");
+        let root = tempdir().unwrap();
+        let explicit = root.path().join("repository");
+        let source_cwd = root.path().join("current-worktree");
 
         assert_eq!(
-            repository_registration_path(Some(explicit), Some(source_cwd)).unwrap(),
+            repository_registration_path(Some(&explicit), Some(&source_cwd)).unwrap(),
             explicit
         );
         assert_eq!(
-            repository_registration_path(None, Some(source_cwd)).unwrap(),
+            repository_registration_path(None, Some(&source_cwd)).unwrap(),
             source_cwd
         );
         assert!(repository_registration_path(Some(Path::new("relative")), None).is_err());
