@@ -764,12 +764,6 @@ impl App {
         Some((thread_id, turn_id))
     }
 
-    pub fn complete_side_chat_deletion(&mut self, thread_id: &str) -> Result<()> {
-        self.side_chat_registry.remove(thread_id)?;
-        self.remove_side_chat_from_session(thread_id);
-        Ok(())
-    }
-
     fn remove_side_chat_from_session(&mut self, thread_id: &str) {
         let Some(parent_thread_id) = self.side_chat_parent(thread_id) else {
             return;
@@ -900,20 +894,6 @@ impl App {
 
     pub fn forget_temporary_side_chat(&self, thread_id: &str) -> Result<()> {
         self.side_chat_registry.remove(thread_id)
-    }
-
-    pub fn side_chat_cleanup_targets(&self) -> Vec<(String, Option<String>)> {
-        self.side_chats_by_parent
-            .values()
-            .flatten()
-            .map(|thread_id| {
-                let turn_id = self
-                    .chats
-                    .get(thread_id)
-                    .and_then(|chat| chat.active_turn_id.clone());
-                (thread_id.clone(), turn_id)
-            })
-            .collect()
     }
 
     pub fn current_side_chats(&self) -> Vec<&ChatState> {
@@ -1148,10 +1128,6 @@ impl App {
         };
         self.side_chat_id = Some(thread_id);
         self.side_chat_parent_id = Some(parent_thread_id);
-    }
-
-    pub fn side_chat_count(&self) -> usize {
-        self.side_chats_by_parent.values().map(Vec::len).sum()
     }
 
     pub fn record_owned_turn(&mut self, thread_id: String, turn_id: String) {

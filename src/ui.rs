@@ -195,10 +195,6 @@ pub async fn run(mut app: App) -> Result<()> {
         &[],
     );
     let server = server?;
-    let cleanup_started = app.performance.start_timer();
-    cleanup_abandoned_side_chats(&mut app, &server).await;
-    app.performance
-        .record_duration("startup.side_chat_cleanup", cleanup_started, "success", &[]);
     let models_started = app.performance.start_timer();
     let models = server.list_models().await;
     app.performance.record_duration(
@@ -275,6 +271,7 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
     let (clipboard_image_sender, mut clipboard_image_receiver) = mpsc::unbounded_channel();
     let (draft_cleanup_sender, mut draft_cleanup_receiver) = mpsc::unbounded_channel();
     let (side_chat_deletion_sender, mut side_chat_deletion_receiver) = mpsc::unbounded_channel();
+    spawn_abandoned_side_chat_cleanup(app, Arc::clone(&server), side_chat_deletion_sender.clone());
     spawn_thread_name_refresh(app, Arc::clone(&server), thread_name_sender);
     let mut thread_name_refresh_pending = true;
     let mut clipboard_image_paste_pending = false;
@@ -2439,7 +2436,11 @@ fn spawn_side_chat_deletion(
     });
 }
 
-async fn cleanup_abandoned_side_chats(app: &mut App, server: &Arc<AppServer>) {
+fn spawn_abandoned_side_chat_cleanup(
+    app: &mut App,
+    server: Arc<AppServer>,
+    sender: mpsc::UnboundedSender<SideChatDeletionEvent>,
+) {
     let thread_ids = match app.abandoned_side_chat_ids() {
         Ok(thread_ids) => thread_ids,
         Err(error) => {
@@ -2447,60 +2448,12 @@ async fn cleanup_abandoned_side_chats(app: &mut App, server: &Arc<AppServer>) {
             return;
         }
     };
-    let mut cleaned = 0;
-    let mut failures = Vec::new();
     for thread_id in thread_ids {
-        if let Err(error) = delete_temporary_thread(server, &thread_id).await {
-            failures.push(format!("{thread_id}: {error}"));
-            continue;
-        }
-        match app.forget_temporary_side_chat(&thread_id) {
-            Ok(()) => cleaned += 1,
-            Err(error) => failures.push(format!("{thread_id}: {error}")),
-        }
-    }
-    if !failures.is_empty() {
-        app.message = Some(format!(
-            "Cleaned {cleaned} abandoned side chat(s); {} cleanup(s) failed",
-            failures.len()
-        ));
-    } else if cleaned > 0 {
-        app.message = Some(format!("Cleaned {cleaned} abandoned side chat(s)"));
-    }
-}
-
-async fn cleanup_open_side_chats(app: &mut App, server: &Arc<AppServer>) -> bool {
-    let mut failures = Vec::new();
-    for (thread_id, turn_id) in app.side_chat_cleanup_targets() {
-        if let Some(turn_id) = turn_id
-            && let Err(error) = server.interrupt_turn(&thread_id, &turn_id).await
-        {
-            failures.push(format!("{thread_id}: {error}"));
-            continue;
-        }
-        if let Err(error) = delete_temporary_thread(server, &thread_id).await {
-            failures.push(format!("{thread_id}: {error}"));
-            continue;
-        }
-        if let Err(error) = app.complete_side_chat_deletion(&thread_id) {
-            failures.push(format!("{thread_id}: local cleanup failed: {error}"));
-        }
-    }
-    if failures.is_empty() {
-        true
-    } else {
-        app.message = Some(format!(
-            "Could not clean up {} side chat(s); quit cancelled",
-            failures.len()
-        ));
-        false
+        spawn_side_chat_deletion(server.clone(), thread_id, None, sender.clone());
     }
 }
 
 async fn prepare_to_quit(app: &mut App, server: &Arc<AppServer>) -> bool {
-    if !cleanup_open_side_chats(app, server).await {
-        return false;
-    }
     interrupt_owned_turns(app, server).await
 }
 
@@ -4993,27 +4946,17 @@ fn bulk_rename_progress_text(progress: Option<BulkRenameProgress>, elapsed: u64)
 }
 
 fn render_quit_confirm(frame: &mut Frame, area: Rect, app: &App) {
-    let side_chat_count = app.side_chat_count();
     let turn_count = app.owned_turn_count();
-    let mut warnings = Vec::new();
-    if turn_count > 0 {
-        warnings.push(format!(
-            "• {turn_count} running response{} will be stopped",
-            if turn_count == 1 { "" } else { "s" }
-        ));
-    }
-    if side_chat_count > 0 {
-        warnings.push(format!(
-            "• {side_chat_count} temporary side chat{} will be deleted",
-            if side_chat_count == 1 { "" } else { "s" }
-        ));
-    }
-    let popup = centered_rect(68, u16::try_from(warnings.len()).unwrap_or(2) + 6, area);
+    let warning = format!(
+        "• {turn_count} running response{} will be stopped",
+        if turn_count == 1 { "" } else { "s" }
+    );
+    let popup = centered_rect(68, 7, area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(format!(
             "{}\n\n{} quit · {} cancel",
-            warnings.join("\n"),
+            warning,
             app.keybindings.label("quit.confirm"),
             app.keybindings.label("quit.cancel"),
         ))
@@ -5975,15 +5918,15 @@ fn navigation_width(total_width: u16) -> u16 {
 }
 
 fn request_quit(app: &mut App) {
-    if quit_requires_confirmation(app.side_chat_count(), app.owned_turn_count()) {
+    if quit_requires_confirmation(app.owned_turn_count()) {
         app.mode = Mode::ConfirmQuit;
     } else {
         app.should_quit = true;
     }
 }
 
-fn quit_requires_confirmation(side_chat_count: usize, owned_turn_count: usize) -> bool {
-    side_chat_count > 0 || owned_turn_count > 0
+fn quit_requires_confirmation(owned_turn_count: usize) -> bool {
+    owned_turn_count > 0
 }
 
 fn focus_style(focused: bool) -> Style {
@@ -6464,11 +6407,10 @@ mod tests {
     }
 
     #[test]
-    fn running_turns_or_side_chats_require_quit_confirmation() {
-        assert!(!quit_requires_confirmation(0, 0));
-        assert!(quit_requires_confirmation(1, 0));
-        assert!(quit_requires_confirmation(0, 1));
-        assert!(quit_requires_confirmation(3, 2));
+    fn only_running_turns_require_quit_confirmation() {
+        assert!(!quit_requires_confirmation(0));
+        assert!(quit_requires_confirmation(1));
+        assert!(quit_requires_confirmation(2));
     }
 
     #[test]
