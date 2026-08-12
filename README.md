@@ -395,7 +395,8 @@ New chats default to `medium` reasoning when the selected model supports it.
 
 Choose `/permissions` to select the global execution mode. Choose `/sidechat` to
 create a fork attached to the current thread; `Ctrl-s` does the same directly
-from chat input or message-scroll mode. Each main
+from chat input, message-scroll mode, or a selected thread in the repository tree.
+Each main
 thread can keep multiple side chats across Shikigami sessions. The chat
 area splits into main and the selected side pane, and both can stream independently.
 Creating a side chat while the main response is streaming forks the conversation

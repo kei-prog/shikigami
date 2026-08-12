@@ -696,6 +696,12 @@ static ACTIONS: &[ActionSpec] = &[
         ["i", "enter"]
     ),
     action!(
+        "normal.thread.side_chat",
+        NormalThread,
+        "ctrl+s",
+        ["ctrl+s"]
+    ),
+    action!(
         "normal.thread.preview_half_page_up",
         NormalThread,
         "ctrl+u",
@@ -1295,6 +1301,17 @@ mod tests {
             assert_eq!(resolved.code, KeyCode::Char('s'));
             assert!(resolved.modifiers.contains(KeyModifiers::CONTROL));
         }
+    }
+
+    #[test]
+    fn ctrl_s_opens_side_chat_from_a_selected_thread() {
+        let bindings = KeyBindings::defaults();
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        let resolved = bindings.resolve(&[KeyContext::NormalThread, KeyContext::Normal], ctrl_s);
+
+        assert_eq!(resolved.code, KeyCode::Char('s'));
+        assert!(resolved.modifiers.contains(KeyModifiers::CONTROL));
     }
 
     #[test]

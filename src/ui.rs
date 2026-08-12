@@ -1477,6 +1477,19 @@ async fn handle_key(
             KeyCode::Char('/') => open_command_palette(app, server).await?,
             KeyCode::Char('f') => app.open_thread_picker(),
             KeyCode::Esc if app.selected_tree_is_thread() => app.select_parent_group(),
+            KeyCode::Char('s')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && app.selected_tree_is_thread()
+                    && !app.show_archived =>
+            {
+                cancel_chat_preview(preview_generation, preview_task);
+                match load_selected_chat(app, server).await {
+                    Ok(()) => open_side_chat(app, server).await?,
+                    Err(error) => {
+                        app.message = Some(format!("Could not open thread: {error}"));
+                    }
+                }
+            }
             KeyCode::Char('h') | KeyCode::Left
                 if matches!(app.selected_tree_row(), Some(TreeRow::GeneralThread { .. })) =>
             {
