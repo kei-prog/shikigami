@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
@@ -67,6 +67,38 @@ enum MarkdownList {
     Ordered(u64),
 }
 
+struct MarkdownTable {
+    alignments: Vec<Alignment>,
+    header: Vec<String>,
+    rows: Vec<Vec<String>>,
+    current_row: Vec<String>,
+    in_header: bool,
+}
+
+impl MarkdownTable {
+    fn new(alignments: Vec<Alignment>) -> Self {
+        Self {
+            alignments,
+            header: Vec::new(),
+            rows: Vec::new(),
+            current_row: Vec::new(),
+            in_header: false,
+        }
+    }
+
+    fn finish_row(&mut self) {
+        if self.current_row.is_empty() {
+            return;
+        }
+        let row = std::mem::take(&mut self.current_row);
+        if self.in_header {
+            self.header = row;
+        } else {
+            self.rows.push(row);
+        }
+    }
+}
+
 struct MarkdownRenderer {
     available_width: usize,
     lines: Vec<Line<'static>>,
@@ -79,6 +111,7 @@ struct MarkdownRenderer {
     code_line: String,
     links: Vec<String>,
     active_link: Option<usize>,
+    table: Option<MarkdownTable>,
 }
 
 impl MarkdownRenderer {
@@ -95,13 +128,18 @@ impl MarkdownRenderer {
             code_line: String::new(),
             links: Vec::new(),
             active_link: None,
+            table: None,
         }
     }
 
     fn render(mut self, content: &str) -> Vec<Line<'static>> {
-        let parser = Parser::new_ext(content, Options::ENABLE_STRIKETHROUGH);
+        let parser = Parser::new_ext(content, markdown_options());
         for event in parser {
             self.event(event);
+        }
+        if let Some(mut table) = self.table.take() {
+            table.finish_row();
+            self.render_table(table);
         }
         if self.code_block {
             self.finish_code_line(false);
@@ -133,6 +171,7 @@ impl MarkdownRenderer {
                     .bg(Color::Rgb(32, 34, 36)),
             ),
             Event::SoftBreak => self.push_text(" "),
+            Event::HardBreak if self.table.is_some() => self.push_styled("\n", Style::default()),
             Event::HardBreak => self.finish_line(true),
             Event::Rule => {
                 self.finish_line(false);
@@ -212,6 +251,22 @@ impl MarkdownRenderer {
                     ));
                 }
             }
+            Tag::Table(alignments) => {
+                self.finish_line(false);
+                self.table = Some(MarkdownTable::new(alignments));
+            }
+            Tag::TableHead => {
+                if let Some(table) = self.table.as_mut() {
+                    table.in_header = true;
+                    table.current_row.clear();
+                }
+            }
+            Tag::TableRow => {
+                if let Some(table) = self.table.as_mut() {
+                    table.current_row.clear();
+                }
+            }
+            Tag::TableCell => self.spans.clear(),
             _ => {}
         }
     }
@@ -258,6 +313,33 @@ impl MarkdownRenderer {
                 self.finish_code_line(false);
                 self.code_block = false;
                 self.blank_line();
+            }
+            TagEnd::TableCell => {
+                let cell = std::mem::take(&mut self.spans)
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect();
+                if let Some(table) = self.table.as_mut() {
+                    table.current_row.push(cell);
+                }
+            }
+            TagEnd::TableHead => {
+                if let Some(table) = self.table.as_mut() {
+                    table.finish_row();
+                    table.in_header = false;
+                }
+            }
+            TagEnd::TableRow => {
+                if let Some(table) = self.table.as_mut() {
+                    table.finish_row();
+                }
+            }
+            TagEnd::Table => {
+                if let Some(mut table) = self.table.take() {
+                    table.finish_row();
+                    self.render_table(table);
+                    self.blank_line();
+                }
             }
             _ => {}
         }
@@ -382,6 +464,179 @@ impl MarkdownRenderer {
             .iter()
             .fold(Style::default(), |style, addition| style.patch(*addition))
     }
+
+    fn render_table(&mut self, table: MarkdownTable) {
+        let columns = table
+            .alignments
+            .len()
+            .max(table.header.len())
+            .max(table.rows.iter().map(Vec::len).max().unwrap_or(0));
+        if columns == 0 {
+            return;
+        }
+        let horizontal_overhead = columns.saturating_add(1);
+        let minimum_readable_width = horizontal_overhead.saturating_add(columns * 4);
+        if self.available_width < minimum_readable_width {
+            self.render_stacked_table(&table, columns);
+            return;
+        }
+
+        let desired_widths = (0..columns)
+            .map(|column| {
+                std::iter::once(table.header.get(column).map_or("", String::as_str))
+                    .chain(
+                        table
+                            .rows
+                            .iter()
+                            .map(move |row| row.get(column).map_or("", String::as_str)),
+                    )
+                    .flat_map(str::lines)
+                    .map(UnicodeWidthStr::width)
+                    .max()
+                    .unwrap_or(1)
+                    .max(1)
+            })
+            .collect::<Vec<_>>();
+        let content_width = self.available_width.saturating_sub(horizontal_overhead);
+        let widths = allocate_column_widths(&desired_widths, content_width);
+
+        self.push_table_rule('┌', '┬', '┐', &widths);
+        self.push_table_row(&table.header, &table.alignments, &widths, true);
+        self.push_table_rule('├', '┼', '┤', &widths);
+        for (index, row) in table.rows.iter().enumerate() {
+            self.push_table_row(row, &table.alignments, &widths, false);
+            if index + 1 < table.rows.len() {
+                self.push_table_rule('├', '┼', '┤', &widths);
+            }
+        }
+        self.push_table_rule('└', '┴', '┘', &widths);
+    }
+
+    fn render_stacked_table(&mut self, table: &MarkdownTable, columns: usize) {
+        let empty_row = Vec::new();
+        let rows = if table.rows.is_empty() {
+            std::slice::from_ref(&empty_row)
+        } else {
+            table.rows.as_slice()
+        };
+        for (row_index, row) in rows.iter().enumerate() {
+            for column in 0..columns {
+                let heading = table.header.get(column).map_or("", String::as_str);
+                for line in wrap_message(heading, self.available_width) {
+                    self.lines.push(Line::styled(
+                        line,
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                let indent = usize::from(self.available_width > 2) * 2;
+                let value_width = self.available_width.saturating_sub(indent).max(1);
+                let value = row.get(column).map_or("", String::as_str);
+                for line in wrap_message(value, value_width) {
+                    self.lines
+                        .push(Line::from(format!("{}{}", " ".repeat(indent), line)));
+                }
+            }
+            if row_index + 1 < rows.len() {
+                self.blank_line();
+            }
+        }
+    }
+
+    fn push_table_rule(&mut self, left: char, middle: char, right: char, widths: &[usize]) {
+        let mut rule = String::new();
+        rule.push(left);
+        for (index, width) in widths.iter().enumerate() {
+            rule.push_str(&"─".repeat(*width));
+            rule.push(if index + 1 == widths.len() {
+                right
+            } else {
+                middle
+            });
+        }
+        self.lines
+            .push(Line::styled(rule, Style::default().fg(Color::DarkGray)));
+    }
+
+    fn push_table_row(
+        &mut self,
+        row: &[String],
+        alignments: &[Alignment],
+        widths: &[usize],
+        header: bool,
+    ) {
+        let cells = widths
+            .iter()
+            .enumerate()
+            .map(|(column, width)| wrap_message(row.get(column).map_or("", String::as_str), *width))
+            .collect::<Vec<_>>();
+        let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+        let cell_style = if header {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        for line_index in 0..height {
+            let mut spans = vec![Span::styled("│", Style::default().fg(Color::DarkGray))];
+            for (column, width) in widths.iter().enumerate() {
+                let content = cells[column].get(line_index).map_or("", String::as_str);
+                let alignment = alignments.get(column).copied().unwrap_or(Alignment::None);
+                spans.push(Span::styled(
+                    align_table_cell(content, *width, alignment),
+                    cell_style,
+                ));
+                spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+            }
+            self.lines.push(Line::from(spans));
+        }
+    }
+}
+
+fn markdown_options() -> Options {
+    Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES
+}
+
+fn allocate_column_widths(desired: &[usize], available: usize) -> Vec<usize> {
+    let mut widths = vec![1; desired.len()];
+    let mut remaining = available.saturating_sub(widths.len());
+    while remaining > 0 {
+        let unsatisfied = widths
+            .iter()
+            .zip(desired)
+            .filter(|(width, desired)| width < desired)
+            .count();
+        if unsatisfied == 0 {
+            break;
+        }
+        let share = (remaining / unsatisfied).max(1);
+        for (width, desired) in widths.iter_mut().zip(desired) {
+            let added = desired.saturating_sub(*width).min(share).min(remaining);
+            *width += added;
+            remaining -= added;
+            if remaining == 0 {
+                break;
+            }
+        }
+    }
+    widths
+}
+
+fn align_table_cell(content: &str, width: usize, alignment: Alignment) -> String {
+    let padding = width.saturating_sub(UnicodeWidthStr::width(content));
+    let left = match alignment {
+        Alignment::Right => padding,
+        Alignment::Center => padding / 2,
+        Alignment::None | Alignment::Left => 0,
+    };
+    format!(
+        "{}{}{}",
+        " ".repeat(left),
+        content,
+        " ".repeat(padding - left)
+    )
 }
 
 fn web_link_number(links: &mut Vec<String>, destination: &str) -> Option<usize> {
@@ -411,7 +666,7 @@ fn next_bare_web_link(text: &str) -> Option<(usize, usize)> {
 
 pub(super) fn message_web_links(content: &str) -> Vec<String> {
     let mut links = Vec::new();
-    let parser = Parser::new_ext(content, Options::ENABLE_STRIKETHROUGH);
+    let parser = Parser::new_ext(content, markdown_options());
     let mut inside_link = false;
     for event in parser {
         match event {
@@ -911,6 +1166,96 @@ mod tests {
 
         assert!(text.contains("Working on **unfinished"));
         assert!(text.contains("let value = 1;"));
+    }
+
+    #[test]
+    fn markdown_renders_a_basic_table() {
+        let lines = markdown_message_lines(
+            "| Name | Status |\n| --- | --- |\n| parser | ready |\n| renderer | active |",
+            40,
+        );
+        let text = lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert!(
+            text.iter()
+                .any(|line| line.starts_with("┌") && line.ends_with("┐"))
+        );
+        assert!(
+            text.iter()
+                .any(|line| line.contains("Name") && line.contains("Status"))
+        );
+        assert!(
+            text.iter()
+                .any(|line| line.contains("parser") && line.contains("ready"))
+        );
+        assert!(
+            text.iter()
+                .any(|line| line.starts_with("└") && line.ends_with("┘"))
+        );
+        let header = lines
+            .iter()
+            .find(|line| line_text(line).contains("Name"))
+            .unwrap();
+        assert!(header.spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn markdown_table_respects_column_alignment() {
+        let lines = markdown_message_lines(
+            "| Left | Center | Right |\n| :--- | :----: | ----: |\n| a | b | c |",
+            40,
+        );
+        let body = lines
+            .iter()
+            .map(line_text)
+            .find(|line| line.contains('a') && line.contains('b') && line.contains('c'))
+            .unwrap();
+
+        assert_eq!(body, "│a   │  b   │    c│");
+    }
+
+    #[test]
+    fn narrow_markdown_table_stacks_without_horizontal_overflow() {
+        let lines = markdown_message_lines(
+            "Before\n\n| Field | Value |\n| --- | --- |\n| mode | streaming response |\n\nAfter",
+            10,
+        );
+        let text = lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert!(lines.iter().all(|line| line.width() <= 10));
+        assert!(text.iter().any(|line| line == "Field"));
+        assert!(text.concat().replace(' ', "").contains("streamingresponse"));
+        assert!(text.iter().any(|line| line == "Before"));
+        assert!(text.iter().any(|line| line == "After"));
+    }
+
+    #[test]
+    fn markdown_table_wraps_unicode_by_display_width() {
+        let lines = markdown_message_lines(
+            "| 項目 | 内容 |\n| --- | --- |\n| 状態 | 日本語の長い説明🙂です |",
+            18,
+        );
+        let text = lines.iter().map(line_text).collect::<String>();
+
+        assert!(lines.iter().all(|line| line.width() <= 18));
+        assert!(text.contains("項目"));
+        assert!(text.contains("日本語"));
+        assert!(text.contains('🙂'));
+    }
+
+    #[test]
+    fn streaming_table_and_existing_markdown_remain_visible() {
+        let lines = markdown_message_lines(
+            "## Update\n\n**Ready**\n\n| Step | Result |\n| --- | --- |\n| parse | partial",
+            24,
+        );
+        let text = lines.iter().map(line_text).collect::<String>();
+
+        assert!(text.contains("Update"));
+        assert!(text.contains("Ready"));
+        assert!(text.contains("Step"));
+        assert!(text.contains("partial"));
+        assert!(lines.iter().all(|line| line.width() <= 24));
     }
 
     #[test]
