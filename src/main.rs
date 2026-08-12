@@ -1,5 +1,6 @@
 mod app;
 pub mod app_server;
+mod browser_preview;
 mod chat;
 mod clipboard;
 mod codex_workspace;

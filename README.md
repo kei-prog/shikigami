@@ -163,7 +163,7 @@ confirmation word, and they refuse to run while Shikigami is open.
 - `Enter`: expand a repository or focus the selected thread's chat input
 - `i`: focus the selected thread's chat input directly
 - `Tab`: focus the open chat
-- In message scroll mode, `J` / `K` selects a message and `1`–`9` opens its numbered web link in the system browser
+- In message scroll mode, `J` / `K` selects a message, `o` opens the chat in a browser at that message, and `1`–`9` opens its numbered web link
 - `Esc`: select the parent group or return from chat to the tree
 - `/`: open the command palette
 - `f`: fuzzy-search active threads from the thread tree
@@ -359,6 +359,12 @@ keeps it visible. Press `y` to copy that message without its rendered wrapping
 or borders, or `Y` to copy the full current chat with role labels. Main and side
 chats keep independent selections. Clipboard commands are launched only when a
 copy is requested (`pbcopy` on macOS, with native command fallbacks elsewhere).
+Press `o` to open the full current chat as a temporary local HTML preview in the
+system browser. If a message is selected, the preview scrolls to and highlights
+it. Tables use the browser layout, and fenced `mermaid` blocks render as diagrams
+when the pinned Mermaid script can be loaded; without network access, their source
+remains visible. Chat content stays in a user-only temporary file and is removed
+after ten minutes instead of being uploaded to a preview service.
 When a diff hunk is visible, `e` copies a command that opens the hunk's new-file
 line in the configured Git editor. Shikigami resolves the editor with
 `git var GIT_EDITOR`, recognizes the line-number syntax of common editors, and

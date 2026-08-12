@@ -49,6 +49,7 @@ use crate::{
         ThreadNameApplyRequest, ThreadNameGenerationRequest, TreeRow,
     },
     app_server::{AppServer, AppServerRequest, TurnSettings},
+    browser_preview,
     chat::{ChatMode, ChatState, CommandPalette, EditorTarget, PaletteCommand, PaletteEntry},
     clipboard,
     git_workspace::{self, Workspace},
@@ -223,6 +224,7 @@ pub async fn run(mut app: App) -> Result<()> {
         }
     };
     let result = run_loop(&mut terminal, &mut app, Arc::clone(&server)).await;
+    browser_preview::cleanup();
     app.persist_repository_ui_state();
     unsubscribe_all_threads(&mut app, &server).await;
     let restore_result = restore_terminal(&mut terminal);
@@ -865,6 +867,7 @@ async fn handle_key(
                 }
                 KeyCode::Char('y') => copy_selected_message(app),
                 KeyCode::Char('Y') => copy_conversation(app),
+                KeyCode::Char('o') => open_browser_preview(app).await,
                 KeyCode::Char('e') => {
                     if let Some(chat) = app.chat()
                         && let Some(target) = chat.visible_editor_target.clone()
@@ -2038,6 +2041,22 @@ fn copy_selected_message(app: &mut App) {
             Err(error) => format!("Could not copy message: {error}"),
         },
         None => "No message selected".into(),
+    });
+}
+
+async fn open_browser_preview(app: &mut App) {
+    let result = app
+        .chat()
+        .context("Select a thread first")
+        .map(browser_preview::PreviewSnapshot::from_chat);
+    let result = match result {
+        Ok(snapshot) => browser_preview::open(snapshot).await,
+        Err(error) => Err(error),
+    };
+    app.message = Some(match result {
+        Ok(true) => "Opened chat in browser at the selected message".into(),
+        Ok(false) => "Opened chat in browser".into(),
+        Err(error) => format!("Could not open browser preview: {error}"),
     });
 }
 
@@ -4318,11 +4337,12 @@ fn chat_help(
                 keybindings.label("chat_input.focus_tree"),
             ),
             (ChatMode::Scroll, true) => format!(
-                "MESSAGES · {} / {} line · {} / {} msg · {}-{} link · {} editor cmd · {} copy · {} input · {} next pane · {} back",
+                "MESSAGES · {} / {} line · {} / {} msg · {} browser · {}-{} link · {} editor cmd · {} copy · {} input · {} next pane · {} back",
                 keybindings.label("chat_scroll.line_up"),
                 keybindings.label("chat_scroll.line_down"),
                 keybindings.label("chat_scroll.previous_message"),
                 keybindings.label("chat_scroll.next_message"),
+                keybindings.label("chat_scroll.browser_preview"),
                 keybindings.label("chat_scroll.open_link_1"),
                 keybindings.label("chat_scroll.open_link_9"),
                 keybindings.label("chat_scroll.copy_editor_command"),
@@ -4332,11 +4352,12 @@ fn chat_help(
                 keybindings.label("chat_scroll.focus_tree"),
             ),
             (ChatMode::Scroll, false) => format!(
-                "MESSAGES · {} / {} line · {} / {} msg · {}-{} link · {} editor cmd · {} / {} copy · {} / {} half · {} input · {} repositories",
+                "MESSAGES · {} / {} line · {} / {} msg · {} browser · {}-{} link · {} editor cmd · {} / {} copy · {} / {} half · {} input · {} repositories",
                 keybindings.label("chat_scroll.line_up"),
                 keybindings.label("chat_scroll.line_down"),
                 keybindings.label("chat_scroll.previous_message"),
                 keybindings.label("chat_scroll.next_message"),
+                keybindings.label("chat_scroll.browser_preview"),
                 keybindings.label("chat_scroll.open_link_1"),
                 keybindings.label("chat_scroll.open_link_9"),
                 keybindings.label("chat_scroll.copy_editor_command"),
@@ -5925,10 +5946,10 @@ fn render_attention(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect, app: &App) {
-    let popup = centered_rect(78, 39, area);
+    let popup = centered_rect(78, 40, area);
     let ask_shikigami = app.keybindings.label("help.ask_shikigami");
     let help = format!(
-        "{up} / {down}  move and preview selected thread\n{collapse} / {expand}  collapse or expand a repository\n{open_scroll}  focus selected thread messages\n{open_input}  focus selected thread input\n{collapse_all} / {expand_all}  collapse / expand all repositories\n{submit}  send or steer in chat\n{newline}  insert a newline in chat input\n{left}/{right}/{input_up}/{input_down}  move the chat input cursor\n{line_start}/{line_end}  move to start/end of the current input line\n{focus_chat}  focus chat / enter scroll mode\n{previous_message} / {next_message}  select messages in scroll mode\n{copy_editor}  copy an editor command for the visible diff hunk\n{copy_id} / {copy_resume}  copy thread ID / resume command\n{copy_message} / {copy_chat}  copy selected message / full chat\n{interrupt}  stop the current response\n{toggle_pane}  switch main / side chat focus\n{next_chat} / {previous_chat}  next / previous side chat\n{palette}  open the command palette\n{find_thread}  filter threads\n/permissions  choose Auto or Dangerous execution\n{rename}  open thread-name actions\n{attention}  show threads that need attention\n{cancel}  return to thread tree / cancel\n{add_repository}  add repositories\n{new_thread}  create General chat or repository thread\n{archive}  archive / restore thread\n{undo}  undo the last archive\n{archived}  active / archived threads\n{delete}  unregister repository / delete archived thread\n{refresh}  reload repositories and names\n{show_help}  help\n{quit}  quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {permissions}\nConfig: {config}\n{close_help} closes this screen",
+        "{up} / {down}  move and preview selected thread\n{collapse} / {expand}  collapse or expand a repository\n{open_scroll}  focus selected thread messages\n{open_input}  focus selected thread input\n{collapse_all} / {expand_all}  collapse / expand all repositories\n{submit}  send or steer in chat\n{newline}  insert a newline in chat input\n{left}/{right}/{input_up}/{input_down}  move the chat input cursor\n{line_start}/{line_end}  move to start/end of the current input line\n{focus_chat}  focus chat / enter scroll mode\n{previous_message} / {next_message}  select messages in scroll mode\n{browser_preview}  open the chat in a browser at the selected message\n{copy_editor}  copy an editor command for the visible diff hunk\n{copy_id} / {copy_resume}  copy thread ID / resume command\n{copy_message} / {copy_chat}  copy selected message / full chat\n{interrupt}  stop the current response\n{toggle_pane}  switch main / side chat focus\n{next_chat} / {previous_chat}  next / previous side chat\n{palette}  open the command palette\n{find_thread}  filter threads\n/permissions  choose Auto or Dangerous execution\n{rename}  open thread-name actions\n{attention}  show threads that need attention\n{cancel}  return to thread tree / cancel\n{add_repository}  add repositories\n{new_thread}  create General chat or repository thread\n{archive}  archive / restore thread\n{undo}  undo the last archive\n{archived}  active / archived threads\n{delete}  unregister repository / delete archived thread\n{refresh}  reload repositories and names\n{show_help}  help\n{quit}  quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {permissions}\nConfig: {config}\n{close_help} closes this screen",
         up = app.keybindings.label("normal.up"),
         down = app.keybindings.label("normal.down"),
         collapse = app.keybindings.label("normal.repository.collapse"),
@@ -5948,6 +5969,7 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
         focus_chat = app.keybindings.label("normal.focus_chat"),
         previous_message = app.keybindings.label("chat_scroll.previous_message"),
         next_message = app.keybindings.label("chat_scroll.next_message"),
+        browser_preview = app.keybindings.label("chat_scroll.browser_preview"),
         copy_editor = app.keybindings.label("chat_scroll.copy_editor_command"),
         copy_id = app.keybindings.label("normal.thread.copy_id"),
         copy_resume = app.keybindings.label("normal.thread.copy_resume"),

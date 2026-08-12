@@ -262,6 +262,17 @@ impl ChatMessage {
     fn mark_render_changed(&mut self) {
         self.render_revision = self.render_revision.wrapping_add(1);
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_preview_test(role: ChatRole, content: &str) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            item_id: None,
+            diff_targets: Vec::new(),
+            render_revision: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

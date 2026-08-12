@@ -178,6 +178,7 @@ static ACTIONS: &[ActionSpec] = &[
     action!("chat_scroll.next_message", ChatScroll, "J", ["J"]),
     action!("chat_scroll.copy_message", ChatScroll, "y", ["y"]),
     action!("chat_scroll.copy_conversation", ChatScroll, "Y", ["Y"]),
+    action!("chat_scroll.browser_preview", ChatScroll, "o", ["o"]),
     action!("chat_scroll.copy_editor_command", ChatScroll, "e", ["e"]),
     action!("chat_scroll.open_link_1", ChatScroll, "1", ["1"]),
     action!("chat_scroll.open_link_2", ChatScroll, "2", ["2"]),
