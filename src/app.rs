@@ -316,6 +316,7 @@ pub struct App {
     pending_onboarding: Option<PendingOnboarding>,
     preview_cache_order: VecDeque<String>,
     pub visible_chat_id: Option<String>,
+    previous_visible_chat_id: Option<String>,
     pub side_chat_id: Option<String>,
     pub side_chat_parent_id: Option<String>,
     pub side_chats_by_parent: HashMap<String, Vec<String>>,
@@ -520,6 +521,7 @@ impl App {
             pending_onboarding: None,
             preview_cache_order: VecDeque::new(),
             visible_chat_id: None,
+            previous_visible_chat_id: None,
             side_chat_id: None,
             side_chat_parent_id: None,
             side_chats_by_parent: HashMap::new(),
@@ -1175,32 +1177,80 @@ impl App {
         }
     }
 
-    pub fn cycle_side_chat(&mut self, forward: bool) {
-        if self.active_chat_pane != ChatPane::Side {
-            return;
-        }
+    pub fn cycle_chat_pane(&mut self, forward: bool) {
         let Some(parent_thread_id) = self.visible_chat_id.clone() else {
             return;
         };
-        let Some(side_chats) = self.side_chats_by_parent.get(&parent_thread_id) else {
+        let Some(side_chats) = self
+            .side_chats_by_parent
+            .get(&parent_thread_id)
+            .filter(|side_chats| !side_chats.is_empty())
+        else {
             return;
         };
-        let Some(current_thread_id) = self.side_chat_id.as_deref() else {
+        let current_side_chat = self.side_chat_id.as_deref().and_then(|current_thread_id| {
+            side_chats
+                .iter()
+                .position(|thread_id| thread_id == current_thread_id)
+        });
+        let (pane, side_chat_index) = adjacent_chat_position(
+            self.active_chat_pane,
+            current_side_chat,
+            side_chats.len(),
+            forward,
+        );
+        if pane == ChatPane::Main {
+            self.active_chat_pane = ChatPane::Main;
+            return;
+        }
+        let Some(side_chat_index) = side_chat_index else {
             return;
         };
-        let current = side_chats
-            .iter()
-            .position(|thread_id| thread_id == current_thread_id)
-            .unwrap_or(0);
-        let next = cycle_index(current, side_chats.len(), forward);
-        let Some(thread_id) = side_chats.get(next).cloned() else {
+        let Some(thread_id) = side_chats.get(side_chat_index).cloned() else {
             return;
         };
         self.selected_side_chat_by_parent
-            .insert(parent_thread_id.clone(), next);
+            .insert(parent_thread_id.clone(), side_chat_index);
         self.side_chat_id = Some(thread_id);
         self.side_chat_parent_id = Some(parent_thread_id);
+        self.active_chat_pane = ChatPane::Side;
         self.mark_thread_seen();
+    }
+
+    pub fn select_adjacent_thread(&mut self, forward: bool) -> bool {
+        let thread_ids = thread_navigation_order(&self.threads, &self.repositories);
+        if thread_ids.len() < 2 {
+            return false;
+        }
+        let Some(current) = self.visible_chat_id.as_deref().and_then(|visible| {
+            thread_ids
+                .iter()
+                .position(|thread_id| *thread_id == visible)
+        }) else {
+            return false;
+        };
+        let next = cycle_index(current, thread_ids.len(), forward);
+        let thread_id = thread_ids[next].to_owned();
+        self.restore_tree_selection(TreeSelection::Thread(thread_id));
+        self.sync_selection_from_tree();
+        true
+    }
+
+    pub fn select_previous_thread(&mut self) -> bool {
+        let Some(thread_id) = self.previous_visible_chat_id.clone() else {
+            return false;
+        };
+        if self.visible_chat_id.as_deref() == Some(&thread_id)
+            || !self
+                .threads
+                .iter()
+                .any(|thread| thread.record.id == thread_id)
+        {
+            return false;
+        }
+        self.restore_tree_selection(TreeSelection::Thread(thread_id));
+        self.sync_selection_from_tree();
+        true
     }
 
     pub fn current_side_chat_position(&self) -> Option<(usize, usize)> {
@@ -1731,6 +1781,16 @@ impl App {
     }
 
     fn show_main_chat_id(&mut self, thread_id: String) {
+        if self.focus == Focus::Chat
+            && self.visible_chat_id.as_deref() != Some(&thread_id)
+            && let Some(previous) = self.visible_chat_id.as_ref()
+            && self
+                .threads
+                .iter()
+                .any(|thread| thread.record.id == *previous)
+        {
+            self.previous_visible_chat_id = Some(previous.clone());
+        }
         self.visible_chat_id = Some(thread_id.clone());
         let selected = self
             .selected_side_chat_by_parent
@@ -4104,6 +4164,27 @@ fn cycle_index(current: usize, count: usize, forward: bool) -> usize {
     }
 }
 
+fn adjacent_chat_position(
+    active_pane: ChatPane,
+    current_side_chat: Option<usize>,
+    side_chat_count: usize,
+    forward: bool,
+) -> (ChatPane, Option<usize>) {
+    if side_chat_count == 0 {
+        return (ChatPane::Main, None);
+    }
+    let current = match active_pane {
+        ChatPane::Main => 0,
+        ChatPane::Side => current_side_chat.map(|index| index + 1).unwrap_or(0),
+    };
+    let next = cycle_index(current, side_chat_count + 1, forward);
+    if next == 0 {
+        (ChatPane::Main, None)
+    } else {
+        (ChatPane::Side, Some(next - 1))
+    }
+}
+
 fn next_available_index(current: usize, forward: bool, available: &[bool]) -> Option<usize> {
     if forward {
         ((current + 1)..available.len()).find(|index| available[*index])
@@ -4161,6 +4242,29 @@ fn tree_rows_for(
         }
     }
     rows
+}
+
+fn thread_navigation_order<'a>(
+    threads: &'a [ThreadItem],
+    repositories: &[Repository],
+) -> Vec<&'a str> {
+    let mut thread_ids = threads
+        .iter()
+        .filter(|thread| thread.record.scope == ThreadScope::General)
+        .map(|thread| thread.record.id.as_str())
+        .collect::<Vec<_>>();
+    for repository in repositories {
+        thread_ids.extend(
+            threads
+                .iter()
+                .filter(|thread| {
+                    thread.record.scope == ThreadScope::Repository
+                        && thread.record.repository_path == repository.path
+                })
+                .map(|thread| thread.record.id.as_str()),
+        );
+    }
+    thread_ids
 }
 
 fn same_thread_group(left: &TreeRow, right: &TreeRow) -> bool {
@@ -4644,6 +4748,51 @@ mod tests {
                     thread_index: 1,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn thread_shortcuts_follow_the_full_sidebar_order() {
+        let repositories = vec![
+            Repository {
+                name: "one".into(),
+                path: "/one".into(),
+            },
+            Repository {
+                name: "two".into(),
+                path: "/two".into(),
+            },
+        ];
+        let threads = vec![
+            thread("two-new", "/two"),
+            general_thread("general"),
+            thread("one", "/one"),
+            thread("two-old", "/two"),
+        ];
+
+        assert_eq!(
+            thread_navigation_order(&threads, &repositories),
+            vec!["general", "one", "two-new", "two-old"]
+        );
+    }
+
+    #[test]
+    fn horizontal_chat_navigation_cycles_main_and_side_chats() {
+        assert_eq!(
+            adjacent_chat_position(ChatPane::Main, Some(0), 2, true),
+            (ChatPane::Side, Some(0))
+        );
+        assert_eq!(
+            adjacent_chat_position(ChatPane::Side, Some(0), 2, true),
+            (ChatPane::Side, Some(1))
+        );
+        assert_eq!(
+            adjacent_chat_position(ChatPane::Side, Some(1), 2, true),
+            (ChatPane::Main, None)
+        );
+        assert_eq!(
+            adjacent_chat_position(ChatPane::Main, Some(0), 2, false),
+            (ChatPane::Side, Some(1))
         );
     }
 

@@ -151,6 +151,13 @@ enum ChatNavigationTarget {
     RepositoryTree,
 }
 
+#[derive(Clone, Copy)]
+enum ThreadNavigation {
+    Next,
+    Previous,
+    Last,
+}
+
 enum BulkRenameEvent {
     Progress(BulkRenameProgress),
     Generated(std::result::Result<Vec<(String, String)>, String>),
@@ -752,6 +759,47 @@ async fn handle_key(
     if app.mode == Mode::Chat && app.focus == Focus::Chat && app.active_chat_has_pending_approval()
     {
         match key.code {
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.cycle_chat_pane(false);
+                return Ok(None);
+            }
+            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.cycle_chat_pane(true);
+                return Ok(None);
+            }
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                switch_thread_shortcut(
+                    app,
+                    server,
+                    preview_generation,
+                    preview_task,
+                    ThreadNavigation::Next,
+                )
+                .await;
+                return Ok(None);
+            }
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                switch_thread_shortcut(
+                    app,
+                    server,
+                    preview_generation,
+                    preview_task,
+                    ThreadNavigation::Previous,
+                )
+                .await;
+                return Ok(None);
+            }
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                switch_thread_shortcut(
+                    app,
+                    server,
+                    preview_generation,
+                    preview_task,
+                    ThreadNavigation::Last,
+                )
+                .await;
+                return Ok(None);
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 let option_count = active_approval_option_count(app);
                 move_approval_selection(app, option_count, -1);
@@ -794,12 +842,14 @@ async fn handle_key(
             action = handle_palette_key(app, key, server).await?;
         }
         Mode::Chat if app.chat().map(|chat| chat.mode) == Some(ChatMode::Scroll) => {
-            if let Some(target) = scroll_navigation_target(
-                &pressed_code,
-                &key.code,
-                app.active_chat_pane,
-                app.has_side_chat(),
-            ) {
+            if key.modifiers.is_empty()
+                && let Some(target) = scroll_navigation_target(
+                    &pressed_code,
+                    &key.code,
+                    app.active_chat_pane,
+                    app.has_side_chat(),
+                )
+            {
                 match target {
                     ChatNavigationTarget::Input => {
                         if let Some(chat) = app.chat_mut() {
@@ -835,11 +885,41 @@ async fn handle_key(
                 KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.toggle_chat_pane();
                 }
+                KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.cycle_chat_pane(false);
+                }
+                KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.cycle_chat_pane(true);
+                }
                 KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.cycle_side_chat(true);
+                    switch_thread_shortcut(
+                        app,
+                        server,
+                        preview_generation,
+                        preview_task,
+                        ThreadNavigation::Next,
+                    )
+                    .await;
                 }
                 KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.cycle_side_chat(false);
+                    switch_thread_shortcut(
+                        app,
+                        server,
+                        preview_generation,
+                        preview_task,
+                        ThreadNavigation::Previous,
+                    )
+                    .await;
+                }
+                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    switch_thread_shortcut(
+                        app,
+                        server,
+                        preview_generation,
+                        preview_task,
+                        ThreadNavigation::Last,
+                    )
+                    .await;
                 }
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if let Some(chat) = app.chat_mut() {
@@ -940,11 +1020,41 @@ async fn handle_key(
             KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.toggle_chat_pane();
             }
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.cycle_chat_pane(false);
+            }
+            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.cycle_chat_pane(true);
+            }
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.cycle_side_chat(true);
+                switch_thread_shortcut(
+                    app,
+                    server,
+                    preview_generation,
+                    preview_task,
+                    ThreadNavigation::Next,
+                )
+                .await;
             }
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.cycle_side_chat(false);
+                switch_thread_shortcut(
+                    app,
+                    server,
+                    preview_generation,
+                    preview_task,
+                    ThreadNavigation::Previous,
+                )
+                .await;
+            }
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                switch_thread_shortcut(
+                    app,
+                    server,
+                    preview_generation,
+                    preview_task,
+                    ThreadNavigation::Last,
+                )
+                .await;
             }
             KeyCode::Char(character)
                 if key
@@ -3557,6 +3667,32 @@ async fn focus_selected_chat_in_mode(
     Ok(())
 }
 
+async fn switch_thread_shortcut(
+    app: &mut App,
+    server: &Arc<AppServer>,
+    preview_generation: &Arc<AtomicU64>,
+    preview_task: &mut Option<JoinHandle<()>>,
+    navigation: ThreadNavigation,
+) {
+    let mode = app.chat().map(|chat| chat.mode).unwrap_or(ChatMode::Input);
+    let selected = match navigation {
+        ThreadNavigation::Next => app.select_adjacent_thread(true),
+        ThreadNavigation::Previous => app.select_adjacent_thread(false),
+        ThreadNavigation::Last => app.select_previous_thread(),
+    };
+    if !selected {
+        app.message = Some(match navigation {
+            ThreadNavigation::Last => "No previous thread".into(),
+            ThreadNavigation::Next | ThreadNavigation::Previous => "No other threads".into(),
+        });
+        return;
+    }
+    cancel_chat_preview(preview_generation, preview_task);
+    if let Err(error) = focus_selected_chat_in_mode(app, server, mode).await {
+        app.message = Some(format!("Could not open thread: {error}"));
+    }
+}
+
 async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     let Some(chat) = app.chat() else {
         return Ok(());
@@ -6026,7 +6162,7 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(78, 45, area);
     let ask_shikigami = app.keybindings.label("help.ask_shikigami");
     let help = format!(
-        "THREADS\n{up} / {down}  move and preview selected thread\n{collapse} / {expand}  collapse or expand a repository\n{open_scroll} / {open_input}  focus selected thread messages / input\n{collapse_all} / {expand_all}  collapse / expand all repositories\n{find_thread}  filter threads\n{copy_id} / {copy_resume}  copy thread ID / resume command\n{rename}  open thread-name actions\n{attention}  show threads that need attention\n{cancel}  return to thread tree / cancel\nask in chat  register the current repository or an exact absolute path\n{add_repository} / {new_thread}  discover and add repositories / create a thread\n{archive} / {undo} / {archived}  archive / undo / active or archived threads\n{delete} / {refresh}  delete or unregister / reload repositories and names\n\nCHAT INPUT\n{submit}  send or steer in chat\n{newline}  insert a newline\n{left}/{right}/{input_up}/{input_down}  move the cursor\n{line_start}/{line_end}  move to start/end of the current line\n{interrupt}  stop the current response\n{toggle_pane}  switch main / side chat focus\n{next_chat} / {previous_chat}  next / previous side chat\n\nMESSAGES\n{focus_chat}  focus messages / enter scroll mode\n{previous_message} / {next_message}  select messages\n{browser_preview}  open chat in a browser at the selected message\n{copy_editor}  copy an editor command for the visible diff hunk\n{copy_message} / {copy_chat}  copy selected message / full chat\n\n{palette}  command palette · /permissions  execution mode\n{show_help}  help · {quit}  quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {permissions}\nConfig: {config}\n{close_help} closes this screen",
+        "THREADS\n{up} / {down}  move and preview selected thread\n{collapse} / {expand}  collapse or expand a repository\n{open_scroll} / {open_input}  focus selected thread messages / input\n{collapse_all} / {expand_all}  collapse / expand all repositories\n{find_thread}  filter threads\n{copy_id} / {copy_resume}  copy thread ID / resume command\n{rename}  open thread-name actions\n{attention}  show threads that need attention\n{cancel}  return to thread tree / cancel\nask in chat  register the current repository or an exact absolute path\n{add_repository} / {new_thread}  discover and add repositories / create a thread\n{archive} / {undo} / {archived}  archive / undo / active or archived threads\n{delete} / {refresh}  delete or unregister / reload repositories and names\n\nCHAT INPUT\n{submit}  send or steer in chat\n{newline}  insert a newline\n{left}/{right}/{input_up}/{input_down}  move the cursor\n{line_start}/{line_end}  move to start/end of the current line\n{interrupt}  stop the current response\n{toggle_pane}  switch main / side chat focus\n{previous_chat} / {next_chat}  move left / right across main and side chats\n{previous_thread} / {next_thread}  previous / next thread\n{last_thread}  return to the last thread\n\nMESSAGES\n{focus_chat}  focus messages / enter scroll mode\n{previous_message} / {next_message}  select messages\n{browser_preview}  open chat in a browser at the selected message\n{copy_editor}  copy an editor command for the visible diff hunk\n{copy_message} / {copy_chat}  copy selected message / full chat\n\n{palette}  command palette · /permissions  execution mode\n{show_help}  help · {quit}  quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {permissions}\nConfig: {config}\n{close_help} closes this screen",
         up = app.keybindings.label("normal.up"),
         down = app.keybindings.label("normal.down"),
         collapse = app.keybindings.label("normal.repository.collapse"),
@@ -6056,6 +6192,9 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
         toggle_pane = app.keybindings.label("chat_input.toggle_pane"),
         next_chat = app.keybindings.label("chat_input.next_chat"),
         previous_chat = app.keybindings.label("chat_input.previous_chat"),
+        next_thread = app.keybindings.label("chat_input.next_thread"),
+        previous_thread = app.keybindings.label("chat_input.previous_thread"),
+        last_thread = app.keybindings.label("chat_input.last_thread"),
         palette = app.keybindings.label("normal.palette"),
         find_thread = app.keybindings.label("normal.find_thread"),
         rename = app.keybindings.label("normal.rename"),

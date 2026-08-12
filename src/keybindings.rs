@@ -102,6 +102,36 @@ static ACTIONS: &[ActionSpec] = &[
         ["ctrl+g"]
     ),
     action!(
+        "approval_chat.previous_chat",
+        ApprovalChat,
+        "ctrl+h",
+        ["ctrl+h", "ctrl+left"]
+    ),
+    action!(
+        "approval_chat.next_chat",
+        ApprovalChat,
+        "ctrl+l",
+        ["ctrl+l", "ctrl+right"]
+    ),
+    action!(
+        "approval_chat.next_thread",
+        ApprovalChat,
+        "ctrl+n",
+        ["ctrl+n"]
+    ),
+    action!(
+        "approval_chat.previous_thread",
+        ApprovalChat,
+        "ctrl+p",
+        ["ctrl+p"]
+    ),
+    action!(
+        "approval_chat.last_thread",
+        ApprovalChat,
+        "ctrl+o",
+        ["ctrl+o"]
+    ),
+    action!(
         "palette.cancel",
         ChatPaletteEmpty,
         "esc",
@@ -155,13 +185,26 @@ static ACTIONS: &[ActionSpec] = &[
     action!("chat_scroll.palette", ChatScroll, "/", ["/"]),
     action!("chat_scroll.side_chat", ChatScroll, "ctrl+s", ["ctrl+s"]),
     action!("chat_scroll.toggle_pane", ChatScroll, "ctrl+g", ["ctrl+g"]),
-    action!("chat_scroll.next_chat", ChatScroll, "ctrl+n", ["ctrl+n"]),
+    action!(
+        "chat_scroll.next_chat",
+        ChatScroll,
+        "ctrl+l",
+        ["ctrl+l", "ctrl+right"]
+    ),
     action!(
         "chat_scroll.previous_chat",
+        ChatScroll,
+        "ctrl+h",
+        ["ctrl+h", "ctrl+left"]
+    ),
+    action!("chat_scroll.next_thread", ChatScroll, "ctrl+n", ["ctrl+n"]),
+    action!(
+        "chat_scroll.previous_thread",
         ChatScroll,
         "ctrl+p",
         ["ctrl+p"]
     ),
+    action!("chat_scroll.last_thread", ChatScroll, "ctrl+o", ["ctrl+o"]),
     action!(
         "chat_scroll.half_page_up",
         ChatScroll,
@@ -205,8 +248,26 @@ static ACTIONS: &[ActionSpec] = &[
     action!("chat_input.interrupt", ChatInput, "ctrl+c", ["ctrl+c"]),
     action!("chat_input.side_chat", ChatInput, "ctrl+s", ["ctrl+s"]),
     action!("chat_input.toggle_pane", ChatInput, "ctrl+g", ["ctrl+g"]),
-    action!("chat_input.next_chat", ChatInput, "ctrl+n", ["ctrl+n"]),
-    action!("chat_input.previous_chat", ChatInput, "ctrl+p", ["ctrl+p"]),
+    action!(
+        "chat_input.next_chat",
+        ChatInput,
+        "ctrl+l",
+        ["ctrl+l", "ctrl+right"]
+    ),
+    action!(
+        "chat_input.previous_chat",
+        ChatInput,
+        "ctrl+h",
+        ["ctrl+h", "ctrl+left"]
+    ),
+    action!("chat_input.next_thread", ChatInput, "ctrl+n", ["ctrl+n"]),
+    action!(
+        "chat_input.previous_thread",
+        ChatInput,
+        "ctrl+p",
+        ["ctrl+p"]
+    ),
+    action!("chat_input.last_thread", ChatInput, "ctrl+o", ["ctrl+o"]),
     action!(
         "chat_input.paste_image",
         ChatInput,
@@ -256,12 +317,35 @@ static ACTIONS: &[ActionSpec] = &[
         "ctrl+g",
         ["ctrl+g"]
     ),
-    action!("chat_input.next_chat", ChatInputEmpty, "ctrl+n", ["ctrl+n"]),
+    action!(
+        "chat_input.next_chat",
+        ChatInputEmpty,
+        "ctrl+l",
+        ["ctrl+l", "ctrl+right"]
+    ),
     action!(
         "chat_input.previous_chat",
         ChatInputEmpty,
+        "ctrl+h",
+        ["ctrl+h", "ctrl+left"]
+    ),
+    action!(
+        "chat_input.next_thread",
+        ChatInputEmpty,
+        "ctrl+n",
+        ["ctrl+n"]
+    ),
+    action!(
+        "chat_input.previous_thread",
+        ChatInputEmpty,
         "ctrl+p",
         ["ctrl+p"]
+    ),
+    action!(
+        "chat_input.last_thread",
+        ChatInputEmpty,
+        "ctrl+o",
+        ["ctrl+o"]
     ),
     action!(
         "chat_input.paste_image",
@@ -731,7 +815,7 @@ static ACTIONS: &[ActionSpec] = &[
     action!("normal.thread.archive_or_restore", NormalThread, "x", ["x"]),
 ];
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct ConfigFile {
     version: u8,
     keybindings: BTreeMap<String, Vec<String>>,
@@ -822,9 +906,14 @@ impl KeyBindings {
         ensure_config_file_at(&path)?;
         let bytes = fs::read(&path)
             .with_context(|| format!("read keybindings config {}", path.display()))?;
-        let config: ConfigFile = serde_json::from_slice(&bytes)
+        let mut config: ConfigFile = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse keybindings config {}", path.display()))?;
-        Self::from_config(path, config)
+        let migrated = migrate_standard_chat_navigation(&mut config);
+        let bindings = Self::from_config(path.clone(), config.clone())?;
+        if migrated {
+            write_config_file_at(&path, &config)?;
+        }
+        Ok(bindings)
     }
 
     fn from_config(path: PathBuf, config: ConfigFile) -> Result<Self> {
@@ -922,6 +1011,57 @@ fn ensure_config_file_at(path: &Path) -> Result<()> {
     fs::write(path, data)
         .with_context(|| format!("create keybindings config {}", path.display()))?;
     Ok(())
+}
+
+fn write_config_file_at(path: &Path, config: &ConfigFile) -> Result<()> {
+    let temporary = path.with_extension("json.tmp");
+    let data = serde_json::to_vec_pretty(config)?;
+    fs::write(&temporary, data)
+        .with_context(|| format!("write keybindings config {}", temporary.display()))?;
+    fs::rename(&temporary, path)
+        .with_context(|| format!("replace keybindings config {}", path.display()))
+}
+
+fn migrate_standard_chat_navigation(config: &mut ConfigFile) -> bool {
+    let mut migrated = false;
+    for (action, old, defaults) in [
+        (
+            "chat_input.next_chat",
+            "ctrl+n",
+            &["ctrl+l", "ctrl+right"][..],
+        ),
+        (
+            "chat_input.previous_chat",
+            "ctrl+p",
+            &["ctrl+h", "ctrl+left"][..],
+        ),
+        (
+            "chat_scroll.next_chat",
+            "ctrl+n",
+            &["ctrl+l", "ctrl+right"][..],
+        ),
+        (
+            "chat_scroll.previous_chat",
+            "ctrl+p",
+            &["ctrl+h", "ctrl+left"][..],
+        ),
+    ] {
+        let Some(bindings) = config.keybindings.get_mut(action) else {
+            continue;
+        };
+        let original_len = bindings.len();
+        bindings.retain(|binding| binding != old);
+        if bindings.len() != original_len {
+            if bindings.is_empty() {
+                *bindings = defaults
+                    .iter()
+                    .map(|binding| (*binding).to_owned())
+                    .collect();
+            }
+            migrated = true;
+        }
+    }
+    migrated
 }
 
 fn reset_config_file_at(path: &Path) -> Result<Option<PathBuf>> {
@@ -1144,6 +1284,11 @@ mod tests {
         assert_eq!(config.keybindings["help.ask_shikigami"], ["enter"]);
         assert_eq!(config.keybindings["chat_input.side_chat"], ["ctrl+s"]);
         assert_eq!(config.keybindings["chat_scroll.side_chat"], ["ctrl+s"]);
+        assert_eq!(
+            config.keybindings["chat_input.previous_chat"],
+            ["ctrl+h", "ctrl+left"]
+        );
+        assert_eq!(config.keybindings["chat_input.next_thread"], ["ctrl+n"]);
     }
 
     #[test]
@@ -1312,6 +1457,65 @@ mod tests {
 
         assert_eq!(resolved.code, KeyCode::Char('s'));
         assert!(resolved.modifiers.contains(KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn chat_navigation_uses_horizontal_keys_and_thread_shortcuts() {
+        let bindings = KeyBindings::defaults();
+
+        for context in [
+            KeyContext::ApprovalChat,
+            KeyContext::ChatInput,
+            KeyContext::ChatInputEmpty,
+            KeyContext::ChatScroll,
+        ] {
+            let left = bindings.resolve(
+                &[context],
+                KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+            );
+            assert_eq!(left.code, KeyCode::Char('h'));
+            assert!(left.modifiers.contains(KeyModifiers::CONTROL));
+
+            for character in ['n', 'p', 'o'] {
+                let resolved = bindings.resolve(
+                    &[context],
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL),
+                );
+                assert_eq!(resolved.code, KeyCode::Char(character));
+                assert!(resolved.modifiers.contains(KeyModifiers::CONTROL));
+            }
+        }
+    }
+
+    #[test]
+    fn migrates_the_old_standard_side_chat_shortcuts() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        fs::write(
+            &path,
+            r#"{
+  "version": 1,
+  "keybindings": {
+    "chat_input.next_chat": ["ctrl+n"],
+    "chat_input.previous_chat": ["ctrl+p"],
+    "chat_scroll.next_chat": ["ctrl+n"],
+    "chat_scroll.previous_chat": ["ctrl+p"]
+  }
+}"#,
+        )
+        .unwrap();
+
+        KeyBindings::load_or_create_at(path.clone()).unwrap();
+
+        let config: ConfigFile = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            config.keybindings["chat_input.next_chat"],
+            ["ctrl+l", "ctrl+right"]
+        );
+        assert_eq!(
+            config.keybindings["chat_scroll.previous_chat"],
+            ["ctrl+h", "ctrl+left"]
+        );
     }
 
     #[test]
