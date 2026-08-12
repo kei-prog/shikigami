@@ -27,8 +27,8 @@ use crate::{
     paths,
     performance::PerformanceSession,
     registry::{
-        AttentionRegistry, PersistentAttentionKind, Registry, SideChatRegistry, ThreadKind,
-        ThreadRecord, ThreadScope, ThreadTitleCache,
+        AttentionRegistry, PersistentAttentionKind, Registry, SideChatRecord, SideChatRegistry,
+        ThreadKind, ThreadRecord, ThreadScope, ThreadTitleCache,
     },
     repository::{self, Repository, RepositoryStore, ScanEvent, ScanScope, start_scan},
     settings::{ExecutionMode, SettingsStore},
@@ -85,6 +85,11 @@ pub struct ThreadDeletionState {
     pub title: String,
     pub phase: ThreadDeletionPhase,
     pub started_at: Instant,
+}
+
+pub struct ThreadDeletionRequest {
+    pub record: ThreadRecord,
+    pub side_chat_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -739,29 +744,129 @@ impl App {
 
     pub fn show_side_chat(&mut self, parent_thread_id: String, chat: ChatState) -> Result<()> {
         let thread_id = chat.thread_id.clone();
-        self.side_chat_registry
-            .register(thread_id.clone(), parent_thread_id.clone())?;
+        self.side_chat_registry.register(
+            thread_id.clone(),
+            parent_thread_id.clone(),
+            chat.title.clone(),
+            chat.model.clone(),
+            chat.model_display_name.clone(),
+            chat.reasoning_effort.clone(),
+            chat.side_chat_has_activity,
+        )?;
+        self.attach_side_chat(parent_thread_id, chat, true);
+        Ok(())
+    }
+
+    pub fn restore_side_chats_for_parent(
+        &mut self,
+        parent_thread_id: &str,
+        cwd: &Path,
+    ) -> Result<()> {
+        if self.side_chats_by_parent.contains_key(parent_thread_id) {
+            return Ok(());
+        }
+        let records = self
+            .side_chat_registry
+            .load()?
+            .into_iter()
+            .filter(|record| {
+                record.parent_thread_id == parent_thread_id && !record.pending_deletion
+            })
+            .collect::<Vec<_>>();
+        for (index, record) in records.into_iter().enumerate() {
+            let mut chat = ChatState::new(
+                record.id,
+                cwd.to_path_buf(),
+                record
+                    .title
+                    .unwrap_or_else(|| format!("Sidechat {}", index + 1)),
+            );
+            if let (Some(model), Some(display_name)) = (record.model, record.model_display_name) {
+                chat.set_model(model, display_name, record.reasoning_effort);
+            } else if let Some((model, display_name, effort)) = self.default_model_settings() {
+                chat.set_model(model, display_name, effort);
+            }
+            chat.mark_as_side_chat();
+            chat.side_chat_has_activity = record.has_activity;
+            chat.mark_history_partial();
+            self.attach_side_chat(parent_thread_id.to_owned(), chat, false);
+        }
+        Ok(())
+    }
+
+    fn attach_side_chat(&mut self, parent_thread_id: String, chat: ChatState, show: bool) {
+        let thread_id = chat.thread_id.clone();
         self.chats.insert(thread_id.clone(), chat);
         let side_chats = self
             .side_chats_by_parent
             .entry(parent_thread_id.clone())
             .or_default();
+        if side_chats.contains(&thread_id) {
+            return;
+        }
         side_chats.push(thread_id.clone());
         let index = side_chats.len() - 1;
-        self.selected_side_chat_by_parent
-            .insert(parent_thread_id.clone(), index);
-        self.side_chat_id = Some(thread_id);
-        self.side_chat_parent_id = Some(parent_thread_id);
-        self.active_chat_pane = ChatPane::Side;
+        self.opened_threads.insert(thread_id.clone());
+        let selected = self
+            .selected_side_chat_by_parent
+            .entry(parent_thread_id.clone())
+            .or_insert(0);
+        if show {
+            *selected = index;
+        }
+        if self.visible_chat_id.as_deref() == Some(&parent_thread_id) {
+            let selected_id = side_chats.get(*selected).cloned();
+            self.side_chat_id = selected_id;
+            self.side_chat_parent_id = self.side_chat_id.as_ref().map(|_| parent_thread_id);
+        }
+        if show {
+            self.active_chat_pane = ChatPane::Side;
+        }
+    }
+
+    pub fn persist_side_chat_metadata(&self, thread_id: &str) -> Result<()> {
+        let chat = self
+            .chats
+            .get(thread_id)
+            .filter(|chat| chat.is_side_chat)
+            .context("side chat is not loaded")?;
+        self.side_chat_registry.update_metadata(
+            thread_id,
+            chat.title.clone(),
+            chat.model.clone(),
+            chat.model_display_name.clone(),
+            chat.reasoning_effort.clone(),
+            chat.side_chat_has_activity,
+        )
+    }
+
+    pub fn saved_side_chats_for_parent(
+        &self,
+        parent_thread_id: &str,
+    ) -> Result<Vec<SideChatRecord>> {
+        Ok(self
+            .side_chat_registry
+            .load()?
+            .into_iter()
+            .filter(|record| record.parent_thread_id == parent_thread_id)
+            .collect())
+    }
+
+    pub fn forget_missing_side_chat(&mut self, thread_id: &str) -> Result<()> {
+        self.side_chat_registry.remove(thread_id)?;
+        self.remove_side_chat_from_session(thread_id);
         Ok(())
     }
 
-    pub fn begin_side_chat_deletion(&mut self) -> Option<(String, Option<String>)> {
-        let chat = self.side_chat()?;
+    pub fn begin_side_chat_deletion(&mut self) -> Result<Option<(String, Option<String>)>> {
+        let Some(chat) = self.side_chat() else {
+            return Ok(None);
+        };
         let thread_id = chat.thread_id.clone();
         let turn_id = chat.active_turn_id.clone();
+        self.side_chat_registry.mark_for_deletion(&thread_id)?;
         self.remove_side_chat_from_session(&thread_id);
-        Some((thread_id, turn_id))
+        Ok(Some((thread_id, turn_id)))
     }
 
     fn remove_side_chat_from_session(&mut self, thread_id: &str) {
@@ -882,18 +987,12 @@ impl App {
         Ok((title, cleanup_warning))
     }
 
-    pub fn abandoned_side_chat_ids(&self) -> Result<Vec<String>> {
-        let registered = self
-            .thread_registry
-            .load()?
-            .into_iter()
-            .map(|thread| thread.id)
-            .collect::<HashSet<_>>();
-        self.side_chat_registry.reconcile(&registered)
-    }
-
     pub fn forget_temporary_side_chat(&self, thread_id: &str) -> Result<()> {
         self.side_chat_registry.remove(thread_id)
+    }
+
+    pub fn pending_side_chat_deletion_ids(&self) -> Result<Vec<String>> {
+        self.side_chat_registry.pending_deletion_ids()
     }
 
     pub fn current_side_chats(&self) -> Vec<&ChatState> {
@@ -1388,6 +1487,14 @@ impl App {
             .or_else(|| preferred_reasoning_effort(&model).map(str::to_owned));
         if let Some(chat) = self.chat_mut() {
             chat.set_model(model.model, model.display_name, effort);
+        }
+        if let Some(thread_id) = self
+            .chat()
+            .filter(|chat| chat.is_side_chat)
+            .map(|chat| chat.thread_id.clone())
+            && let Err(error) = self.persist_side_chat_metadata(&thread_id)
+        {
+            self.message = Some(format!("Could not save side chat settings: {error}"));
         }
         self.reasoning_effort_returns_to_model = false;
         self.mode = Mode::Chat;
@@ -2063,8 +2170,13 @@ impl App {
         Ok(record)
     }
 
-    pub fn begin_thread_deletion(&mut self) -> Result<ThreadRecord> {
+    pub fn begin_thread_deletion(&mut self) -> Result<ThreadDeletionRequest> {
         let record = self.selected_thread_delete_candidate()?;
+        let side_chat_ids = self
+            .saved_side_chats_for_parent(&record.id)?
+            .into_iter()
+            .map(|side_chat| side_chat.id)
+            .collect();
         self.thread_deletion = Some(ThreadDeletionState {
             title: record.title.clone(),
             phase: if record.managed_worktree && record.cwd.is_dir() {
@@ -2075,7 +2187,10 @@ impl App {
             started_at: Instant::now(),
         });
         self.mode = Mode::DeletingThread;
-        Ok(record)
+        Ok(ThreadDeletionRequest {
+            record,
+            side_chat_ids,
+        })
     }
 
     pub fn set_thread_deletion_phase(&mut self, phase: ThreadDeletionPhase) {
@@ -2104,6 +2219,7 @@ impl App {
             .context("thread is no longer selected")?;
         ensure_thread_deletion_context(self.show_archived, &record)?;
         self.thread_registry.remove(thread_id)?;
+        self.side_chat_registry.remove_for_parent(thread_id)?;
         forget_archive_undo(&mut self.archived_thread_undos, thread_id);
         self.remove_thread_name(thread_id);
         self.discard_chat(thread_id);

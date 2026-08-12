@@ -238,9 +238,9 @@ The active process starts a dedicated Codex App Server over stdio and stops that
 child process when Shikigami exits.
 On the first send, new threads are registered from `thread/start`; existing
 threads use `thread/resume` and `thread/read`. Each connection unsubscribes from
-its resumed threads on exit. Pressing `q` asks for confirmation when responses started by that
-Shikigami process are still running or temporary side chats remain. Confirming
-interrupts those responses and deletes the temporary chats before exit. Messages,
+its resumed threads on exit. Pressing `q` asks for confirmation only when responses
+started by that Shikigami process are still running. Confirming interrupts those
+responses; side chats remain available on the next launch. Messages,
 streamed reasoning summaries, plans, command output
 tails, tool activity, and approvals stay inside the Shikigami TUI instead of
 opening the Codex terminal UI. App Server stderr is captured instead of being
@@ -386,9 +386,9 @@ appears in the header and applies to subsequent turns in that thread. Press
 New chats default to `medium` reasoning when the selected model supports it.
 
 Choose `/permissions` to select the global execution mode. Choose `/sidechat` to
-create a temporary fork of the current thread; `Ctrl-s` does the same directly
+create a fork attached to the current thread; `Ctrl-s` does the same directly
 from chat input or message-scroll mode. Each main
-thread can keep multiple side chats for the current Shikigami session. The chat
+thread can keep multiple side chats across Shikigami sessions. The chat
 area splits into main and the selected side pane, and both can stream independently.
 In message-scroll mode, press `l` / `Right` from the main pane to focus the side
 pane, then `h` / `Left` to return to the main pane; another `h` / `Left` returns
@@ -400,19 +400,20 @@ previous selection. Use `/sideclose` to close the selected fork without
 confirmation. Use `/sidepromote` while the side pane is focused to move that
 fork into the repository tree as a persistent thread, preserving its conversation,
 workspace, model, and active turn. Moving to another main thread hides its remaining
-side chats; returning restores them. `/sideclose` and confirmed app exit delete
-unpromoted side chats from Codex. Shikigami records temporary side chats locally
-and cleans them up on the next launch after a crash. A thread created immediately
-before an unrecoverable registry-write failure is left untouched to avoid deleting
-an unrelated thread.
+side chats; returning restores them. `/sideclose` permanently deletes the selected
+side chat from Codex, retrying pending cleanup on the next launch after a crash or
+App Server failure. Quitting and archiving the parent preserve its side chats. A
+thread created immediately before an unrecoverable registry-write failure is left
+untouched to avoid deleting an unrelated thread.
 
 Existing Codex threads are not imported.
 
 Archiving hides a thread while preserving its Codex history, worktree, and branch.
 An active response in the main thread or one of its side chats must be stopped
 before the thread can be archived.
-Restoring an archived thread only returns it to the active view.
-Press `d` in the archived view and confirm to delete the Codex history and local
+Restoring an archived thread returns it and its side chats to the active view.
+Press `d` in the archived view and confirm to delete the Codex history, its side
+chats, and the local
 Shikigami record. Shikigami shows the deletion progress while it waits for Codex.
 A clean
 Shikigami-managed worktree is removed; deletion is refused while it is dirty.

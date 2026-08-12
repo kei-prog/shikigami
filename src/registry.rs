@@ -58,15 +58,27 @@ struct ThreadTitleCacheData {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct TemporarySideChatRecord {
+pub struct SideChatRecord {
     pub id: String,
     pub parent_thread_id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub model_display_name: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub has_activity: bool,
+    #[serde(default)]
+    pub pending_deletion: bool,
     pub created_at: u64,
 }
 
 #[derive(Default, Deserialize, Serialize)]
 struct SideChatRegistryData {
-    side_chats: Vec<TemporarySideChatRecord>,
+    side_chats: Vec<SideChatRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -248,7 +260,7 @@ impl SideChatRegistry {
         Self { path }
     }
 
-    pub fn load(&self) -> Result<Vec<TemporarySideChatRecord>> {
+    pub fn load(&self) -> Result<Vec<SideChatRecord>> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
@@ -259,16 +271,56 @@ impl SideChatRegistry {
         Ok(data.side_chats)
     }
 
-    pub fn register(&self, id: String, parent_thread_id: String) -> Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn register(
+        &self,
+        id: String,
+        parent_thread_id: String,
+        title: String,
+        model: Option<String>,
+        model_display_name: Option<String>,
+        reasoning_effort: Option<String>,
+        has_activity: bool,
+    ) -> Result<()> {
         let mut side_chats = self.load()?;
         if !side_chats.iter().any(|side_chat| side_chat.id == id) {
-            side_chats.push(TemporarySideChatRecord {
+            side_chats.push(SideChatRecord {
                 id,
                 parent_thread_id,
+                title: Some(title),
+                model,
+                model_display_name,
+                reasoning_effort,
+                has_activity,
+                pending_deletion: false,
                 created_at: now_seconds()?,
             });
         }
         self.save(&side_chats)
+    }
+
+    pub fn update_metadata(
+        &self,
+        thread_id: &str,
+        title: String,
+        model: Option<String>,
+        model_display_name: Option<String>,
+        reasoning_effort: Option<String>,
+        has_activity: bool,
+    ) -> Result<()> {
+        let mut side_chats = self.load()?;
+        if let Some(side_chat) = side_chats
+            .iter_mut()
+            .find(|side_chat| side_chat.id == thread_id)
+        {
+            side_chat.title = Some(title);
+            side_chat.model = model;
+            side_chat.model_display_name = model_display_name;
+            side_chat.reasoning_effort = reasoning_effort;
+            side_chat.has_activity = has_activity;
+            self.save(&side_chats)?;
+        }
+        Ok(())
     }
 
     pub fn remove(&self, thread_id: &str) -> Result<()> {
@@ -277,20 +329,34 @@ impl SideChatRegistry {
         self.save(&side_chats)
     }
 
-    pub fn reconcile(&self, registered_thread_ids: &HashSet<String>) -> Result<Vec<String>> {
+    pub fn mark_for_deletion(&self, thread_id: &str) -> Result<()> {
         let mut side_chats = self.load()?;
-        let original_len = side_chats.len();
-        side_chats.retain(|side_chat| !registered_thread_ids.contains(&side_chat.id));
-        if side_chats.len() != original_len {
+        if let Some(side_chat) = side_chats
+            .iter_mut()
+            .find(|side_chat| side_chat.id == thread_id)
+        {
+            side_chat.pending_deletion = true;
             self.save(&side_chats)?;
         }
-        Ok(side_chats
+        Ok(())
+    }
+
+    pub fn pending_deletion_ids(&self) -> Result<Vec<String>> {
+        Ok(self
+            .load()?
             .into_iter()
+            .filter(|side_chat| side_chat.pending_deletion)
             .map(|side_chat| side_chat.id)
             .collect())
     }
 
-    fn save(&self, side_chats: &[TemporarySideChatRecord]) -> Result<()> {
+    pub fn remove_for_parent(&self, parent_thread_id: &str) -> Result<()> {
+        let mut side_chats = self.load()?;
+        side_chats.retain(|side_chat| side_chat.parent_thread_id != parent_thread_id);
+        self.save(&side_chats)
+    }
+
+    fn save(&self, side_chats: &[SideChatRecord]) -> Result<()> {
         let parent = self
             .path
             .parent()
@@ -499,35 +565,119 @@ mod tests {
         let registry = SideChatRegistry::at(temp.path().join("side-chats.json"));
 
         registry
-            .register("side-1".into(), "parent-1".into())
+            .register(
+                "side-1".into(),
+                "parent-1".into(),
+                "First title".into(),
+                Some("model".into()),
+                Some("Model".into()),
+                Some("high".into()),
+                false,
+            )
             .unwrap();
         registry
-            .register("side-1".into(), "parent-1".into())
+            .register(
+                "side-1".into(),
+                "parent-1".into(),
+                "Ignored title".into(),
+                None,
+                None,
+                None,
+                false,
+            )
             .unwrap();
         assert_eq!(registry.load().unwrap().len(), 1);
         assert_eq!(registry.load().unwrap()[0].parent_thread_id, "parent-1");
+        assert_eq!(
+            registry.load().unwrap()[0].title.as_deref(),
+            Some("First title")
+        );
+
+        registry
+            .update_metadata(
+                "side-1",
+                "Updated title".into(),
+                Some("new-model".into()),
+                Some("New Model".into()),
+                Some("medium".into()),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            registry.load().unwrap()[0].title.as_deref(),
+            Some("Updated title")
+        );
+        assert_eq!(
+            registry.load().unwrap()[0].model.as_deref(),
+            Some("new-model")
+        );
+        assert!(registry.load().unwrap()[0].has_activity);
+
+        registry.mark_for_deletion("side-1").unwrap();
+        assert_eq!(registry.pending_deletion_ids().unwrap(), vec!["side-1"]);
 
         registry.remove("side-1").unwrap();
         assert!(registry.load().unwrap().is_empty());
     }
 
     #[test]
-    fn reconciliation_keeps_only_unpromoted_side_chats() {
+    fn loads_side_chats_saved_before_titles_were_persisted() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("side-chats.json");
+        fs::write(
+            &path,
+            br#"{"side_chats":[{"id":"side-1","parent_thread_id":"parent","created_at":1}]}"#,
+        )
+        .unwrap();
+
+        let records = SideChatRegistry::at(path).load().unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].title, None);
+    }
+
+    #[test]
+    fn removes_all_side_chats_for_a_parent() {
         let temp = tempdir().unwrap();
         let registry = SideChatRegistry::at(temp.path().join("side-chats.json"));
         registry
-            .register("promoted".into(), "parent".into())
+            .register(
+                "side-1".into(),
+                "parent".into(),
+                "One".into(),
+                None,
+                None,
+                None,
+                false,
+            )
             .unwrap();
         registry
-            .register("abandoned".into(), "parent".into())
+            .register(
+                "side-2".into(),
+                "parent".into(),
+                "Two".into(),
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        registry
+            .register(
+                "other".into(),
+                "other-parent".into(),
+                "Other".into(),
+                None,
+                None,
+                None,
+                false,
+            )
             .unwrap();
 
-        let pending = registry
-            .reconcile(&HashSet::from(["promoted".into()]))
-            .unwrap();
+        registry.remove_for_parent("parent").unwrap();
 
-        assert_eq!(pending, vec!["abandoned"]);
-        assert_eq!(registry.load().unwrap()[0].id, "abandoned");
+        assert_eq!(registry.load().unwrap().len(), 1);
+        assert_eq!(registry.load().unwrap()[0].id, "other");
     }
 
     #[test]

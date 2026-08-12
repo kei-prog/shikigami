@@ -45,8 +45,8 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     app::{
         App, AttentionKind, BulkRenamePhase, BulkRenameProgress, ChatPane, DraftWorkspaceCleanup,
-        Focus, Mode, RenameAction, ThreadDeletionPhase, ThreadNameApplyRequest,
-        ThreadNameGenerationRequest, TreeRow,
+        Focus, Mode, RenameAction, ThreadDeletionPhase, ThreadDeletionRequest,
+        ThreadNameApplyRequest, ThreadNameGenerationRequest, TreeRow,
     },
     app_server::{AppServer, AppServerRequest, TurnSettings},
     chat::{ChatMode, ChatState, CommandPalette, EditorTarget, PaletteCommand, PaletteEntry},
@@ -54,7 +54,7 @@ use crate::{
     git_workspace::{self, Workspace},
     keybindings::{KeyBindings, KeyContext},
     onboarding,
-    registry::{ThreadRecord, ThreadScope},
+    registry::ThreadScope,
     settings::ExecutionMode,
 };
 
@@ -131,7 +131,7 @@ enum UiAction {
         turn_id: Option<String>,
     },
     CleanupDraftWorkspace(DraftWorkspaceCleanup),
-    DeleteThread(ThreadRecord),
+    DeleteThread(ThreadDeletionRequest),
     GenerateThreadNames(ThreadNameGenerationRequest),
     ApplyThreadNames(ThreadNameApplyRequest),
 }
@@ -271,7 +271,7 @@ async fn run_loop(terminal: &mut Tui, app: &mut App, server: Arc<AppServer>) -> 
     let (clipboard_image_sender, mut clipboard_image_receiver) = mpsc::unbounded_channel();
     let (draft_cleanup_sender, mut draft_cleanup_receiver) = mpsc::unbounded_channel();
     let (side_chat_deletion_sender, mut side_chat_deletion_receiver) = mpsc::unbounded_channel();
-    spawn_abandoned_side_chat_cleanup(app, Arc::clone(&server), side_chat_deletion_sender.clone());
+    spawn_pending_side_chat_deletions(app, Arc::clone(&server), side_chat_deletion_sender.clone());
     spawn_thread_name_refresh(app, Arc::clone(&server), thread_name_sender);
     let mut thread_name_refresh_pending = true;
     let mut clipboard_image_paste_pending = false;
@@ -2432,8 +2432,15 @@ async fn open_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
 }
 
 fn close_side_chat(app: &mut App) -> Option<UiAction> {
-    app.begin_side_chat_deletion()
-        .map(|(thread_id, turn_id)| UiAction::DeleteSideChat { thread_id, turn_id })
+    match app.begin_side_chat_deletion() {
+        Ok(target) => {
+            target.map(|(thread_id, turn_id)| UiAction::DeleteSideChat { thread_id, turn_id })
+        }
+        Err(error) => {
+            app.message = Some(format!("Could not close side chat: {error}"));
+            None
+        }
+    }
 }
 
 fn spawn_side_chat_deletion(
@@ -2458,15 +2465,17 @@ fn spawn_side_chat_deletion(
     });
 }
 
-fn spawn_abandoned_side_chat_cleanup(
+fn spawn_pending_side_chat_deletions(
     app: &mut App,
     server: Arc<AppServer>,
     sender: mpsc::UnboundedSender<SideChatDeletionEvent>,
 ) {
-    let thread_ids = match app.abandoned_side_chat_ids() {
+    let thread_ids = match app.pending_side_chat_deletion_ids() {
         Ok(thread_ids) => thread_ids,
         Err(error) => {
-            app.message = Some(format!("Could not inspect abandoned side chats: {error}"));
+            app.message = Some(format!(
+                "Could not inspect pending side chat cleanup: {error}"
+            ));
             return;
         }
     };
@@ -2518,12 +2527,12 @@ async fn delete_temporary_thread(server: &Arc<AppServer>, thread_id: &str) -> Re
 
 fn spawn_thread_deletion(
     server: Arc<AppServer>,
-    record: ThreadRecord,
+    request: ThreadDeletionRequest,
     sender: mpsc::UnboundedSender<ThreadDeletionEvent>,
 ) {
     tokio::spawn(async move {
-        let thread_id = record.id.clone();
-        let result = perform_thread_deletion(&server, &record, &sender)
+        let thread_id = request.record.id.clone();
+        let result = perform_thread_deletion(&server, &request, &sender)
             .await
             .map_err(|error| error.to_string());
         let _ = sender.send(ThreadDeletionEvent::Finished { thread_id, result });
@@ -2819,9 +2828,10 @@ fn parse_thread_name_suggestions(
 
 async fn perform_thread_deletion(
     server: &Arc<AppServer>,
-    record: &ThreadRecord,
+    request: &ThreadDeletionRequest,
     sender: &mpsc::UnboundedSender<ThreadDeletionEvent>,
 ) -> Result<()> {
+    let record = &request.record;
     if record.managed_worktree && record.cwd.is_dir() {
         let cwd = record.cwd.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -2838,6 +2848,14 @@ async fn perform_thread_deletion(
     let _ = sender.send(ThreadDeletionEvent::Phase(
         ThreadDeletionPhase::DeletingHistory,
     ));
+    let mut side_chat_deletions = request
+        .side_chat_ids
+        .iter()
+        .map(|thread_id| delete_temporary_thread(server, thread_id))
+        .collect::<FuturesUnordered<_>>();
+    while let Some(result) = side_chat_deletions.next().await {
+        result.context("delete side chat history")?;
+    }
     match server.delete_thread(&record.id).await {
         Ok(()) => {}
         Err(error) if is_missing_thread_history_error(&error) => {}
@@ -3346,6 +3364,7 @@ async fn focus_selected_chat(app: &mut App, server: &Arc<AppServer>) -> Result<(
     let cwd = chat.cwd.clone();
     let model = chat.model.clone();
     let title = chat.title.clone();
+    app.restore_side_chats_for_parent(&thread_id, &cwd)?;
     if !app.resumed_threads.contains(&thread_id) {
         match server
             .resume_thread(&thread_id, &cwd, model.as_deref(), app.execution_mode)
@@ -3474,11 +3493,13 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
         )
         .await?;
     app.record_owned_turn(thread_id.clone(), turn_id.clone());
+    let mut side_chat_title_changed = false;
     if let Some(chat) = app.chat_mut() {
         let first_side_message = chat.is_side_chat && !chat.side_chat_has_activity;
         chat.clear_composer();
         chat.begin_user_turn_with_images(prompt.clone(), local_images, turn_id);
         if first_side_message {
+            side_chat_title_changed = true;
             chat.title = if prompt.trim().is_empty() {
                 "Image attachment".into()
             } else {
@@ -3491,6 +3512,11 @@ async fn submit_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
                     .collect()
             };
         }
+    }
+    if side_chat_title_changed && let Err(error) = app.persist_side_chat_metadata(&thread_id) {
+        app.message = Some(format!(
+            "Message sent, but side chat title was not saved: {error}"
+        ));
     }
     if app.thread_is_registered(&thread_id) && !app.thread_has_name(&thread_id) {
         let name = if prompt.trim().is_empty() {
@@ -3532,10 +3558,10 @@ async fn reconcile_thread_subscriptions(app: &mut App, server: &Arc<AppServer>) 
         .collect::<Vec<_>>();
     acquisitions.sort();
     for thread_id in acquisitions {
-        let Some((cwd, model)) = app
+        let Some((cwd, model, is_side_chat)) = app
             .chats
             .get(&thread_id)
-            .map(|chat| (chat.cwd.clone(), chat.model.clone()))
+            .map(|chat| (chat.cwd.clone(), chat.model.clone(), chat.is_side_chat))
         else {
             continue;
         };
@@ -3552,6 +3578,13 @@ async fn reconcile_thread_subscriptions(app: &mut App, server: &Arc<AppServer>) 
                             chat.load_history(&history);
                         }
                     }
+                    Err(error) if is_side_chat && is_missing_thread_error(&error) => {
+                        if let Err(cleanup_error) = app.forget_missing_side_chat(&thread_id) {
+                            app.message = Some(format!(
+                                "Could not forget missing side chat {thread_id}: {cleanup_error}"
+                            ));
+                        }
+                    }
                     Err(error) => {
                         app.message = Some(format!(
                             "Reopened thread {thread_id}, but could not refresh it: {error}"
@@ -3564,6 +3597,13 @@ async fn reconcile_thread_subscriptions(app: &mut App, server: &Arc<AppServer>) 
                 app.message = Some(format!(
                     "Thread {thread_id} is now read-only because another Codex session owns it"
                 ));
+            }
+            Err(error) if is_side_chat && is_missing_thread_error(&error) => {
+                if let Err(cleanup_error) = app.forget_missing_side_chat(&thread_id) {
+                    app.message = Some(format!(
+                        "Could not forget missing side chat {thread_id}: {cleanup_error}"
+                    ));
+                }
             }
             Err(error) => {
                 app.message = Some(format!("Could not reopen thread {thread_id}: {error}"));
@@ -5702,7 +5742,7 @@ fn render_repository_remove_confirm(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_thread_delete_confirm(frame: &mut Frame, area: Rect, app: &App) {
-    let popup = centered_rect(76, 10, area);
+    let popup = centered_rect(76, 11, area);
     let title = app
         .selected_thread()
         .map(|thread| thread.record.title.as_str())
@@ -5710,7 +5750,7 @@ fn render_thread_delete_confirm(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(format!(
-            "Permanently delete thread '{title}'?\n\nCodex history cannot be recovered.\nA clean Shikigami worktree is removed; other worktrees are kept.\n\n{} delete · {} cancel",
+            "Permanently delete thread '{title}'?\n\nCodex history and its side chats cannot be recovered.\nA clean Shikigami worktree is removed; other worktrees are kept.\n\n{} delete · {} cancel",
             app.keybindings.label("delete_thread.confirm"),
             app.keybindings.label("delete_thread.cancel"),
         ))
