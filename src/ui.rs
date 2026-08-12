@@ -1606,6 +1606,48 @@ async fn handle_key(
                     }
                 }
             }
+            KeyCode::Char('n')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && app.selected_tree_is_thread()
+                    && !app.show_archived =>
+            {
+                switch_thread_shortcut(
+                    app,
+                    server,
+                    preview_generation,
+                    preview_task,
+                    ThreadNavigation::Next,
+                )
+                .await;
+            }
+            KeyCode::Char('p')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && app.selected_tree_is_thread()
+                    && !app.show_archived =>
+            {
+                switch_thread_shortcut(
+                    app,
+                    server,
+                    preview_generation,
+                    preview_task,
+                    ThreadNavigation::Previous,
+                )
+                .await;
+            }
+            KeyCode::Char('o')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && app.selected_tree_is_thread()
+                    && !app.show_archived =>
+            {
+                switch_thread_shortcut(
+                    app,
+                    server,
+                    preview_generation,
+                    preview_task,
+                    ThreadNavigation::Last,
+                )
+                .await;
+            }
             KeyCode::Char('h') | KeyCode::Left
                 if matches!(app.selected_tree_row(), Some(TreeRow::GeneralThread { .. })) =>
             {
@@ -3674,7 +3716,11 @@ async fn switch_thread_shortcut(
     preview_task: &mut Option<JoinHandle<()>>,
     navigation: ThreadNavigation,
 ) {
-    let mode = app.chat().map(|chat| chat.mode).unwrap_or(ChatMode::Input);
+    let mode = if app.mode == Mode::Normal {
+        ChatMode::Input
+    } else {
+        app.chat().map(|chat| chat.mode).unwrap_or(ChatMode::Input)
+    };
     let selected = match navigation {
         ThreadNavigation::Next => app.select_adjacent_thread(true),
         ThreadNavigation::Previous => app.select_adjacent_thread(false),

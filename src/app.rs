@@ -1218,20 +1218,24 @@ impl App {
     }
 
     pub fn select_adjacent_thread(&mut self, forward: bool) -> bool {
-        let thread_ids = thread_navigation_order(&self.threads, &self.repositories);
-        if thread_ids.len() < 2 {
-            return false;
-        }
-        let Some(current) = self.visible_chat_id.as_deref().and_then(|visible| {
-            thread_ids
-                .iter()
-                .position(|thread_id| *thread_id == visible)
+        let current_thread_id = if self.focus == Focus::Navigation && self.selected_tree_is_thread()
+        {
+            self.selected_thread()
+                .map(|thread| thread.record.id.as_str())
+        } else {
+            self.visible_chat_id.as_deref()
+        };
+        let Some(thread_id) = current_thread_id.and_then(|current_thread_id| {
+            adjacent_thread_id(
+                &self.threads,
+                &self.repositories,
+                current_thread_id,
+                forward,
+            )
         }) else {
             return false;
         };
-        let next = cycle_index(current, thread_ids.len(), forward);
-        let thread_id = thread_ids[next].to_owned();
-        self.restore_tree_selection(TreeSelection::Thread(thread_id));
+        self.restore_tree_selection(TreeSelection::Thread(thread_id.to_owned()));
         self.sync_selection_from_tree();
         true
     }
@@ -4267,6 +4271,22 @@ fn thread_navigation_order<'a>(
     thread_ids
 }
 
+fn adjacent_thread_id<'a>(
+    threads: &'a [ThreadItem],
+    repositories: &[Repository],
+    current_thread_id: &str,
+    forward: bool,
+) -> Option<&'a str> {
+    let thread_ids = thread_navigation_order(threads, repositories);
+    if thread_ids.len() < 2 {
+        return None;
+    }
+    let current = thread_ids
+        .iter()
+        .position(|thread_id| *thread_id == current_thread_id)?;
+    Some(thread_ids[cycle_index(current, thread_ids.len(), forward)])
+}
+
 fn same_thread_group(left: &TreeRow, right: &TreeRow) -> bool {
     match (left, right) {
         (TreeRow::GeneralThread { .. }, TreeRow::GeneralThread { .. }) => true,
@@ -4773,6 +4793,14 @@ mod tests {
         assert_eq!(
             thread_navigation_order(&threads, &repositories),
             vec!["general", "one", "two-new", "two-old"]
+        );
+        assert_eq!(
+            adjacent_thread_id(&threads, &repositories, "one", true),
+            Some("two-new")
+        );
+        assert_eq!(
+            adjacent_thread_id(&threads, &repositories, "one", false),
+            Some("general")
         );
     }
 

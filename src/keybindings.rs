@@ -786,6 +786,24 @@ static ACTIONS: &[ActionSpec] = &[
         ["ctrl+s"]
     ),
     action!(
+        "normal.thread.next_thread",
+        NormalThread,
+        "ctrl+n",
+        ["ctrl+n"]
+    ),
+    action!(
+        "normal.thread.previous_thread",
+        NormalThread,
+        "ctrl+p",
+        ["ctrl+p"]
+    ),
+    action!(
+        "normal.thread.last_thread",
+        NormalThread,
+        "ctrl+o",
+        ["ctrl+o"]
+    ),
+    action!(
         "normal.thread.preview_half_page_up",
         NormalThread,
         "ctrl+u",
@@ -1457,6 +1475,21 @@ mod tests {
 
         assert_eq!(resolved.code, KeyCode::Char('s'));
         assert!(resolved.modifiers.contains(KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn thread_shortcuts_open_adjacent_and_last_threads_from_the_tree() {
+        let bindings = KeyBindings::defaults();
+
+        for character in ['n', 'p', 'o'] {
+            let resolved = bindings.resolve(
+                &[KeyContext::NormalThread, KeyContext::Normal],
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL),
+            );
+
+            assert_eq!(resolved.code, KeyCode::Char(character));
+            assert!(resolved.modifiers.contains(KeyModifiers::CONTROL));
+        }
     }
 
     #[test]
