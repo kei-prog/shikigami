@@ -392,6 +392,10 @@ create a fork attached to the current thread; `Ctrl-s` does the same directly
 from chat input or message-scroll mode. Each main
 thread can keep multiple side chats across Shikigami sessions. The chat
 area splits into main and the selected side pane, and both can stream independently.
+Creating a side chat while the main response is streaming forks the conversation
+immediately before that in-progress turn, so partial output and tool activity are
+not copied. The first response must finish because there is no earlier conversation
+to fork.
 In message-scroll mode, press `l` / `Right` from the main pane to focus the side
 pane, then `h` / `Left` to return to the main pane; another `h` / `Left` returns
 to the repository tree. `Esc` returns directly to the tree, and `Ctrl-g` switches

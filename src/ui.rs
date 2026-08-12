@@ -2409,10 +2409,12 @@ async fn open_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     let Some(main_chat) = app.main_chat() else {
         return Ok(());
     };
-    if main_chat.active_turn_id.is_some() {
+    let before_turn_id = main_chat.active_turn_id.clone();
+    if before_turn_id.is_some() && !main_chat.has_completed_turn() {
         if let Some(main_chat) = app.main_chat_mut() {
-            main_chat
-                .show_inline_warning("Side chats can't be created while a response is streaming.");
+            main_chat.show_inline_warning(
+                "A side chat can't be created during the first response because there is no earlier conversation to fork.",
+            );
         }
         return Ok(());
     }
@@ -2427,7 +2429,13 @@ async fn open_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     let reasoning_effort = main_chat.reasoning_effort.clone();
     let side_chat_number = app.current_side_chats().len() + 1;
     let (side_thread_id, history) = match server
-        .fork_thread(&parent_thread_id, &cwd, false, app.execution_mode)
+        .fork_thread(
+            &parent_thread_id,
+            &cwd,
+            false,
+            before_turn_id.as_deref(),
+            app.execution_mode,
+        )
         .await
     {
         Ok(result) => result,
@@ -2445,6 +2453,11 @@ async fn open_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
         side_chat.set_model(model, display_name, reasoning_effort);
     }
     side_chat.load_history(&history);
+    if before_turn_id.is_some() {
+        side_chat.push_notice(
+            "Forked before the current response; its in-progress turn is not included.".into(),
+        );
+    }
     side_chat.mark_as_side_chat();
     app.mark_thread_opened(side_thread_id.clone());
     if let Err(error) = app.show_side_chat(parent_thread_id, side_chat) {
@@ -6059,16 +6072,16 @@ mod tests {
     #[test]
     fn inline_warning_is_prefixed_and_wrapped_for_the_chat_pane() {
         let lines = inline_warning_lines(
-            "Side chats can't be created while a response is streaming.",
+            "A side chat can't be created during the first response because there is no earlier conversation to fork.",
             36,
         );
 
-        assert!(lines[0].starts_with(" WARNING · Side chats"));
+        assert!(lines[0].starts_with(" WARNING · A side chat"));
         assert!(lines.len() > 1);
         assert!(lines.iter().all(|line| line.chars().count() <= 36));
         assert_eq!(
             lines.concat(),
-            " WARNING · Side chats can't be created while a response is streaming."
+            " WARNING · A side chat can't be created during the first response because there is no earlier conversation to fork."
         );
     }
 

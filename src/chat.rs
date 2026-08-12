@@ -299,6 +299,7 @@ pub struct ChatState {
     pub side_chat_has_activity: bool,
     pub visible_editor_target: Option<EditorTarget>,
     waiting_for_activity: bool,
+    has_completed_turn: bool,
     streaming_message: Option<usize>,
     pending_user_message: Option<PendingInput>,
     pending_steers: VecDeque<PendingInput>,
@@ -339,6 +340,7 @@ impl ChatState {
             side_chat_has_activity: false,
             visible_editor_target: None,
             waiting_for_activity: false,
+            has_completed_turn: false,
             streaming_message: None,
             pending_user_message: None,
             pending_steers: VecDeque::new(),
@@ -407,11 +409,15 @@ impl ChatState {
         self.selected_message_index = None;
         self.message_selection_scroll_pending = false;
         self.waiting_for_activity = false;
+        self.has_completed_turn = false;
         let Some(turns) = response.pointer("/thread/turns").and_then(Value::as_array) else {
             return;
         };
         for turn in turns {
             let in_progress = turn.get("status").and_then(Value::as_str) == Some("inProgress");
+            if !in_progress {
+                self.has_completed_turn = true;
+            }
             if in_progress {
                 self.active_turn_id = turn.get("id").and_then(Value::as_str).map(str::to_owned);
                 self.waiting_for_activity = true;
@@ -464,6 +470,10 @@ impl ChatState {
 
     pub fn inline_warning(&self) -> Option<&str> {
         self.inline_warning.as_deref()
+    }
+
+    pub fn has_completed_turn(&self) -> bool {
+        self.has_completed_turn
     }
 
     #[cfg(test)]
@@ -933,6 +943,7 @@ impl ChatState {
                 self.inline_warning = None;
                 self.interrupt_requested = false;
                 self.waiting_for_activity = false;
+                self.has_completed_turn = true;
                 if interrupted {
                     self.push_notice("■ Response interrupted".into());
                 }
@@ -1603,6 +1614,7 @@ mod tests {
         }]}}));
 
         assert_eq!(chat.active_turn_id.as_deref(), Some("turn-1"));
+        assert!(!chat.has_completed_turn());
         assert_eq!(chat.messages.len(), 2);
         assert_eq!(chat.messages[1].role, ChatRole::Diff);
         assert!(chat.messages[1].content.starts_with("Editing: src/main.rs"));
@@ -1614,6 +1626,18 @@ mod tests {
 
         assert_eq!(chat.messages.len(), 3);
         assert_eq!(chat.messages[2].content, "response");
+    }
+
+    #[test]
+    fn completed_history_allows_forking_before_a_later_active_turn() {
+        let mut chat = ChatState::new("t".into(), "/tmp".into(), "test".into());
+        chat.load_history(&json!({"thread":{"turns":[
+            {"id":"turn-1","status":"completed","items":[]},
+            {"id":"turn-2","status":"inProgress","items":[]}
+        ]}}));
+
+        assert!(chat.has_completed_turn());
+        assert_eq!(chat.active_turn_id.as_deref(), Some("turn-2"));
     }
 
     #[test]
@@ -1727,6 +1751,7 @@ mod tests {
 
         assert_eq!(chat.messages.len(), message_count);
         assert_eq!(chat.inline_warning(), None);
+        assert!(chat.has_completed_turn());
     }
 
     #[test]

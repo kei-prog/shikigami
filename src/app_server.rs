@@ -486,6 +486,7 @@ impl AppServer {
         thread_id: &str,
         cwd: &Path,
         ephemeral: bool,
+        before_turn_id: Option<&str>,
         execution_mode: ExecutionMode,
     ) -> Result<(String, Value)> {
         let (approval_policy, sandbox) = execution_policy(execution_mode);
@@ -499,7 +500,8 @@ impl AppServer {
                     "approvalPolicy": approval_policy,
                     "approvalsReviewer": approvals_reviewer,
                     "sandbox": sandbox,
-                    "ephemeral": ephemeral
+                    "ephemeral": ephemeral,
+                    "beforeTurnId": before_turn_id
                 }),
             )
             .await?;
@@ -1488,6 +1490,56 @@ mod tests {
         .await;
 
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_thread_can_exclude_an_in_progress_turn() {
+        let (writer, mut messages) = mpsc::channel(1);
+        let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(1);
+        let (_request_tx, request_rx) = mpsc::channel(1);
+        let server = Arc::new(AppServer {
+            writer,
+            writer_task: Mutex::new(None),
+            reader_task: Mutex::new(None),
+            child: Mutex::new(None),
+            pending: pending.clone(),
+            next_id: AtomicU64::new(0),
+            events,
+            server_requests: Mutex::new(request_rx),
+            version: "test".into(),
+            request_timeout: Duration::from_secs(1),
+            performance: None,
+        });
+
+        let task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .fork_thread(
+                        "thread-1",
+                        Path::new("/tmp/project"),
+                        false,
+                        Some("turn-in-progress"),
+                        ExecutionMode::Auto,
+                    )
+                    .await
+            }
+        });
+        let OutgoingMessage::Json(message) = messages.recv().await.unwrap() else {
+            panic!("unexpected shutdown message");
+        };
+        assert_eq!(message["method"], "thread/fork");
+        assert_eq!(message["params"]["threadId"], "thread-1");
+        assert_eq!(message["params"]["beforeTurnId"], "turn-in-progress");
+        dispatch_response(
+            &pending,
+            &json!({"id":message["id"],"result":{"thread":{"id":"fork-1"}}}),
+        )
+        .await;
+
+        let (thread_id, _) = task.await.unwrap().unwrap();
+        assert_eq!(thread_id, "fork-1");
     }
 
     #[tokio::test]
