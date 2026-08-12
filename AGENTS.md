@@ -4,6 +4,12 @@
 
 `shikigami` is a Rust 2024 TUI for managing Codex CLI threads across Git repositories. The entry point is `src/main.rs`; application state lives in `src/app.rs`, rendering in `src/ui.rs`, and App Server JSONL communication in `src/app_server.rs`. Repository discovery, thread data, Git worktrees, chat state, and clipboard support use correspondingly named modules. Tests are colocated in `#[cfg(test)] mod tests` blocks. Never commit generated `target/` contents.
 
+## Product Scope & Feature Decisions
+
+Shikigami enables powerful multi-threaded Codex use that the Codex CLI alone cannot provide. Keep responsibilities that Codex can perform through natural-language instructions, tools, or skills in Codex; do not reimplement them as built-in Shikigami workflows by default. Concentrate Shikigami on persistent client capabilities such as coordinating and navigating multiple threads, repositories, and worktrees, and making their state clear to the user.
+
+Before adding a feature, determine whether Codex or a skill can already provide it sufficiently and whether it creates value unavailable in the Codex CLI itself. If both answers favor existing Codex capabilities, leave the feature to Codex. Prefer changes that reduce the human interaction and coordination cost of operating multiple concurrent Codex threads.
+
 ## Build, Test, and Development Commands
 
 Run shell commands through `rtk` in this workspace:

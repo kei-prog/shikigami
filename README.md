@@ -424,6 +424,18 @@ shi repo list
 
 ## Scope
 
-Shikigami is a lightweight App Server client. Codex still owns agent execution,
-tools, sandboxing, conversation history, and authentication; Shikigami owns the TUI,
+Shikigami exists to make powerful multi-threaded use of Codex practical where the
+Codex CLI alone is not enough. It does not aim to reimplement Codex features or
+turn workflows that Codex can perform from natural-language instructions or skills
+into application features. Those responsibilities should remain with Codex.
+
+Shikigami instead concentrates on the interaction and coordination capabilities
+that require a persistent client: operating multiple Codex threads across
+repositories and worktrees, seeing their state, and moving between them quickly.
+When considering a new feature, the central question is whether it provides value
+that cannot be achieved sufficiently through Codex, a skill, or the Codex CLI by
+itself.
+
+Shikigami is a lightweight App Server client. Codex owns agent execution, tools,
+sandboxing, conversation history, and authentication; Shikigami owns the TUI,
 repository/worktree lifecycle, and its selected thread registry.
