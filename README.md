@@ -17,7 +17,7 @@ uses Codex App Server, and only lists threads created through Shikigami.
 Install the latest stable release from GitHub:
 
 ```bash
-cargo install --git https://github.com/kei-prog/shikigami --tag v0.2.1
+cargo install --git https://github.com/kei-prog/shikigami --tag v0.3.0
 ```
 
 To try the latest development version from `main` instead:
