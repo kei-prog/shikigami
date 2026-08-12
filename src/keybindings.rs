@@ -704,6 +704,20 @@ static ACTIONS: &[ActionSpec] = &[
         "ctrl+d",
         ["ctrl+d"]
     ),
+    action!(
+        "normal.thread.preview_previous_message",
+        NormalThread,
+        "K",
+        ["K"]
+    ),
+    action!(
+        "normal.thread.preview_next_message",
+        NormalThread,
+        "J",
+        ["J"]
+    ),
+    action!("normal.thread.preview_top", NormalThread, "g", ["g"]),
+    action!("normal.thread.preview_bottom", NormalThread, "G", ["G"]),
     action!("normal.thread.copy_id", NormalThread, "y", ["y"]),
     action!("normal.thread.copy_resume", NormalThread, "Y", ["Y"]),
     action!("normal.thread.delete", NormalThread, "d", ["d"]),
@@ -1294,6 +1308,20 @@ mod tests {
 
             assert_eq!(resolved.code, KeyCode::Char(character));
             assert!(resolved.modifiers.contains(KeyModifiers::CONTROL));
+        }
+    }
+
+    #[test]
+    fn g_and_shifted_j_k_navigate_a_selected_thread_preview() {
+        let bindings = KeyBindings::defaults();
+
+        for character in ['g', 'G', 'J', 'K'] {
+            let resolved = bindings.resolve(
+                &[KeyContext::NormalThread, KeyContext::Normal],
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            );
+
+            assert_eq!(resolved.code, KeyCode::Char(character));
         }
     }
 

@@ -1539,6 +1539,26 @@ async fn handle_key(
                     chat.scroll_half_page_down();
                 }
             }
+            KeyCode::Char('K') if app.selected_tree_is_thread() => {
+                if let Some(chat) = app.chat_mut() {
+                    chat.move_message_selection(false);
+                }
+            }
+            KeyCode::Char('J') if app.selected_tree_is_thread() => {
+                if let Some(chat) = app.chat_mut() {
+                    chat.move_message_selection(true);
+                }
+            }
+            KeyCode::Char('g') if app.selected_tree_is_thread() => {
+                if let Some(chat) = app.chat_mut() {
+                    chat.scroll_to_top();
+                }
+            }
+            KeyCode::Char('G') if app.selected_tree_is_thread() => {
+                if let Some(chat) = app.chat_mut() {
+                    chat.scroll_to_bottom();
+                }
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 app.move_up();
                 begin_navigation_paint(app, pending.thread_paint);

@@ -156,6 +156,8 @@ confirmation word, and they refuse to run while Shikigami is open.
 
 - `j` / `k`: move through the thread tree and preview the selected thread
 - `Ctrl+U` / `Ctrl+D`: scroll the selected thread preview half a page without leaving the tree
+- `g` / `G`: jump to the top or bottom of the selected thread preview without leaving the tree
+- `J` / `K`: select the next or previous message in the selected thread preview without leaving the tree
 - `h` / `l`: collapse or expand a repository; `l` focuses a selected thread's messages
 - `H` / `L`: collapse or expand all repositories
 - `Enter`: expand a repository or focus the selected thread's chat input
