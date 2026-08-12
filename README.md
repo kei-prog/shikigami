@@ -155,7 +155,7 @@ the current state. Both destructive operations require typing an explicit
 confirmation word, and they refuse to run while Shikigami is open.
 
 - `j` / `k`: move through the thread tree and preview the selected thread
-- `Ctrl+U` / `Ctrl+D`: scroll the selected thread preview half a page without leaving the tree
+- `Ctrl+U` / `Ctrl+D` or `,` / `.`: scroll the selected thread preview half a page without leaving the tree
 - `g` / `G`: jump to the top or bottom of the thread tree
 - `J` / `K`: select the next or previous message in the selected thread preview without leaving the tree
 - `h` / `l`: collapse or expand a repository; `l` focuses a selected thread's messages
@@ -326,7 +326,7 @@ reasoning, command, edit, or tool activity keeps animating for the full active
 turn, including periods without incoming App Server events.
 
 Chat starts in input mode. Press `Tab` for scroll mode, then use `j` / `k` for
-one line, `u` / `d` for half a page, `PageUp` / `PageDown` for a full
+one line, `u` / `d` or `,` / `.` for half a page, `PageUp` / `PageDown` for a full
 page, and `g` / `G` for the beginning or latest message. `i`, `Enter`, or `Tab`
 return to input mode. Press `h`, `Left`, or `Esc` in scroll mode to return to
 the repository tree. In input mode, `Ctrl-u` clears the composer and `Esc`

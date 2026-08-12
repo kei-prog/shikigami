@@ -166,13 +166,13 @@ static ACTIONS: &[ActionSpec] = &[
         "chat_scroll.half_page_up",
         ChatScroll,
         "ctrl+u",
-        ["ctrl+u", "u"]
+        ["ctrl+u", "u", ","]
     ),
     action!(
         "chat_scroll.half_page_down",
         ChatScroll,
         "ctrl+d",
-        ["ctrl+d", "d"]
+        ["ctrl+d", "d", "."]
     ),
     action!("chat_scroll.previous_message", ChatScroll, "K", ["K"]),
     action!("chat_scroll.next_message", ChatScroll, "J", ["J"]),
@@ -705,13 +705,13 @@ static ACTIONS: &[ActionSpec] = &[
         "normal.thread.preview_half_page_up",
         NormalThread,
         "ctrl+u",
-        ["ctrl+u"]
+        ["ctrl+u", ","]
     ),
     action!(
         "normal.thread.preview_half_page_down",
         NormalThread,
         "ctrl+d",
-        ["ctrl+d"]
+        ["ctrl+d", "."]
     ),
     action!(
         "normal.thread.preview_previous_message",
@@ -1326,6 +1326,23 @@ mod tests {
 
             assert_eq!(resolved.code, KeyCode::Char(character));
             assert!(resolved.modifiers.contains(KeyModifiers::CONTROL));
+        }
+    }
+
+    #[test]
+    fn comma_and_period_scroll_half_a_page_in_thread_views() {
+        let bindings = KeyBindings::defaults();
+
+        for context in [KeyContext::NormalThread, KeyContext::ChatScroll] {
+            for (pressed, canonical) in [(',', 'u'), ('.', 'd')] {
+                let resolved = bindings.resolve(
+                    &[context, KeyContext::Normal],
+                    KeyEvent::new(KeyCode::Char(pressed), KeyModifiers::NONE),
+                );
+
+                assert_eq!(resolved.code, KeyCode::Char(canonical));
+                assert!(resolved.modifiers.contains(KeyModifiers::CONTROL));
+            }
         }
     }
 
