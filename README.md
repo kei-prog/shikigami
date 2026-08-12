@@ -155,6 +155,7 @@ the current state. Both destructive operations require typing an explicit
 confirmation word, and they refuse to run while Shikigami is open.
 
 - `j` / `k`: move through the thread tree and preview the selected thread
+- `Ctrl+U` / `Ctrl+D`: scroll the selected thread preview half a page without leaving the tree
 - `h` / `l`: collapse or expand a repository; `l` focuses a selected thread's messages
 - `H` / `L`: collapse or expand all repositories
 - `Enter`: expand a repository or focus the selected thread's chat input

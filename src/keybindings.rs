@@ -692,6 +692,18 @@ static ACTIONS: &[ActionSpec] = &[
         "i",
         ["i", "enter"]
     ),
+    action!(
+        "normal.thread.preview_half_page_up",
+        NormalThread,
+        "ctrl+u",
+        ["ctrl+u"]
+    ),
+    action!(
+        "normal.thread.preview_half_page_down",
+        NormalThread,
+        "ctrl+d",
+        ["ctrl+d"]
+    ),
     action!("normal.thread.copy_id", NormalThread, "y", ["y"]),
     action!("normal.thread.copy_resume", NormalThread, "Y", ["Y"]),
     action!("normal.thread.delete", NormalThread, "d", ["d"]),
@@ -1266,6 +1278,21 @@ mod tests {
             let resolved = bindings.resolve(&[context], ctrl_s);
 
             assert_eq!(resolved.code, KeyCode::Char('s'));
+            assert!(resolved.modifiers.contains(KeyModifiers::CONTROL));
+        }
+    }
+
+    #[test]
+    fn ctrl_u_and_d_scroll_a_selected_thread_preview() {
+        let bindings = KeyBindings::defaults();
+
+        for character in ['u', 'd'] {
+            let resolved = bindings.resolve(
+                &[KeyContext::NormalThread, KeyContext::Normal],
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL),
+            );
+
+            assert_eq!(resolved.code, KeyCode::Char(character));
             assert!(resolved.modifiers.contains(KeyModifiers::CONTROL));
         }
     }

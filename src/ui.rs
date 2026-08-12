@@ -1523,6 +1523,22 @@ async fn handle_key(
                     chat.enter_scroll_mode();
                 }
             }
+            KeyCode::Char('u')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && app.selected_tree_is_thread() =>
+            {
+                if let Some(chat) = app.chat_mut() {
+                    chat.scroll_half_page_up();
+                }
+            }
+            KeyCode::Char('d')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && app.selected_tree_is_thread() =>
+            {
+                if let Some(chat) = app.chat_mut() {
+                    chat.scroll_half_page_down();
+                }
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 app.move_up();
                 begin_navigation_paint(app, pending.thread_paint);
