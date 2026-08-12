@@ -108,13 +108,15 @@ fn render_document(title: &str, messages: &[ChatMessage], selected: Option<usize
         };
         let content = markdown_html(&message.content);
         if matches!(message.role, ChatRole::Activity | ChatRole::Diff) {
+            let summary = escape_html(&message_summary(&message.content));
             body.push_str(&format!(
-                "<details id=\"message-{}\" class=\"message auxiliary {}{}\"><summary><span class=\"role-marker\">{}</span><span>{}</span><span class=\"summary-hint\">show details</span></summary><div class=\"markdown auxiliary-content\">{}</div></details>",
+                "<details id=\"message-{}\" class=\"message auxiliary {}{}\"><summary><span class=\"role-marker\">{}</span><span class=\"summary-kind\">{}</span><span class=\"summary-text\">{}</span><span class=\"summary-hint\">Details</span></summary><div class=\"markdown auxiliary-content\">{}</div></details>",
                 index + 1,
                 class,
                 selection_class,
                 marker,
                 role,
+                summary,
                 content,
             ));
         } else {
@@ -184,6 +186,9 @@ th {{ background:var(--surface-raised); color:var(--text-soft); font-size:13px; 
 .auxiliary summary::-webkit-details-marker {{ display:none; }}
 .auxiliary summary::before {{ content:'›'; color:var(--muted); font-size:18px; transition:transform .16s ease; }}
 .auxiliary[open] summary::before {{ transform:rotate(90deg); }}
+.summary-kind {{ flex:none; }}
+.summary-text {{ min-width:0; overflow:hidden; color:var(--text-soft); font-weight:550; letter-spacing:0; text-overflow:ellipsis; text-transform:none; white-space:nowrap; }}
+.summary-text::before {{ content:'·'; margin-right:9px; color:var(--muted); }}
 .summary-hint {{ margin-left:auto; color:var(--muted); font-size:10px; font-weight:500; letter-spacing:.04em; text-transform:none; }}
 .auxiliary[open] .summary-hint {{ visibility:hidden; }}
 .auxiliary-content {{ padding:0 16px 15px 45px; font-size:14px; }}
@@ -296,6 +301,30 @@ fn markdown_html(markdown: &str) -> String {
     let mut output = String::new();
     html::push_html(&mut output, safe_events);
     output
+}
+
+fn message_summary(content: &str) -> String {
+    let mut lines = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let first = lines.next().unwrap_or("No details");
+    let summary = if matches!(first, "Thought" | "Thinking…" | "Running command") {
+        lines.next().unwrap_or(first)
+    } else {
+        first
+    };
+    truncate_summary(summary, 120)
+}
+
+fn truncate_summary(summary: &str, max_chars: usize) -> String {
+    let mut chars = summary.chars();
+    let prefix = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
 }
 
 fn safe_web_destination(destination: CowStr<'_>) -> CowStr<'_> {
@@ -415,15 +444,48 @@ mod tests {
     #[test]
     fn activity_and_changes_are_collapsed_for_readability() {
         let messages = vec![
-            ChatMessage::for_preview_test(ChatRole::Activity, "Ran tests"),
-            ChatMessage::for_preview_test(ChatRole::Diff, "diff --git a/a b/a"),
+            ChatMessage::for_preview_test(ChatRole::Activity, "Running: cargo test\noutput"),
+            ChatMessage::for_preview_test(
+                ChatRole::Diff,
+                "Edited: src/ui.rs, src/chat.rs [completed]\ndiff --git a/a b/a",
+            ),
         ];
         let rendered = render_document("Thread", &messages, None);
 
         assert!(rendered.contains("<details id=\"message-1\""));
         assert!(rendered.contains("class=\"message auxiliary activity\""));
         assert!(rendered.contains("class=\"message auxiliary diff\""));
+        assert!(rendered.contains("class=\"summary-text\">Running: cargo test"));
+        assert!(
+            rendered.contains("class=\"summary-text\">Edited: src/ui.rs, src/chat.rs [completed]")
+        );
         assert!(rendered.contains("2 messages"));
+    }
+
+    #[test]
+    fn activity_summary_prefers_reasoning_content_and_escapes_html() {
+        assert_eq!(
+            message_summary("Thought\nChecking the <unsafe> edge case\nMore"),
+            "Checking the <unsafe> edge case"
+        );
+        let rendered = render_document(
+            "Thread",
+            &[ChatMessage::for_preview_test(
+                ChatRole::Activity,
+                "Thought\nChecking the <unsafe> edge case",
+            )],
+            None,
+        );
+        assert!(rendered.contains("Checking the &lt;unsafe&gt; edge case"));
+    }
+
+    #[test]
+    fn activity_summary_is_bounded() {
+        let long = "x".repeat(140);
+        let summary = message_summary(&long);
+
+        assert_eq!(summary.chars().count(), 121);
+        assert!(summary.ends_with('…'));
     }
 
     #[test]
