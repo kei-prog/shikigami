@@ -153,6 +153,7 @@ static ACTIONS: &[ActionSpec] = &[
     ),
     action!("chat_scroll.interrupt", ChatScroll, "ctrl+c", ["ctrl+c"]),
     action!("chat_scroll.palette", ChatScroll, "/", ["/"]),
+    action!("chat_scroll.side_chat", ChatScroll, "ctrl+s", ["ctrl+s"]),
     action!("chat_scroll.toggle_pane", ChatScroll, "ctrl+g", ["ctrl+g"]),
     action!("chat_scroll.next_chat", ChatScroll, "ctrl+n", ["ctrl+n"]),
     action!(
@@ -201,6 +202,7 @@ static ACTIONS: &[ActionSpec] = &[
     action!("chat_input.scroll", ChatInput, "tab", ["tab"]),
     action!("chat_input.focus_tree", ChatInput, "esc", ["esc"]),
     action!("chat_input.interrupt", ChatInput, "ctrl+c", ["ctrl+c"]),
+    action!("chat_input.side_chat", ChatInput, "ctrl+s", ["ctrl+s"]),
     action!("chat_input.toggle_pane", ChatInput, "ctrl+g", ["ctrl+g"]),
     action!("chat_input.next_chat", ChatInput, "ctrl+n", ["ctrl+n"]),
     action!("chat_input.previous_chat", ChatInput, "ctrl+p", ["ctrl+p"]),
@@ -246,6 +248,7 @@ static ACTIONS: &[ActionSpec] = &[
     action!("chat_input.scroll", ChatInputEmpty, "tab", ["tab"]),
     action!("chat_input.focus_tree", ChatInputEmpty, "esc", ["esc"]),
     action!("chat_input.interrupt", ChatInputEmpty, "ctrl+c", ["ctrl+c"]),
+    action!("chat_input.side_chat", ChatInputEmpty, "ctrl+s", ["ctrl+s"]),
     action!(
         "chat_input.toggle_pane",
         ChatInputEmpty,
@@ -1106,6 +1109,8 @@ mod tests {
         assert_eq!(config.version, CONFIG_VERSION);
         assert_eq!(config.keybindings["normal.quit"], ["q"]);
         assert_eq!(config.keybindings["help.ask_shikigami"], ["enter"]);
+        assert_eq!(config.keybindings["chat_input.side_chat"], ["ctrl+s"]);
+        assert_eq!(config.keybindings["chat_scroll.side_chat"], ["ctrl+s"]);
     }
 
     #[test]
@@ -1246,6 +1251,23 @@ mod tests {
 
         assert_eq!(typed.code, KeyCode::Char('u'));
         assert!(typed.modifiers.is_empty());
+    }
+
+    #[test]
+    fn ctrl_s_opens_side_chat_from_input_and_scroll_modes() {
+        let bindings = KeyBindings::defaults();
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        for context in [
+            KeyContext::ChatInput,
+            KeyContext::ChatInputEmpty,
+            KeyContext::ChatScroll,
+        ] {
+            let resolved = bindings.resolve(&[context], ctrl_s);
+
+            assert_eq!(resolved.code, KeyCode::Char('s'));
+            assert!(resolved.modifiers.contains(KeyModifiers::CONTROL));
+        }
     }
 
     #[test]

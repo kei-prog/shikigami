@@ -821,6 +821,9 @@ async fn handle_key(
                     interrupt_chat(app, server).await?;
                 }
                 KeyCode::Char('/') => open_command_palette(app, server).await?,
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    open_side_chat(app, server).await?;
+                }
                 KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.toggle_chat_pane();
                 }
@@ -921,6 +924,9 @@ async fn handle_key(
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 interrupt_chat(app, server).await?;
+            }
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                open_side_chat(app, server).await?;
             }
             KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.toggle_chat_pane();

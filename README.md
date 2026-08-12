@@ -385,7 +385,8 @@ appears in the header and applies to subsequent turns in that thread. Press
 New chats default to `medium` reasoning when the selected model supports it.
 
 Choose `/permissions` to select the global execution mode. Choose `/sidechat` to
-create a temporary fork of the current thread. Each main
+create a temporary fork of the current thread; `Ctrl-s` does the same directly
+from chat input or message-scroll mode. Each main
 thread can keep multiple side chats for the current Shikigami session. The chat
 area splits into main and the selected side pane, and both can stream independently.
 In message-scroll mode, press `l` / `Right` from the main pane to focus the side
