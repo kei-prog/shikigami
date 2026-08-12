@@ -648,6 +648,8 @@ static ACTIONS: &[ActionSpec] = &[
     action!("normal.focus_chat", Normal, "tab", ["tab"]),
     action!("normal.up", Normal, "up", ["up", "k"]),
     action!("normal.down", Normal, "down", ["down", "j"]),
+    action!("normal.top", Normal, "g", ["g"]),
+    action!("normal.bottom", Normal, "G", ["G"]),
     action!("normal.add_repository", Normal, "a", ["a"]),
     action!("normal.toggle_archived", Normal, "A", ["A"]),
     action!("normal.undo_archive", Normal, "u", ["u"]),
@@ -716,8 +718,6 @@ static ACTIONS: &[ActionSpec] = &[
         "J",
         ["J"]
     ),
-    action!("normal.thread.preview_top", NormalThread, "g", ["g"]),
-    action!("normal.thread.preview_bottom", NormalThread, "G", ["G"]),
     action!("normal.thread.copy_id", NormalThread, "y", ["y"]),
     action!("normal.thread.copy_resume", NormalThread, "Y", ["Y"]),
     action!("normal.thread.delete", NormalThread, "d", ["d"]),
@@ -1312,10 +1312,20 @@ mod tests {
     }
 
     #[test]
-    fn g_and_shifted_j_k_navigate_a_selected_thread_preview() {
+    fn g_moves_the_tree_and_shifted_j_k_navigate_a_selected_thread_preview() {
         let bindings = KeyBindings::defaults();
 
-        for character in ['g', 'G', 'J', 'K'] {
+        for character in ['g', 'G'] {
+            for specific_context in [KeyContext::NormalRepository, KeyContext::NormalThread] {
+                let resolved = bindings.resolve(
+                    &[specific_context, KeyContext::Normal],
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                );
+
+                assert_eq!(resolved.code, KeyCode::Char(character));
+            }
+        }
+        for character in ['J', 'K'] {
             let resolved = bindings.resolve(
                 &[KeyContext::NormalThread, KeyContext::Normal],
                 KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),

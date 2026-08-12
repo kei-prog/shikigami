@@ -2309,6 +2309,16 @@ impl App {
         }
     }
 
+    pub fn move_tree_to_top(&mut self) {
+        self.tree_index = 0;
+        self.sync_selection_from_tree();
+    }
+
+    pub fn move_tree_to_bottom(&mut self) {
+        self.tree_index = self.tree_rows().len().saturating_sub(1);
+        self.sync_selection_from_tree();
+    }
+
     pub fn open_repository_add(&mut self) {
         self.mode = Mode::AddRepositories;
         self.candidate_index = 0;

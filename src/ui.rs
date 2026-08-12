@@ -1549,15 +1549,27 @@ async fn handle_key(
                     chat.move_message_selection(true);
                 }
             }
-            KeyCode::Char('g') if app.selected_tree_is_thread() => {
-                if let Some(chat) = app.chat_mut() {
-                    chat.scroll_to_top();
-                }
+            KeyCode::Char('g') => {
+                app.move_tree_to_top();
+                begin_navigation_paint(app, pending.thread_paint);
+                schedule_selected_chat_preview(
+                    app,
+                    server,
+                    preview_generation,
+                    preview_sender,
+                    preview_task,
+                );
             }
-            KeyCode::Char('G') if app.selected_tree_is_thread() => {
-                if let Some(chat) = app.chat_mut() {
-                    chat.scroll_to_bottom();
-                }
+            KeyCode::Char('G') => {
+                app.move_tree_to_bottom();
+                begin_navigation_paint(app, pending.thread_paint);
+                schedule_selected_chat_preview(
+                    app,
+                    server,
+                    preview_generation,
+                    preview_sender,
+                    preview_task,
+                );
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 app.move_up();
