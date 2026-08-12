@@ -2518,6 +2518,30 @@ impl App {
         Ok(())
     }
 
+    pub fn register_repository_from_thread(
+        &mut self,
+        source_thread_id: &str,
+        path: Option<&Path>,
+    ) -> Result<(Repository, bool)> {
+        let source_cwd = self
+            .chats
+            .get(source_thread_id)
+            .map(|chat| chat.cwd.as_path());
+        let path = repository_registration_path(path, source_cwd)?;
+        let repository = repository::repository_at(&path)?;
+        let added = !self
+            .repositories
+            .iter()
+            .any(|registered| registered.path == repository.path);
+        if added {
+            self.repository_store
+                .register(std::slice::from_ref(&repository))?;
+            self.refresh_repositories()?;
+            self.reveal_chat(source_thread_id);
+        }
+        Ok((repository, added))
+    }
+
     pub fn scan_browse_path(&mut self) -> Result<PathBuf> {
         let root = self.repository_store.add_search_root(&self.browse_path)?;
         self.mode = Mode::AddRepositories;
@@ -3872,6 +3896,19 @@ fn should_show_onboarding(
     marker_is_pending && initial_scan_is_pending && repositories_are_empty && !has_existing_threads
 }
 
+fn repository_registration_path(
+    requested_path: Option<&Path>,
+    source_cwd: Option<&Path>,
+) -> Result<PathBuf> {
+    if let Some(path) = requested_path {
+        anyhow::ensure!(path.is_absolute(), "repository path must be absolute");
+        return Ok(path.to_path_buf());
+    }
+    source_cwd
+        .map(Path::to_path_buf)
+        .context("source thread working directory is unavailable")
+}
+
 fn import_codex_workspaces(
     repository_store: &RepositoryStore,
     repositories: &mut Vec<Repository>,
@@ -4312,6 +4349,23 @@ mod tests {
             thread_id: thread_id.map(str::to_owned),
             turn_id: None,
         }
+    }
+
+    #[test]
+    fn repository_registration_uses_an_exact_path_or_the_source_cwd() {
+        let explicit = Path::new("/projects/repository");
+        let source_cwd = Path::new("/projects/current-worktree");
+
+        assert_eq!(
+            repository_registration_path(Some(explicit), Some(source_cwd)).unwrap(),
+            explicit
+        );
+        assert_eq!(
+            repository_registration_path(None, Some(source_cwd)).unwrap(),
+            source_cwd
+        );
+        assert!(repository_registration_path(Some(Path::new("relative")), None).is_err());
+        assert!(repository_registration_path(None, None).is_err());
     }
 
     fn archive_undo(id: &str) -> ArchivedThreadUndo {

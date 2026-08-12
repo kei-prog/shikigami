@@ -101,6 +101,12 @@ struct StartThreadToolArguments {
     workspace: StartThreadWorkspace,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddRepositoryToolArguments {
+    path: Option<PathBuf>,
+}
+
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum StartThreadWorkspace {
@@ -3093,6 +3099,28 @@ async fn handle_dynamic_tool_call(
             ),
             Err(error) => dynamic_tool_response(false, format!("Could not start thread: {error}")),
         }
+    } else if is_shikigami_tool(&request, "add_repository") {
+        match add_repository_from_tool(app, &request) {
+            Ok((repository, true)) => dynamic_tool_response(
+                true,
+                format!(
+                    "Registered repository.\nName: {}\nPath: {}",
+                    repository.name,
+                    repository.path.display()
+                ),
+            ),
+            Ok((repository, false)) => dynamic_tool_response(
+                true,
+                format!(
+                    "Repository is already registered.\nName: {}\nPath: {}",
+                    repository.name,
+                    repository.path.display()
+                ),
+            ),
+            Err(error) => {
+                dynamic_tool_response(false, format!("Could not add repository: {error}"))
+            }
+        }
     } else {
         dynamic_tool_response(false, "Unsupported Shikigami tool".into())
     };
@@ -3100,11 +3128,16 @@ async fn handle_dynamic_tool_call(
 }
 
 fn is_start_thread_tool(request: &AppServerRequest) -> bool {
+    is_shikigami_tool(request, "start_thread")
+}
+
+fn is_shikigami_tool(request: &AppServerRequest, expected_tool: &str) -> bool {
     let namespace = request.params.get("namespace").and_then(Value::as_str);
     let tool = request.params.get("tool").and_then(Value::as_str);
+    let qualified_tool = format!("shikigami.{expected_tool}");
     request.method == "item/tool/call"
-        && ((namespace == Some("shikigami") && tool == Some("start_thread"))
-            || tool == Some("shikigami.start_thread"))
+        && ((namespace == Some("shikigami") && tool == Some(expected_tool))
+            || tool == Some(qualified_tool.as_str()))
 }
 
 fn dynamic_tool_response(success: bool, text: String) -> Value {
@@ -3112,6 +3145,37 @@ fn dynamic_tool_response(success: bool, text: String) -> Value {
         "contentItems": [{"type": "inputText", "text": text}],
         "success": success
     })
+}
+
+fn add_repository_from_tool(
+    app: &mut App,
+    request: &AppServerRequest,
+) -> Result<(crate::repository::Repository, bool)> {
+    let source_thread_id = request
+        .thread_id
+        .as_deref()
+        .context("tool request did not identify its source thread")?;
+    let arguments = add_repository_tool_arguments(request)?;
+    app.register_repository_from_thread(source_thread_id, arguments.path.as_deref())
+}
+
+fn add_repository_tool_arguments(request: &AppServerRequest) -> Result<AddRepositoryToolArguments> {
+    let arguments: AddRepositoryToolArguments = serde_json::from_value(
+        request
+            .params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+    )
+    .context("invalid add_repository arguments")?;
+    if arguments
+        .path
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        bail!("repository path cannot be empty");
+    }
+    Ok(arguments)
 }
 
 async fn start_thread_from_tool(
@@ -5962,7 +6026,7 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(78, 45, area);
     let ask_shikigami = app.keybindings.label("help.ask_shikigami");
     let help = format!(
-        "THREADS\n{up} / {down}  move and preview selected thread\n{collapse} / {expand}  collapse or expand a repository\n{open_scroll} / {open_input}  focus selected thread messages / input\n{collapse_all} / {expand_all}  collapse / expand all repositories\n{find_thread}  filter threads\n{copy_id} / {copy_resume}  copy thread ID / resume command\n{rename}  open thread-name actions\n{attention}  show threads that need attention\n{cancel}  return to thread tree / cancel\n{add_repository} / {new_thread}  add repositories / create a thread\n{archive} / {undo} / {archived}  archive / undo / active or archived threads\n{delete} / {refresh}  delete or unregister / reload repositories and names\n\nCHAT INPUT\n{submit}  send or steer in chat\n{newline}  insert a newline\n{left}/{right}/{input_up}/{input_down}  move the cursor\n{line_start}/{line_end}  move to start/end of the current line\n{interrupt}  stop the current response\n{toggle_pane}  switch main / side chat focus\n{next_chat} / {previous_chat}  next / previous side chat\n\nMESSAGES\n{focus_chat}  focus messages / enter scroll mode\n{previous_message} / {next_message}  select messages\n{browser_preview}  open chat in a browser at the selected message\n{copy_editor}  copy an editor command for the visible diff hunk\n{copy_message} / {copy_chat}  copy selected message / full chat\n\n{palette}  command palette · /permissions  execution mode\n{show_help}  help · {quit}  quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {permissions}\nConfig: {config}\n{close_help} closes this screen",
+        "THREADS\n{up} / {down}  move and preview selected thread\n{collapse} / {expand}  collapse or expand a repository\n{open_scroll} / {open_input}  focus selected thread messages / input\n{collapse_all} / {expand_all}  collapse / expand all repositories\n{find_thread}  filter threads\n{copy_id} / {copy_resume}  copy thread ID / resume command\n{rename}  open thread-name actions\n{attention}  show threads that need attention\n{cancel}  return to thread tree / cancel\nask in chat  register the current repository or an exact absolute path\n{add_repository} / {new_thread}  discover and add repositories / create a thread\n{archive} / {undo} / {archived}  archive / undo / active or archived threads\n{delete} / {refresh}  delete or unregister / reload repositories and names\n\nCHAT INPUT\n{submit}  send or steer in chat\n{newline}  insert a newline\n{left}/{right}/{input_up}/{input_down}  move the cursor\n{line_start}/{line_end}  move to start/end of the current line\n{interrupt}  stop the current response\n{toggle_pane}  switch main / side chat focus\n{next_chat} / {previous_chat}  next / previous side chat\n\nMESSAGES\n{focus_chat}  focus messages / enter scroll mode\n{previous_message} / {next_message}  select messages\n{browser_preview}  open chat in a browser at the selected message\n{copy_editor}  copy an editor command for the visible diff hunk\n{copy_message} / {copy_chat}  copy selected message / full chat\n\n{palette}  command palette · /permissions  execution mode\n{show_help}  help · {quit}  quit\n\n● visible · ◉ working · ◆ completed · × failed · ! approval\nPermissions: {permissions}\nConfig: {config}\n{close_help} closes this screen",
         up = app.keybindings.label("normal.up"),
         down = app.keybindings.label("normal.down"),
         collapse = app.keybindings.label("normal.repository.collapse"),
@@ -6494,7 +6558,7 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_only_the_shikigami_start_thread_tool() {
+    fn recognizes_shikigami_dynamic_tools() {
         let request = AppServerRequest {
             id: json!(1),
             method: "item/tool/call".into(),
@@ -6510,9 +6574,49 @@ mod tests {
         };
 
         assert!(is_start_thread_tool(&request));
+        let add_repository = AppServerRequest {
+            id: json!(2),
+            method: "item/tool/call".into(),
+            params: json!({
+                "namespace": "shikigami",
+                "tool": "add_repository",
+                "arguments": {"path": "/repo"},
+                "threadId": "source",
+                "turnId": "turn"
+            }),
+            thread_id: Some("source".into()),
+            turn_id: Some("turn".into()),
+        };
+        assert!(is_shikigami_tool(&add_repository, "add_repository"));
+
         let mut other = request;
         other.params["tool"] = json!("get_thread_status");
         assert!(!is_start_thread_tool(&other));
+    }
+
+    #[test]
+    fn add_repository_tool_accepts_an_optional_exact_path() {
+        let request = AppServerRequest {
+            id: json!(1),
+            method: "item/tool/call".into(),
+            params: json!({
+                "namespace": "shikigami",
+                "tool": "add_repository",
+                "arguments": {"path": "/projects/repository"}
+            }),
+            thread_id: Some("source".into()),
+            turn_id: Some("turn".into()),
+        };
+        assert_eq!(
+            add_repository_tool_arguments(&request).unwrap().path,
+            Some(PathBuf::from("/projects/repository"))
+        );
+
+        let mut current = request;
+        current.params["arguments"] = json!({});
+        assert_eq!(add_repository_tool_arguments(&current).unwrap().path, None);
+        current.params["arguments"] = json!({"path": ""});
+        assert!(add_repository_tool_arguments(&current).is_err());
     }
 
     #[test]

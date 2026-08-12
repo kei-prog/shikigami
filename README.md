@@ -199,12 +199,17 @@ Each thread keeps an independent chat state, so multiple turns can continue in
 the background while another thread is displayed. The tree marks the visible,
 working, and approval-waiting threads separately.
 
-A chat can also create an independent thread when asked in natural language.
-Shikigami gives it a single `shikigami.start_thread` tool that starts the first
-turn in either the current workspace or a new managed worktree. General chats
-can start another thread in their current scratch workspace but cannot request a
-Git worktree. The new thread does not inherit the current conversation and
-appears in the same tree group.
+A chat can also create an independent thread or register a known repository when
+asked in natural language. Shikigami gives every chat two tools:
+`shikigami.start_thread` starts the first turn in either the current workspace
+or a new managed worktree, while `shikigami.add_repository` validates and
+registers an exact absolute repository or worktree path. Omitting the path uses
+the Git repository containing the current chat's working directory. The tool
+does not search for repositories; use `a` for discovered candidates. General
+chats can start another thread in their current scratch workspace but cannot
+request a Git worktree or omit the repository path when registering. A new
+thread does not inherit the current conversation and appears in the same tree
+group.
 
 A background turn that completes or fails stays in the attention list until its
 chat is viewed or the item is dismissed, including across Shikigami restarts.
@@ -365,10 +370,6 @@ it. Tables use the browser layout, and fenced `mermaid` blocks render as diagram
 when the pinned Mermaid script can be loaded; without network access, their source
 remains visible. Chat content stays in a user-only temporary file and is removed
 after ten minutes instead of being uploaded to a preview service.
-The browser view keeps user and Codex messages visually distinct and collapses
-command activity and diffs by default. Mermaid diagrams include fit, zoom, source,
-full-screen, and SVG download controls; all rendering still happens locally in the
-browser after the pinned script is loaded.
 When a diff hunk is visible, `e` copies a command that opens the hunk's new-file
 line in the configured Git editor. Shikigami resolves the editor with
 `git var GIT_EDITOR`, recognizes the line-number syntax of common editors, and

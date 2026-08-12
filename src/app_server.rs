@@ -823,28 +823,45 @@ fn shikigami_dynamic_tools() -> Value {
     json!([{
         "type": "namespace",
         "name": "shikigami",
-        "description": "Create and start independent Shikigami threads when the user requests them",
-        "tools": [{
-            "type": "function",
-            "name": "start_thread",
-            "description": "Create a new independent thread in the current repository and immediately start the requested task. Call this only when the user explicitly asks to create or start a separate thread. This does not copy conversation history. Use current to reuse the same worktree, which can conflict with concurrent edits, or new_worktree to isolate code changes in a new managed worktree.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "The first user prompt for the new thread"
+        "description": "Manage Shikigami threads and repositories on explicit user request",
+        "tools": [
+            {
+                "type": "function",
+                "name": "start_thread",
+                "description": "Create a new independent thread in the current repository and immediately start the requested task. Call this only when the user explicitly asks to create or start a separate thread. This does not copy conversation history. Use current to reuse the same worktree, which can conflict with concurrent edits, or new_worktree to isolate code changes in a new managed worktree.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "description": "The first user prompt for the new thread"
+                        },
+                        "workspace": {
+                            "type": "string",
+                            "enum": ["current", "new_worktree"],
+                            "description": "Where the new thread should work"
+                        }
                     },
-                    "workspace": {
-                        "type": "string",
-                        "enum": ["current", "new_worktree"],
-                        "description": "Where the new thread should work"
-                    }
-                },
-                "required": ["prompt", "workspace"],
-                "additionalProperties": false
+                    "required": ["prompt", "workspace"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "type": "function",
+                "name": "add_repository",
+                "description": "Register one identified Git repository with Shikigami. Use only on explicit user request. Pass its exact absolute repository or worktree path; omit path for the source thread's repository. Does not search.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Exact absolute repository or worktree path; omit for the source thread's repository"
+                        }
+                    },
+                    "additionalProperties": false
+                }
             }
-        }]
+        ]
     }])
 }
 
@@ -982,16 +999,27 @@ mod tests {
     }
 
     #[test]
-    fn shikigami_exposes_only_the_start_thread_tool() {
+    fn shikigami_exposes_thread_and_repository_tools() {
         let tools = shikigami_dynamic_tools();
 
         assert_eq!(tools.as_array().unwrap().len(), 1);
         assert_eq!(tools[0]["name"], "shikigami");
-        assert_eq!(tools[0]["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(tools[0]["tools"].as_array().unwrap().len(), 2);
         assert_eq!(tools[0]["tools"][0]["name"], "start_thread");
         assert_eq!(
             tools[0]["tools"][0]["inputSchema"]["required"],
             json!(["prompt", "workspace"])
+        );
+        assert_eq!(tools[0]["tools"][1]["name"], "add_repository");
+        assert!(
+            tools[0]["tools"][1]["inputSchema"]
+                .get("required")
+                .is_none()
+        );
+        let encoded_len = serde_json::to_vec(&tools).unwrap().len();
+        assert!(
+            encoded_len <= 1_350,
+            "dynamic tool payload grew to {encoded_len} bytes"
         );
     }
 

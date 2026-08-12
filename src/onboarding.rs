@@ -65,7 +65,7 @@ fn normalize_locale(locale: &str) -> Option<String> {
 
 pub fn developer_instructions(locale: &str, imported_repository_count: usize) -> String {
     let repository_guidance = if imported_repository_count == 0 {
-        "- Make repository addition the primary action: tell the user to press `a`, then use `f` to filter if needed, `Space` to select repositories, and `Enter` to register them. Mention `b` only as the fallback when the repository is not listed."
+        "- Make repository addition the primary action: tell the user they can give you the exact absolute path of a known Git repository to register it, or press `a` to choose from discovered candidates. For the picker, mention `f` to filter, `Space` to select, and `Enter` to register; mention `b` only when the repository is not listed."
             .to_owned()
     } else {
         format!(
@@ -128,6 +128,7 @@ mod tests {
         assert!(prompt.contains("`ja-JP`"));
         assert!(prompt.contains("General"));
         assert!(prompt.contains("Make repository addition the primary action"));
+        assert!(prompt.contains("exact absolute path"));
         assert!(prompt.contains("`n`"));
         assert!(prompt.contains("`a`"));
         assert!(prompt.contains("`?`"));
