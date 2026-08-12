@@ -89,33 +89,49 @@ fn remove_preview_file(path: &Path) {
 
 fn render_document(title: &str, messages: &[ChatMessage], selected: Option<usize>) -> String {
     let mut body = String::new();
+    let mut visible_messages = 0usize;
     for (index, message) in messages.iter().enumerate() {
         if message.content.is_empty() {
             continue;
         }
-        let (role, class) = match message.role {
-            ChatRole::User => ("You", "user"),
-            ChatRole::Assistant => ("Codex", "assistant"),
-            ChatRole::Activity => ("Activity", "activity"),
-            ChatRole::Diff => ("Changes", "diff"),
+        visible_messages += 1;
+        let (role, class, marker) = match message.role {
+            ChatRole::User => ("You", "user", "Y"),
+            ChatRole::Assistant => ("Codex", "assistant", "C"),
+            ChatRole::Activity => ("Activity", "activity", "·"),
+            ChatRole::Diff => ("Changes", "diff", "±"),
         };
         let selection_class = if selected == Some(index) {
             " selected"
         } else {
             ""
         };
-        body.push_str(&format!(
-            "<article id=\"message-{}\" class=\"message {}{}\"><header>{}</header><div class=\"markdown\">{}</div></article>",
-            index + 1,
-            class,
-            selection_class,
-            role,
-            markdown_html(&message.content),
-        ));
+        let content = markdown_html(&message.content);
+        if matches!(message.role, ChatRole::Activity | ChatRole::Diff) {
+            body.push_str(&format!(
+                "<details id=\"message-{}\" class=\"message auxiliary {}{}\"><summary><span class=\"role-marker\">{}</span><span>{}</span><span class=\"summary-hint\">show details</span></summary><div class=\"markdown auxiliary-content\">{}</div></details>",
+                index + 1,
+                class,
+                selection_class,
+                marker,
+                role,
+                content,
+            ));
+        } else {
+            body.push_str(&format!(
+                "<article id=\"message-{}\" class=\"message {}{}\"><header><span class=\"role-marker\">{}</span><span>{}</span></header><div class=\"markdown\">{}</div></article>",
+                index + 1,
+                class,
+                selection_class,
+                marker,
+                role,
+                content,
+            ));
+        }
     }
     let selected_script = selected.map_or_else(String::new, |index| {
         format!(
-            "document.getElementById('message-{}')?.scrollIntoView({{block:'center'}});",
+            "const selectedMessage=document.getElementById('message-{}'); if(selectedMessage?.tagName==='DETAILS') selectedMessage.open=true; selectedMessage?.scrollIntoView({{block:'center'}});",
             index + 1
         )
     });
@@ -125,50 +141,119 @@ fn render_document(title: &str, messages: &[ChatMessage], selected: Option<usize
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; font-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; font-src 'none'; base-uri 'none'; form-action 'none'">
 <title>{title}</title>
 <style>
-:root {{ color-scheme: light dark; --bg:#0f1115; --panel:#171a21; --muted:#9299a6; --text:#e6e8ec; --accent:#70b7ff; --user:#172438; --activity:#15171b; --border:#303642; --selected:#e6b450; }}
+:root {{ color-scheme:light dark; --bg:#0c0f14; --surface:#131820; --surface-raised:#181e27; --surface-soft:#10151c; --text:#e8ebf0; --text-soft:#c1c7d0; --muted:#818a98; --accent:#71b7ff; --accent-soft:#16283d; --border:#29313d; --border-strong:#3a4655; --selected:#e4b45c; --code:#090c11; --diagram:#f7f9fc; --diagram-text:#17202b; --shadow:0 18px 50px rgba(0,0,0,.22); }}
 * {{ box-sizing:border-box; }}
 html {{ scroll-behavior:smooth; }}
-body {{ margin:0; background:var(--bg); color:var(--text); font:15px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
-main {{ width:min(100% - 32px, 1040px); margin:0 auto; padding:32px 0 72px; }}
-h1 {{ margin:0 0 28px; font-size:22px; overflow-wrap:anywhere; }}
-.message {{ margin:0 0 18px; padding:18px 20px; border:1px solid var(--border); border-radius:10px; background:var(--panel); scroll-margin:15vh 0; }}
-.message.user {{ background:var(--user); }}
-.message.activity,.message.diff {{ background:var(--activity); color:#c4c9d1; }}
-.message.selected {{ border-color:var(--selected); box-shadow:0 0 0 2px color-mix(in srgb,var(--selected) 35%,transparent); animation:selected 2.4s ease-out; }}
-@keyframes selected {{ from {{ background:#4a3c20; }} }}
-header {{ margin-bottom:10px; color:var(--accent); font-size:12px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }}
+body {{ margin:0; background:var(--bg); color:var(--text); font:16px/1.72 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; text-rendering:optimizeLegibility; }}
+.page-header {{ position:sticky; top:0; z-index:20; border-bottom:1px solid var(--border); background:color-mix(in srgb,var(--bg) 88%,transparent); backdrop-filter:blur(16px); }}
+.page-header-inner {{ width:min(100% - 36px, 920px); min-height:68px; margin:0 auto; display:flex; align-items:center; justify-content:space-between; gap:24px; }}
+.eyebrow {{ color:var(--accent); font-size:11px; font-weight:750; letter-spacing:.13em; text-transform:uppercase; }}
+.page-title {{ margin:2px 0 0; max-width:680px; overflow:hidden; color:var(--text); font-size:15px; font-weight:650; text-overflow:ellipsis; white-space:nowrap; }}
+.page-meta {{ flex:none; color:var(--muted); font-size:12px; }}
+main {{ width:min(100% - 36px, 920px); margin:0 auto; padding:38px 0 88px; }}
+.message {{ position:relative; margin:0 0 26px; scroll-margin:110px 0; }}
+.message.assistant {{ padding:3px 2px 24px; border-bottom:1px solid var(--border); }}
+.message.user {{ margin-left:auto; padding:17px 20px; border:1px solid #29496a; border-radius:14px; background:linear-gradient(145deg,var(--accent-soft),#111d2a); box-shadow:0 10px 28px rgba(0,0,0,.12); }}
+.message.selected {{ border-color:var(--selected); box-shadow:0 0 0 2px color-mix(in srgb,var(--selected) 38%,transparent); animation:selected 2.4s ease-out; }}
+@keyframes selected {{ from {{ background-color:#47391d; }} }}
+header,summary {{ display:flex; align-items:center; gap:9px; color:var(--muted); font-size:12px; font-weight:750; letter-spacing:.06em; text-transform:uppercase; }}
+header {{ margin-bottom:12px; }}
+.role-marker {{ display:inline-grid; width:23px; height:23px; place-items:center; border:1px solid var(--border-strong); border-radius:7px; color:var(--accent); background:var(--surface-raised); font-size:11px; letter-spacing:0; }}
+.user .role-marker {{ border-color:#39658f; background:#1d3853; color:#d7ebff; }}
+.markdown {{ color:var(--text); overflow-wrap:anywhere; }}
 .markdown > :first-child {{ margin-top:0; }} .markdown > :last-child {{ margin-bottom:0; }}
-h2,h3,h4,h5,h6 {{ line-height:1.25; }}
-a {{ color:var(--accent); }}
-blockquote {{ margin-left:0; padding-left:14px; border-left:3px solid var(--border); color:#bac0ca; }}
+.markdown p {{ margin:0 0 1em; }}
+h1,h2,h3,h4,h5,h6 {{ margin:1.65em 0 .65em; line-height:1.25; letter-spacing:-.018em; }}
+h1 {{ font-size:1.65rem; }} h2 {{ font-size:1.38rem; }} h3 {{ font-size:1.18rem; }}
+ul,ol {{ padding-left:1.55em; }} li + li {{ margin-top:.35em; }}
+a {{ color:var(--accent); text-underline-offset:3px; }}
+blockquote {{ margin:1.2em 0; padding:2px 0 2px 16px; border-left:3px solid var(--border-strong); color:var(--text-soft); }}
 code,pre {{ font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace; }}
-code {{ padding:.12em .32em; border-radius:4px; background:#242933; }}
-pre {{ overflow:auto; padding:14px; border-radius:7px; background:#0a0c10; line-height:1.45; }}
+code {{ padding:.14em .34em; border:1px solid var(--border); border-radius:5px; background:var(--surface-raised); font-size:.91em; }}
+pre {{ overflow:auto; margin:1.25em 0; padding:16px 18px; border:1px solid var(--border); border-radius:10px; background:var(--code); font-size:13px; line-height:1.55; box-shadow:inset 0 1px rgba(255,255,255,.025); }}
 pre code {{ padding:0; background:transparent; }}
-table {{ display:block; max-width:100%; overflow-x:auto; border-collapse:collapse; }}
-th,td {{ padding:7px 10px; border:1px solid var(--border); text-align:left; vertical-align:top; }}
-th {{ background:#20252e; }}
-.mermaid {{ background:#fff; color:#111; }}
+table {{ display:block; max-width:100%; margin:1.35em 0; overflow-x:auto; border-spacing:0; border-collapse:separate; border:1px solid var(--border); border-radius:10px; }}
+th,td {{ min-width:120px; padding:10px 13px; border-right:1px solid var(--border); border-bottom:1px solid var(--border); text-align:left; vertical-align:top; }}
+th:last-child,td:last-child {{ border-right:0; }} tr:last-child td {{ border-bottom:0; }}
+th {{ background:var(--surface-raised); color:var(--text-soft); font-size:13px; }}
+.auxiliary {{ overflow:hidden; border:1px solid var(--border); border-radius:10px; background:var(--surface-soft); color:var(--text-soft); }}
+.auxiliary summary {{ min-height:44px; padding:9px 13px; cursor:pointer; list-style:none; }}
+.auxiliary summary::-webkit-details-marker {{ display:none; }}
+.auxiliary summary::before {{ content:'›'; color:var(--muted); font-size:18px; transition:transform .16s ease; }}
+.auxiliary[open] summary::before {{ transform:rotate(90deg); }}
+.summary-hint {{ margin-left:auto; color:var(--muted); font-size:10px; font-weight:500; letter-spacing:.04em; text-transform:none; }}
+.auxiliary[open] .summary-hint {{ visibility:hidden; }}
+.auxiliary-content {{ padding:0 16px 15px 45px; font-size:14px; }}
+.diagram-card {{ margin:1.45em 0; overflow:hidden; border:1px solid var(--border-strong); border-radius:13px; background:var(--diagram); color:var(--diagram-text); box-shadow:var(--shadow); }}
+.diagram-toolbar {{ display:flex; min-height:48px; align-items:center; gap:6px; padding:7px 9px 7px 14px; border-bottom:1px solid #d9dee6; background:#eef2f7; color:#455160; }}
+.diagram-title {{ margin-right:auto; font-size:12px; font-weight:750; letter-spacing:.08em; text-transform:uppercase; }}
+.diagram-status {{ color:#697586; font-size:11px; }}
+.diagram-button {{ min-width:34px; height:32px; padding:0 9px; border:1px solid #c9d0da; border-radius:7px; background:#fff; color:#344052; cursor:pointer; font:600 12px/1 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+.diagram-button:hover {{ border-color:#8d99a9; background:#f7f9fc; }}
+.diagram-button:focus-visible {{ outline:2px solid #2979c9; outline-offset:2px; }}
+.diagram-viewport {{ min-height:260px; max-height:72vh; overflow:auto; padding:26px; background:linear-gradient(#fff,#f8fafc); }}
+.diagram-canvas {{ display:flex; width:100%; min-width:max-content; min-height:208px; align-items:center; justify-content:center; transition:width .12s ease; }}
+.diagram-canvas svg {{ display:block; height:auto; max-width:none; filter:drop-shadow(0 5px 10px rgba(31,42,55,.08)); }}
+.diagram-source {{ display:none; margin:0; border:0; border-top:1px solid #d9dee6; border-radius:0; background:#111720; color:#dce4ef; box-shadow:none; }}
+.diagram-card.show-source .diagram-source {{ display:block; }}
+.diagram-card.is-error .diagram-viewport {{ display:none; }}
+.diagram-card.is-error .diagram-source {{ display:block; }}
+.diagram-card:fullscreen {{ display:flex; flex-direction:column; border:0; border-radius:0; }}
+.diagram-card:fullscreen .diagram-viewport {{ max-height:none; flex:1; }}
+.diagram-card:fullscreen .diagram-canvas {{ min-height:calc(100vh - 110px); }}
 hr {{ border:0; border-top:1px solid var(--border); }}
-@media (prefers-color-scheme:light) {{ :root {{ --bg:#f6f7f9; --panel:#fff; --muted:#646b76; --text:#1e222a; --accent:#0969da; --user:#edf5ff; --activity:#f1f3f5; --border:#d5d9df; --selected:#9a6700; }} pre {{ background:#161b22; color:#f0f3f6; }} code {{ background:#e8ebef; }} pre code {{ background:transparent; }} }}
+@media (max-width:680px) {{ body {{ font-size:15px; }} .page-header-inner,main {{ width:min(100% - 24px,920px); }} .page-meta,.diagram-status {{ display:none; }} .diagram-toolbar {{ padding-left:10px; }} .diagram-button {{ min-width:32px; padding:0 7px; }} .diagram-viewport {{ padding:14px; }} }}
+@media (prefers-color-scheme:light) {{ :root {{ --bg:#f4f6f8; --surface:#fff; --surface-raised:#f1f4f7; --surface-soft:#f7f8fa; --text:#20262e; --text-soft:#4f5966; --muted:#6f7884; --accent:#0969da; --accent-soft:#e8f2ff; --border:#d8dde4; --border-strong:#c5ccd6; --selected:#9a6700; --code:#151a21; --shadow:0 18px 45px rgba(33,43,54,.12); }} .message.user {{ background:linear-gradient(145deg,#edf6ff,#e6f1fd); }} pre {{ color:#edf2f7; }} code {{ color:#27313d; }} pre code {{ color:inherit; }} }}
+@media print {{ .page-header {{ position:static; }} .diagram-toolbar {{ display:none; }} .auxiliary:not([open]) {{ display:none; }} main {{ width:100%; }} }}
 </style>
 </head>
-<body><main><h1>{title}</h1>{body}</main>
+<body><div class="page-header"><div class="page-header-inner"><div><div class="eyebrow">Shikigami preview</div><div class="page-title">{title}</div></div><div class="page-meta">{visible_messages} messages</div></div></div><main>{body}</main>
 <script src="{mermaid_script}"></script>
 <script>
 document.querySelectorAll('a').forEach(a => {{ a.target='_blank'; a.rel='noopener noreferrer'; }});
-document.querySelectorAll('pre > code.language-mermaid').forEach(code => {{
-  const diagram=document.createElement('pre'); diagram.className='mermaid'; diagram.textContent=code.textContent; code.parentElement.replaceWith(diagram);
+const diagrams=[];
+document.querySelectorAll('pre > code.language-mermaid').forEach((code,index) => {{
+  const source=code.textContent;
+  const card=document.createElement('section'); card.className='diagram-card';
+  const toolbar=document.createElement('div'); toolbar.className='diagram-toolbar';
+  const heading=document.createElement('span'); heading.className='diagram-title'; heading.textContent=`Diagram ${{index+1}}`;
+  const status=document.createElement('span'); status.className='diagram-status'; status.textContent='Fit';
+  const viewport=document.createElement('div'); viewport.className='diagram-viewport';
+  const canvas=document.createElement('div'); canvas.className='diagram-canvas'; canvas.textContent=source;
+  const sourceView=document.createElement('pre'); sourceView.className='diagram-source';
+  const sourceCode=document.createElement('code'); sourceCode.textContent=source; sourceView.append(sourceCode);
+  const button=(label,title,action) => {{ const item=document.createElement('button'); item.type='button'; item.className='diagram-button'; item.textContent=label; item.title=title; item.setAttribute('aria-label',title); item.dataset.action=action; return item; }};
+  toolbar.setAttribute('aria-label',`Diagram ${{index+1}} controls`);
+  toolbar.append(heading,status,button('−','Zoom out','out'),button('Fit','Fit diagram','fit'),button('+','Zoom in','in'),button('Source','Show source','source'),button('Full','Full screen','full'),button('SVG','Download SVG','download'));
+  viewport.append(canvas); card.append(toolbar,viewport,sourceView); code.parentElement.replaceWith(card);
+  diagrams.push({{card,canvas,status,source,zoom:1}});
 }});
-if(window.mermaid) {{ mermaid.initialize({{startOnLoad:false,securityLevel:'strict',theme:'default'}}); mermaid.run({{querySelector:'.mermaid'}}).catch(() => {{}}); }}
+const fitDiagram=(diagram) => {{ diagram.zoom=1; diagram.canvas.style.width='100%'; diagram.status.textContent='Fit'; diagram.card.querySelector('.diagram-viewport').scrollTo(0,0); }};
+const setZoom=(diagram,next) => {{ diagram.zoom=Math.min(3,Math.max(.5,next)); diagram.canvas.style.width=`${{diagram.zoom*100}}%`; diagram.status.textContent=`${{Math.round(diagram.zoom*100)}}%`; }};
+document.addEventListener('click',event => {{
+  const control=event.target.closest('[data-action]'); if(!control) return;
+  const card=control.closest('.diagram-card'); const diagram=diagrams.find(item => item.card===card); if(!diagram) return;
+  const action=control.dataset.action;
+  if(action==='in') setZoom(diagram,diagram.zoom+.25);
+  if(action==='out') setZoom(diagram,diagram.zoom-.25);
+  if(action==='fit') fitDiagram(diagram);
+  if(action==='source') {{ card.classList.toggle('show-source'); control.textContent=card.classList.contains('show-source')?'Hide source':'Source'; }}
+  if(action==='full') {{ if(document.fullscreenElement===card) document.exitFullscreen(); else card.requestFullscreen?.(); }}
+  if(action==='download') {{ const svg=diagram.canvas.querySelector('svg'); if(!svg) return; const blob=new Blob([new XMLSerializer().serializeToString(svg)],{{type:'image/svg+xml'}}); const link=document.createElement('a'); link.href=URL.createObjectURL(blob); link.download=`shikigami-diagram-${{diagrams.indexOf(diagram)+1}}.svg`; link.click(); setTimeout(() => URL.revokeObjectURL(link.href),1000); }}
+}});
+if(window.mermaid) {{
+  mermaid.initialize({{startOnLoad:false,securityLevel:'strict',theme:'default',flowchart:{{htmlLabels:true,useMaxWidth:true}},sequence:{{useMaxWidth:true}},themeVariables:{{fontFamily:'ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif',fontSize:'15px'}}}});
+  Promise.all(diagrams.map(async (diagram,index) => {{ try {{ const rendered=await mermaid.render(`shi-diagram-${{index}}`,diagram.source); diagram.canvas.innerHTML=rendered.svg; rendered.bindFunctions?.(diagram.canvas); fitDiagram(diagram); }} catch(error) {{ diagram.card.classList.add('is-error'); diagram.status.textContent='Could not render'; }} }}));
+}} else {{ diagrams.forEach(diagram => {{ diagram.card.classList.add('is-error'); diagram.status.textContent='Mermaid unavailable'; }}); }}
 {selected_script}
 </script>
 </body></html>"#,
         title = escape_html(title),
         body = body,
+        visible_messages = visible_messages,
         mermaid_script = MERMAID_SCRIPT,
         selected_script = selected_script,
     )
@@ -322,6 +407,23 @@ mod tests {
         assert!(rendered.contains("id=\"message-2\" class=\"message assistant selected\""));
         assert!(rendered.contains("getElementById('message-2')"));
         assert!(rendered.contains(MERMAID_SCRIPT));
+        assert!(rendered.contains("button('Fit','Fit diagram','fit')"));
+        assert!(rendered.contains("requestFullscreen"));
+        assert!(rendered.contains("Download SVG"));
+    }
+
+    #[test]
+    fn activity_and_changes_are_collapsed_for_readability() {
+        let messages = vec![
+            ChatMessage::for_preview_test(ChatRole::Activity, "Ran tests"),
+            ChatMessage::for_preview_test(ChatRole::Diff, "diff --git a/a b/a"),
+        ];
+        let rendered = render_document("Thread", &messages, None);
+
+        assert!(rendered.contains("<details id=\"message-1\""));
+        assert!(rendered.contains("class=\"message auxiliary activity\""));
+        assert!(rendered.contains("class=\"message auxiliary diff\""));
+        assert!(rendered.contains("2 messages"));
     }
 
     #[test]

@@ -365,6 +365,10 @@ it. Tables use the browser layout, and fenced `mermaid` blocks render as diagram
 when the pinned Mermaid script can be loaded; without network access, their source
 remains visible. Chat content stays in a user-only temporary file and is removed
 after ten minutes instead of being uploaded to a preview service.
+The browser view keeps user and Codex messages visually distinct and collapses
+command activity and diffs by default. Mermaid diagrams include fit, zoom, source,
+full-screen, and SVG download controls; all rendering still happens locally in the
+browser after the pinned script is loaded.
 When a diff hunk is visible, `e` copies a command that opens the hunk's new-file
 line in the configured Git editor. Shikigami resolves the editor with
 `git var GIT_EDITOR`, recognizes the line-number syntax of common editors, and
