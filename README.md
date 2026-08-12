@@ -1,8 +1,10 @@
 # Shikigami
 
-Shikigami is a fast, lightweight TUI for switching between Codex CLI threads
-across repositories. It keeps a small list of repositories chosen by the user,
-uses Codex App Server, and only lists threads created through Shikigami.
+Shikigami is a fast, lightweight TUI designed to minimize the human cost of
+operating multiple Codex threads concurrently: the interactions required to
+move work forward, the cognitive load of tracking it, and the coordination
+needed across repositories and worktrees. It uses Codex App Server and only
+lists threads created through Shikigami.
 
 ![Shikigami TUI showing its first-run help chat](docs/shikigami.png)
 
@@ -445,17 +447,19 @@ shi repo list
 
 ## Scope
 
-Shikigami exists to make powerful multi-threaded use of Codex practical where the
-Codex CLI alone is not enough. It does not aim to reimplement Codex features or
-turn workflows that Codex can perform from natural-language instructions or skills
-into application features. Those responsibilities should remain with Codex.
+Shikigami exists to minimize the interaction costs, cognitive load, and
+coordination overhead of operating multiple Codex threads concurrently. It makes
+multi-threaded use of Codex practical where the Codex CLI alone is not enough. It
+does not aim to reimplement Codex features or turn workflows that Codex can
+perform from natural-language instructions or skills into application features.
+Those responsibilities should remain with Codex.
 
 Shikigami instead concentrates on the interaction and coordination capabilities
 that require a persistent client: operating multiple Codex threads across
 repositories and worktrees, seeing their state, and moving between them quickly.
 When considering a new feature, the central question is whether it provides value
 that cannot be achieved sufficiently through Codex, a skill, or the Codex CLI by
-itself.
+itself, and whether it meaningfully reduces the human cost of concurrent work.
 
 Shikigami is a lightweight App Server client. Codex owns agent execution, tools,
 sandboxing, conversation history, and authentication; Shikigami owns the TUI,
