@@ -68,6 +68,7 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 const REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 const PREVIEW_TURN_LIMIT: u32 = 5;
 const PREVIEW_CACHE_CAPACITY: usize = 20;
+const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(75);
 const MAX_THREAD_NAME_CHARS: usize = 100;
 const PASTING_CLIPBOARD_IMAGE_MESSAGE: &str = "Pasting clipboard image…";
 const CLIPBOARD_IMAGE_ALREADY_PASTING_MESSAGE: &str = "A clipboard image is already being pasted";
@@ -3529,7 +3530,7 @@ fn schedule_selected_chat_preview(
     let generation = Arc::clone(generation);
     let sender = sender.clone();
     *preview_task = Some(tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(PREVIEW_DEBOUNCE).await;
         if generation.load(Ordering::Relaxed) != current_generation {
             return;
         }
