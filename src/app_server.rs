@@ -486,7 +486,7 @@ impl AppServer {
         thread_id: &str,
         cwd: &Path,
         ephemeral: bool,
-        before_turn_id: Option<&str>,
+        last_turn_id: Option<&str>,
         execution_mode: ExecutionMode,
     ) -> Result<(String, Value)> {
         let (approval_policy, sandbox) = execution_policy(execution_mode);
@@ -501,7 +501,7 @@ impl AppServer {
                     "approvalsReviewer": approvals_reviewer,
                     "sandbox": sandbox,
                     "ephemeral": ephemeral,
-                    "beforeTurnId": before_turn_id
+                    "lastTurnId": last_turn_id
                 }),
             )
             .await?;
@@ -1521,7 +1521,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fork_thread_can_exclude_an_in_progress_turn() {
+    async fn fork_thread_can_stop_at_the_last_completed_turn() {
         let (writer, mut messages) = mpsc::channel(1);
         let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
         let (events, _) = broadcast::channel(1);
@@ -1548,7 +1548,7 @@ mod tests {
                         "thread-1",
                         Path::new("/tmp/project"),
                         false,
-                        Some("turn-in-progress"),
+                        Some("turn-completed"),
                         ExecutionMode::Auto,
                     )
                     .await
@@ -1559,7 +1559,7 @@ mod tests {
         };
         assert_eq!(message["method"], "thread/fork");
         assert_eq!(message["params"]["threadId"], "thread-1");
-        assert_eq!(message["params"]["beforeTurnId"], "turn-in-progress");
+        assert_eq!(message["params"]["lastTurnId"], "turn-completed");
         dispatch_response(
             &pending,
             &json!({"id":message["id"],"result":{"thread":{"id":"fork-1"}}}),

@@ -2596,19 +2596,31 @@ async fn select_palette_entry(app: &mut App, server: &Arc<AppServer>) -> Result<
     Ok(action)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SideChatCreation<'a> {
+    StartEmpty,
+    Fork { last_turn_id: Option<&'a str> },
+}
+
+fn side_chat_creation<'a>(
+    active_turn_id: Option<&str>,
+    last_completed_turn_id: Option<&'a str>,
+) -> SideChatCreation<'a> {
+    match (active_turn_id, last_completed_turn_id) {
+        (Some(_), None) => SideChatCreation::StartEmpty,
+        (Some(_), Some(last_turn_id)) => SideChatCreation::Fork {
+            last_turn_id: Some(last_turn_id),
+        },
+        (None, _) => SideChatCreation::Fork { last_turn_id: None },
+    }
+}
+
 async fn open_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     let Some(main_chat) = app.main_chat() else {
         return Ok(());
     };
-    let before_turn_id = main_chat.active_turn_id.clone();
-    if before_turn_id.is_some() && !main_chat.has_completed_turn() {
-        if let Some(main_chat) = app.main_chat_mut() {
-            main_chat.show_inline_warning(
-                "A side chat can't be created during the first response because there is no earlier conversation to fork.",
-            );
-        }
-        return Ok(());
-    }
+    let active_turn_id = main_chat.active_turn_id.clone();
+    let last_completed_turn_id = main_chat.last_completed_turn_id().map(str::to_owned);
     if main_chat.messages.is_empty() {
         app.message = Some("Send a message before forking a side chat".into());
         return Ok(());
@@ -2619,19 +2631,28 @@ async fn open_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
     let model_display_name = main_chat.model_display_name.clone();
     let reasoning_effort = main_chat.reasoning_effort.clone();
     let side_chat_number = app.current_side_chats().len() + 1;
-    let (side_thread_id, history) = match server
-        .fork_thread(
-            &parent_thread_id,
-            &cwd,
-            false,
-            before_turn_id.as_deref(),
-            app.execution_mode,
-        )
-        .await
-    {
+    let creation = side_chat_creation(active_turn_id.as_deref(), last_completed_turn_id.as_deref());
+    let result = match creation {
+        SideChatCreation::StartEmpty => server
+            .start_thread(&cwd, model.as_deref(), app.execution_mode)
+            .await
+            .map(|thread_id| (thread_id, json!({"thread":{"turns":[]}}))),
+        SideChatCreation::Fork { last_turn_id } => {
+            server
+                .fork_thread(
+                    &parent_thread_id,
+                    &cwd,
+                    false,
+                    last_turn_id,
+                    app.execution_mode,
+                )
+                .await
+        }
+    };
+    let (side_thread_id, history) = match result {
         Ok(result) => result,
         Err(error) => {
-            app.message = Some(format!("Could not fork side chat: {error}"));
+            app.message = Some(format!("Could not create side chat: {error}"));
             return Ok(());
         }
     };
@@ -2644,7 +2665,12 @@ async fn open_side_chat(app: &mut App, server: &Arc<AppServer>) -> Result<()> {
         side_chat.set_model(model, display_name, reasoning_effort);
     }
     side_chat.load_history(&history);
-    if before_turn_id.is_some() {
+    if creation == SideChatCreation::StartEmpty {
+        side_chat.push_notice(
+            "Started an empty side chat while the first response continues in the main chat."
+                .into(),
+        );
+    } else if active_turn_id.is_some() {
         side_chat.push_notice(
             "Forked before the current response; its in-progress turn is not included.".into(),
         );
@@ -6357,16 +6383,34 @@ mod tests {
     #[test]
     fn inline_warning_is_prefixed_and_wrapped_for_the_chat_pane() {
         let lines = inline_warning_lines(
-            "A side chat can't be created during the first response because there is no earlier conversation to fork.",
+            "Something needs your attention before this action can continue.",
             36,
         );
 
-        assert!(lines[0].starts_with(" WARNING · A side chat"));
+        assert!(lines[0].starts_with(" WARNING · Something"));
         assert!(lines.len() > 1);
         assert!(lines.iter().all(|line| line.chars().count() <= 36));
         assert_eq!(
             lines.concat(),
-            " WARNING · A side chat can't be created during the first response because there is no earlier conversation to fork."
+            " WARNING · Something needs your attention before this action can continue."
+        );
+    }
+
+    #[test]
+    fn side_chat_creation_handles_idle_and_streaming_threads() {
+        assert_eq!(
+            side_chat_creation(Some("first-active"), None),
+            SideChatCreation::StartEmpty
+        );
+        assert_eq!(
+            side_chat_creation(Some("later-active"), Some("last-completed")),
+            SideChatCreation::Fork {
+                last_turn_id: Some("last-completed")
+            }
+        );
+        assert_eq!(
+            side_chat_creation(None, Some("last-completed")),
+            SideChatCreation::Fork { last_turn_id: None }
         );
     }
 
